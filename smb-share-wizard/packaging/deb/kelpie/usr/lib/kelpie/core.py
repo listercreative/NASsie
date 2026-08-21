@@ -1516,7 +1516,10 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         # <share>) actually exist, so share["group"] below reflects reality
         # instead of being set for shares Kelpie never touched. One extra
         # Get-LocalGroup call, batched here rather than per-share.
-        group_cmd = "Get-LocalGroup | Where-Object { $_.Name -like 'Kelpie*' } | Select-Object -ExpandProperty Name"
+        group_cmd = (
+            "Get-LocalGroup | Where-Object { $_.Name -like 'Kelpie*' } "
+            "| Select-Object -ExpandProperty Name | ConvertTo-Json -Compress"
+        )
         group_proc = _run(["powershell", "-Command", group_cmd], capture_output=True, text=True)
         existing_groups = set()
         if group_proc.returncode == 0 and group_proc.stdout.strip():
