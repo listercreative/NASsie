@@ -375,38 +375,28 @@ class GUIWizard:
         groups_hscroll.grid(row=1, column=0, sticky="ew", padx=(4, 0))
         self.groups_list.configure(yscrollcommand=groups_vscroll.set, xscrollcommand=groups_hscroll.set)
 
-        # Two rows - four buttons packed side="left" don't reliably fit the
-        # default 560px window width (see the earlier users_btn_row1/2/3
-        # split for the same reason).
-        groups_btn_row1 = ttk.Frame(frame)
-        groups_btn_row1.pack(fill="x", padx=8, pady=(0, 2))
-        ttk.Button(groups_btn_row1, text="Add Member...", command=self._add_group_member).pack(
-            side="left", padx=4
-        )
-        ttk.Button(groups_btn_row1, text="Remove Member...", command=self._remove_group_member).pack(
-            side="left", padx=4
-        )
+        # A grid of equal-width columns instead of left-packed rows of
+        # varying button widths - packed rows left every row a different
+        # total width (jagged/uneven), since each button only takes the
+        # width its own label needs. Grouped by what the actions do:
+        # group lifecycle, membership, then share access.
+        groups_btn_frame = ttk.Frame(frame)
+        groups_btn_frame.pack(fill="x", padx=8, pady=(0, 4))
+        for col in range(3):
+            groups_btn_frame.columnconfigure(col, weight=1, uniform="groups_btn")
 
-        groups_btn_row2 = ttk.Frame(frame)
-        groups_btn_row2.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Button(
-            groups_btn_row2, text="Set Access Level...", command=self._set_access_level_for_group
-        ).pack(side="left", padx=4)
-        ttk.Button(groups_btn_row2, text="Delete Group", command=self._delete_selected_group).pack(
-            side="left", padx=4
-        )
+        def group_button(text, command, row, col):
+            ttk.Button(groups_btn_frame, text=text, command=command).grid(
+                row=row, column=col, sticky="ew", padx=4, pady=2
+            )
 
-        groups_btn_row3 = ttk.Frame(frame)
-        groups_btn_row3.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Button(groups_btn_row3, text="New Group...", command=self._create_new_group).pack(
-            side="left", padx=4
-        )
-        ttk.Button(
-            groups_btn_row3, text="Assign to Share...", command=self._assign_group_to_share
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            groups_btn_row3, text="Remove from Share...", command=self._unassign_group_from_share
-        ).pack(side="left", padx=4)
+        group_button("New Group...", self._create_new_group, 0, 0)
+        group_button("Delete Group", self._delete_selected_group, 0, 1)
+        group_button("Add Member...", self._add_group_member, 1, 0)
+        group_button("Remove Member...", self._remove_group_member, 1, 1)
+        group_button("Assign to Share...", self._assign_group_to_share, 2, 0)
+        group_button("Remove from Share...", self._unassign_group_from_share, 2, 1)
+        group_button("Set Access Level...", self._set_access_level_for_group, 2, 2)
 
         users_frame = ttk.LabelFrame(frame, text="Users")
         users_frame.pack(fill="both", expand=True, padx=8, pady=(4, 4))
