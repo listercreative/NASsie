@@ -8,7 +8,17 @@
            UpgradeCode="4c2e7f0a-9b1d-4e3a-8c6f-2a1b5d7e9f30"
            Compressed="yes">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Kelpie is already installed." />
+    <!-- AllowSameVersionUpgrades: Package/@Id (ProductCode) is left
+         unpinned, so every build gets a fresh auto-generated GUID (the
+         standard, recommended WiX practice) - but Version here doesn't
+         change between test rebuilds. Without this, WiX's default
+         upgrade-detection range excludes the exact current version, so
+         reinstalling the same version (new ProductCode, same Version) is
+         invisible to MajorUpgrade's logic entirely: it neither upgrades
+         nor blocks, it just installs as a second, unrelated product -
+         which is exactly how Kelpie ended up installable multiple times. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Kelpie is already installed." />
 
     <MediaTemplate EmbedCab="yes" />
 
