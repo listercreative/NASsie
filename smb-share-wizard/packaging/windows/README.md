@@ -51,8 +51,11 @@ alpha channel). To regenerate them after changing the source logo:
 from PIL import Image
 logo = Image.open("assets/kelpie_icon.png").convert("RGBA")
 
+# Logo sits at the right edge of the banner - WixUI draws the dialog
+# title/description text on top of this bitmap, left-aligned starting
+# around x=15, so anything placed there gets visually collided with.
 banner = Image.new("RGBA", (493, 58), (255, 255, 255, 255))
-banner.alpha_composite(logo.resize((46, 46), Image.LANCZOS), (10, 6))
+banner.alpha_composite(logo.resize((44, 44), Image.LANCZOS), (493 - 44 - 10, 7))
 banner.convert("RGB").save("packaging/windows/banner.bmp")
 
 dialog = Image.new("RGBA", (493, 312), (255, 255, 255, 255))
