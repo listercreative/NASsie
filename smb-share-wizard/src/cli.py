@@ -338,14 +338,16 @@ class CLIWizard(SMBWizard):
 
     def _manage_groups_screen(self):
         # Same two-step picker as _manage_users_screen: pick the group by
-        # number, then a numbered menu of just that group's actions.
+        # number, then a numbered menu of just that group's actions. Groups
+        # shown here are only the admin-created access-control kind (New
+        # Group) - a share's own auto-created ownership group is filesystem-
+        # permission-only and never shown, see core.py's _MANAGED_GROUP_PREFIX.
         while True:
             groups = self.list_groups()
 
             console.print("\n[bold]--- Groups ---[/bold]")
             if not groups:
-                print("No managed groups found.")
-                return
+                print("No groups yet.")
             for i, g in enumerate(groups):
                 print(f"{i}. {g['name']}")
                 for m in g["members"]:
@@ -353,9 +355,21 @@ class CLIWizard(SMBWizard):
                 for s in g["shares"]:
                     print(f"\tshare: {s}")
 
-            choice = input("\nEnter a group number to manage, or press Enter to return: ").strip()
+            choice = input(
+                "\nEnter a group number to manage, 'n' for a new group, or press Enter to return: "
+            ).strip().lower()
             if not choice:
                 return
+            if choice == 'n':
+                name = input("New group name: ").strip()
+                if not name:
+                    continue
+                system_name = self.add_group(name)
+                if system_name:
+                    print(f"Created group '{system_name}'.")
+                else:
+                    print("Failed to create group (or elevation was cancelled).")
+                continue
             if not choice.isdigit() or not (0 <= int(choice) < len(groups)):
                 print("Invalid option.")
                 continue
@@ -366,6 +380,9 @@ class CLIWizard(SMBWizard):
                 sub_options.append("Remove member")
             if group["members"] and group["shares"]:
                 sub_options.append("Set Access Level")
+            sub_options.append("Assign to share")
+            if group["shares"]:
+                sub_options.append("Remove from share")
             sub_options.append("Delete group")
             sub_options.append("Back")
 
@@ -445,6 +462,51 @@ class CLIWizard(SMBWizard):
                     print(f"Set '{group['name']}''s members to {'read-only' if read_only else 'read-write'} on '{share_name}'.")
                 else:
                     print("Failed to change access level (or elevation was cancelled).")
+            elif action == "Assign to share":
+                # A real, persistent grant (unlike "Set Access Level" above)
+                # - any current or future member of the group gets this
+                # access, since Windows/Samba/macOS all resolve group
+                # membership live at connect time.
+                shares = self.list_shares()
+                if not shares:
+                    print("No shares exist yet.")
+                    continue
+                print("Shares:")
+                for si, s in enumerate(shares):
+                    print(f"  {si}. {s['name']}")
+                sidx = input("Grant access to which share? ").strip()
+                if not sidx.isdigit() or not (0 <= int(sidx) < len(shares)):
+                    print("Invalid share number.")
+                    continue
+                share_name = shares[int(sidx)]["name"]
+                level = input("Grant members (r)ead-write or (o)nly read-only? [r/o] ").strip().lower()
+                if level not in ('r', 'o'):
+                    print("Invalid option.")
+                    continue
+                read_only = level == 'o'
+                if self.grant_group_share_access(group['name'], share_name, read_only):
+                    print(f"Assigned '{group['name']}' to '{share_name}' ({'read-only' if read_only else 'read-write'}).")
+                else:
+                    print("Failed to assign group to share (or elevation was cancelled).")
+            elif action == "Remove from share":
+                if len(group["shares"]) == 1:
+                    share_name = group["shares"][0]
+                else:
+                    print("Shares:")
+                    for si, sname in enumerate(group["shares"]):
+                        print(f"  {si}. {sname}")
+                    sidx = input("Remove access from which share? ").strip()
+                    if not sidx.isdigit() or not (0 <= int(sidx) < len(group["shares"])):
+                        print("Invalid share number.")
+                        continue
+                    share_name = group["shares"][int(sidx)]
+                confirm = input(f"Remove '{group['name']}''s access to '{share_name}'? [y/N] ").strip().lower()
+                if confirm not in ('y', 'yes'):
+                    continue
+                if self.revoke_group_share_access(group['name'], share_name):
+                    print(f"Removed '{group['name']}''s access to '{share_name}'.")
+                else:
+                    print("Failed to remove group's access (or elevation was cancelled).")
             else:
                 confirm = input(f"Delete group '{group['name']}'? [y/N] ").strip().lower()
                 if confirm not in ('y', 'yes'):

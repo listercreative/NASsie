@@ -5,7 +5,7 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
 
 from core import SMBWizard, QR_PASSWORD_RESET_NOTE
@@ -396,6 +396,18 @@ class GUIWizard:
             side="left", padx=4
         )
 
+        groups_btn_row3 = ttk.Frame(frame)
+        groups_btn_row3.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Button(groups_btn_row3, text="New Group...", command=self._create_new_group).pack(
+            side="left", padx=4
+        )
+        ttk.Button(
+            groups_btn_row3, text="Assign to Share...", command=self._assign_group_to_share
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            groups_btn_row3, text="Remove from Share...", command=self._unassign_group_from_share
+        ).pack(side="left", padx=4)
+
         users_frame = ttk.LabelFrame(frame, text="Users")
         users_frame.pack(fill="both", expand=True, padx=8, pady=(4, 4))
         users_frame.rowconfigure(0, weight=1)
@@ -453,7 +465,14 @@ class GUIWizard:
             padx=8, pady=(0, 8), anchor="w"
         )
 
-    def _populate_users_groups(self, groups, users, access_lookup):
+    def _populate_users_groups(self, groups, users, access_lookup, overrides, shares):
+        # (group_name, share_name) -> read_only, for the access level shown
+        # next to each of a group's assigned shares below.
+        group_share_access = {
+            (s["access_group"], s["name"]): s.get("access_group_read_only", False)
+            for s in shares if s.get("access_group")
+        }
+
         for item in self.groups_list.get_children():
             self.groups_list.delete(item)
         for g in groups:
@@ -461,7 +480,8 @@ class GUIWizard:
             for m in g["members"]:
                 self.groups_list.insert(gid, tk.END, text=f"user: {m}")
             for s in g["shares"]:
-                self.groups_list.insert(gid, tk.END, text=f"share: {s}")
+                level = "read-only" if group_share_access.get((g["name"], s)) else "full access"
+                self.groups_list.insert(gid, tk.END, text=f"share: {s} ({level})")
 
         for item in self.system_users_list.get_children():
             self.system_users_list.delete(item)
@@ -471,12 +491,22 @@ class GUIWizard:
                 self.system_users_list.insert(uid, tk.END, text=f"group: {g}")
             for s in u["shares"]:
                 suffix = " (read-only)" if access_lookup.get((s, u["username"])) else ""
+                override = overrides.get((s, u["username"]))
+                if override:
+                    # This user's own read-only setting above is masked by
+                    # a group grant - Windows/Samba/macOS all resolve
+                    # group access without regard to it, so it's misleading
+                    # to show just "(read-only)" with nothing else to
+                    # explain why they can actually still write.
+                    suffix += f" [overridden by group '{override[0]}': full access]"
                 self.system_users_list.insert(uid, tk.END, text=f"share: {s}{suffix}")
 
     def _refresh_users_groups(self):
         shares = self.wizard.list_shares()
+        groups = self.wizard.list_groups()
         self._populate_users_groups(
-            self.wizard.list_groups(), self.wizard.list_users(), self.wizard.build_access_lookup(shares)
+            groups, self.wizard.list_users(), self.wizard.build_access_lookup(shares),
+            self.wizard.effective_share_access(shares, groups), shares
         )
 
     def _refresh_all_lists(self):
@@ -494,10 +524,11 @@ class GUIWizard:
         users = self.wizard.list_users()
 
         access_lookup = self.wizard.build_access_lookup(shares)
+        overrides = self.wizard.effective_share_access(shares, groups)
 
         def apply():
-            self._populate_shares_list(shares)
-            self._populate_users_groups(groups, users, access_lookup)
+            self._populate_shares_list(shares, overrides)
+            self._populate_users_groups(groups, users, access_lookup, overrides, shares)
 
         self.root.after(0, apply)
 
@@ -544,20 +575,30 @@ class GUIWizard:
             del self.pending_users[index]
             self.users_list.delete(item)
 
-    def _populate_shares_list(self, shares):
+    def _populate_shares_list(self, shares, overrides=None):
         # list_shares() only reflects live share config (Get-SmbShare /
         # smb.conf) - it has no idea whether the folder that config points
         # at still exists, since the OS never removes a share just because
         # its target got deleted out from under it. Flag that here instead,
         # so an orphaned share (folder deleted outside Kelpie) is visibly
         # different from a normal one rather than silently looking fine.
+        overrides = overrides or {}
         for item in self.shares_list.get_children():
             self.shares_list.delete(item)
         for share in shares:
-            users = ", ".join(
-                u["username"] + (" (read-only)" if u.get("read_only") else "")
-                for u in share.get("users", [])
-            ) or "(none)"
+            user_labels = []
+            for u in share.get("users", []):
+                label = u["username"] + (" (read-only)" if u.get("read_only") else "")
+                override = overrides.get((share.get("name"), u["username"]))
+                if override:
+                    # Their own read-only setting above is masked by a
+                    # group grant - see effective_share_access().
+                    label += f" [overridden by group '{override[0]}']"
+                user_labels.append(label)
+            users = ", ".join(user_labels) or "(none)"
+            if share.get("access_group"):
+                level = "read-only" if share.get("access_group_read_only") else "full access"
+                users += f"; group '{share['access_group']}' ({level})"
             path = share.get("path") or "Unknown"
             if path != "Unknown" and not os.path.isdir(path):
                 path = f"{path}  (folder missing!)"
@@ -566,7 +607,9 @@ class GUIWizard:
             )
 
     def _refresh_manage_list(self):
-        self._populate_shares_list(self.wizard.list_shares())
+        shares = self.wizard.list_shares()
+        overrides = self.wizard.effective_share_access(shares, self.wizard.list_groups())
+        self._populate_shares_list(shares, overrides)
 
     def _add_user_to_selected_share(self):
         selection = self.shares_list.selection()
@@ -1025,6 +1068,142 @@ class GUIWizard:
             messagebox.showinfo("Deleted", f"Deleted group '{group_name}'.")
         else:
             messagebox.showerror("Failed", f"Could not delete group '{group_name}' — see log.")
+        self._refresh_all_lists()
+
+    def _create_new_group(self):
+        # A standalone access-control group, not tied to any share until
+        # explicitly assigned via "Assign to Share..." - unlike a share's
+        # own auto-created ownership group (filesystem-permission-only,
+        # never shown here), this one grants real, persistent SMB access
+        # to whatever it's assigned to.
+        name = simpledialog.askstring("New Group", "Group name:", parent=self.root)
+        if not name or not name.strip():
+            return
+        threading.Thread(target=self._create_group_worker, args=(name.strip(),), daemon=True).start()
+
+    def _create_group_worker(self, name):
+        buffer = io.StringIO()
+        system_name = None
+        try:
+            with contextlib.redirect_stdout(buffer):
+                system_name = self.wizard.add_group(name)
+        except Exception as e:
+            buffer.write(f"\nUnexpected error: {e}\n")
+        self.root.after(0, lambda: self._create_group_done(name, system_name, buffer.getvalue()))
+
+    def _create_group_done(self, name, system_name, log_output):
+        if log_output.strip():
+            self._append_log(log_output)
+        if system_name:
+            messagebox.showinfo("Created", f"Created group '{system_name}'.")
+        else:
+            messagebox.showerror("Failed", f"Could not create group '{name}' — see log.")
+        self._refresh_all_lists()
+
+    def _assign_group_to_share(self):
+        group_name = self._selected_top_level_text(self.groups_list)
+        if not group_name:
+            messagebox.showinfo("Assign to Share", "Select a group first.")
+            return
+        shares = [s["name"] for s in self.wizard.list_shares()]
+        if not shares:
+            messagebox.showinfo("Assign to Share", "No shares exist yet.")
+            return
+        share_dialog = ChoiceDialog(
+            self.root, "Choose share", f"Grant '{group_name}' access to which share?", shares, ok_label="Next"
+        )
+        if not share_dialog.result:
+            return
+        share_name = share_dialog.result
+
+        level_dialog = ChoiceDialog(
+            self.root, "Access level", f"Grant '{group_name}' members:",
+            ["Read-write", "Read-only"], ok_label="Assign"
+        )
+        if not level_dialog.result:
+            return
+        read_only = level_dialog.result == "Read-only"
+
+        if not messagebox.askyesno(
+            "Assign to Share",
+            f"Grant '{group_name}' {level_dialog.result.lower()} access to '{share_name}'? "
+            f"Every current and future member gets this access - not a one-time snapshot.",
+        ):
+            return
+
+        threading.Thread(
+            target=self._assign_group_share_worker, args=(group_name, share_name, read_only), daemon=True
+        ).start()
+
+    def _assign_group_share_worker(self, group_name, share_name, read_only):
+        buffer = io.StringIO()
+        ok = False
+        try:
+            with contextlib.redirect_stdout(buffer):
+                ok = self.wizard.grant_group_share_access(group_name, share_name, read_only)
+        except Exception as e:
+            buffer.write(f"\nUnexpected error: {e}\n")
+        self.root.after(
+            0, lambda: self._assign_group_share_done(group_name, share_name, ok, buffer.getvalue())
+        )
+
+    def _assign_group_share_done(self, group_name, share_name, ok, log_output):
+        if log_output.strip():
+            self._append_log(log_output)
+        if ok:
+            messagebox.showinfo("Assigned", f"Assigned '{group_name}' to '{share_name}'.")
+        else:
+            messagebox.showerror("Failed", f"Could not assign '{group_name}' to '{share_name}' — see log.")
+        self._refresh_all_lists()
+
+    def _unassign_group_from_share(self):
+        group_name = self._selected_top_level_text(self.groups_list)
+        if not group_name:
+            messagebox.showinfo("Remove from Share", "Select a group first.")
+            return
+        group = next((g for g in self.wizard.list_groups() if g["name"] == group_name), None)
+        if not group or not group["shares"]:
+            messagebox.showinfo("Remove from Share", f"'{group_name}' isn't assigned to any share.")
+            return
+        if len(group["shares"]) == 1:
+            share_name = group["shares"][0]
+        else:
+            dialog = ChoiceDialog(
+                self.root, "Choose share", f"Remove '{group_name}' from which share?",
+                group["shares"], ok_label="Next"
+            )
+            if not dialog.result:
+                return
+            share_name = dialog.result
+
+        if not messagebox.askyesno(
+            "Remove from Share", f"Remove '{group_name}''s access to '{share_name}'?"
+        ):
+            return
+
+        threading.Thread(
+            target=self._unassign_group_share_worker, args=(group_name, share_name), daemon=True
+        ).start()
+
+    def _unassign_group_share_worker(self, group_name, share_name):
+        buffer = io.StringIO()
+        ok = False
+        try:
+            with contextlib.redirect_stdout(buffer):
+                ok = self.wizard.revoke_group_share_access(group_name, share_name)
+        except Exception as e:
+            buffer.write(f"\nUnexpected error: {e}\n")
+        self.root.after(
+            0, lambda: self._unassign_group_share_done(group_name, share_name, ok, buffer.getvalue())
+        )
+
+    def _unassign_group_share_done(self, group_name, share_name, ok, log_output):
+        if log_output.strip():
+            self._append_log(log_output)
+        if ok:
+            messagebox.showinfo("Removed", f"Removed '{group_name}''s access to '{share_name}'.")
+        else:
+            messagebox.showerror("Failed", f"Could not remove '{group_name}''s access to '{share_name}' — see log.")
         self._refresh_all_lists()
 
     def _delete_selected_share(self):

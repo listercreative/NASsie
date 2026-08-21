@@ -57,6 +57,9 @@ Usage:
         "--delete-group": "delete_group_from_file",
         "--assign-group": "assign_user_to_group_from_file",
         "--revoke-group": "revoke_group_membership_from_file",
+        "--create-group": "create_group_from_file",
+        "--assign-group-share": "assign_group_to_share_from_file",
+        "--unassign-group-share": "unassign_group_from_share_from_file",
     }
 
     try:

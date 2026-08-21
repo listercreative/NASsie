@@ -323,6 +323,26 @@ class TUIWizard:
                 print(f"Removed '{action['username']}' from group '{action['group']}'.")
             else:
                 print("Failed to remove from group (or elevation was cancelled).")
+        elif kind == "create_group":
+            print(f"\n--- Creating group '{action['name']}' ---")
+            system_name = self.wizard.add_group(action["name"])
+            if system_name:
+                print(f"Created group '{system_name}'.")
+            else:
+                print("Failed to create group (or elevation was cancelled).")
+        elif kind == "assign_group_share":
+            level = "read-only" if action["read_only"] else "read-write"
+            print(f"\n--- Assigning '{action['group']}' to '{action['share']}' ({level}) ---")
+            if self.wizard.grant_group_share_access(action["group"], action["share"], action["read_only"]):
+                print(f"Assigned '{action['group']}' to '{action['share']}'.")
+            else:
+                print("Failed to assign group to share (or elevation was cancelled).")
+        elif kind == "unassign_group_share":
+            print(f"\n--- Removing '{action['group']}''s access to '{action['share']}' ---")
+            if self.wizard.revoke_group_share_access(action["group"], action["share"]):
+                print(f"Removed '{action['group']}''s access to '{action['share']}'.")
+            else:
+                print("Failed to remove group's access (or elevation was cancelled).")
 
     def _launch_gui_outside_curses(self):
         try:
@@ -457,6 +477,38 @@ class TUIWizard:
                 )
                 print(output, end="")
             print(f"Removed '{username}' from group '{group}'." if ok else "Failed to remove from group.")
+        elif kind == "create_group":
+            name = action["name"]
+            print(f"--- Creating group '{name}' ---")
+            if self.wizard.has_admin_privileges():
+                ok = self.wizard.create_group(name)
+            else:
+                ok, output = self.wizard._elevated_relaunch_capturing("--create-group", {"name": name})
+                print(output, end="")
+            print(f"Created group '{name}'." if ok else "Failed to create group.")
+        elif kind == "assign_group_share":
+            group, share, read_only = action["group"], action["share"], action["read_only"]
+            level = "read-only" if read_only else "read-write"
+            print(f"--- Assigning '{group}' to '{share}' ({level}) ---")
+            if self.wizard.has_admin_privileges():
+                ok = self.wizard.assign_group_to_share(group, share, read_only)
+            else:
+                ok, output = self.wizard._elevated_relaunch_capturing(
+                    "--assign-group-share", {"group": group, "share": share, "read_only": read_only}
+                )
+                print(output, end="")
+            print(f"Assigned '{group}' to '{share}'." if ok else "Failed to assign group to share.")
+        elif kind == "unassign_group_share":
+            group, share = action["group"], action["share"]
+            print(f"--- Removing '{group}''s access to '{share}' ---")
+            if self.wizard.has_admin_privileges():
+                ok = self.wizard.unassign_group_from_share(group, share)
+            else:
+                ok, output = self.wizard._elevated_relaunch_capturing(
+                    "--unassign-group-share", {"group": group, "share": share}
+                )
+                print(output, end="")
+            print(f"Removed '{group}''s access to '{share}'." if ok else "Failed to remove group's access.")
 
     def _run_privileged_action(self, stdscr, busy_message, work_fn):
         # Runs work_fn() (which prints via stdout) in a background thread
@@ -1017,7 +1069,8 @@ class TUIWizard:
 
     def _users_groups_flow(self, stdscr):
         # Returns an action dict to apply outside curses (revoke_access /
-        # delete_user / delete_group / assign_group / revoke_group), or
+        # delete_user / delete_group / assign_group / revoke_group /
+        # create_group / assign_group_share / unassign_group_share), or
         # None once the user backs all the way out (Esc/q at any level -
         # no separate "Back" entries needed). Users and Groups are
         # deliberately separate screens - easier to look at one without the
@@ -1077,11 +1130,13 @@ class TUIWizard:
     def _groups_screen_flow(self, stdscr):
         while True:
             groups = self.wizard.list_groups()
-            if not groups:
-                self._message(stdscr, "No managed groups found.")
-                return None
 
-            items = [
+            # "+ New Group" always available, even with no existing groups -
+            # a standalone access-control group, not tied to any share
+            # until explicitly assigned via "Assign to share". Unlike a
+            # share's own auto-created ownership group (filesystem-
+            # permission-only), this is never created automatically.
+            items = [("+ New Group", [])] + [
                 (g["name"], [f"user: {m}" for m in g["members"]] + [f"share: {s}" for s in g["shares"]])
                 for g in groups
             ]
@@ -1089,7 +1144,16 @@ class TUIWizard:
             if idx is None:
                 return None
 
-            action = self._manage_group_flow(stdscr, groups[idx])
+            if idx == 0:
+                name = self._text_input(stdscr, "Group name:")
+                if not name:
+                    continue
+                action = self._apply_or_bubble(stdscr, {"action": "create_group", "name": name})
+                if action:
+                    return action
+                continue
+
+            action = self._manage_group_flow(stdscr, groups[idx - 1])
             if action:
                 return action
             # otherwise back out of the submenu - show this screen again
@@ -1228,6 +1292,9 @@ class TUIWizard:
             sub_options.append("Remove member")
         if group["members"] and group["shares"]:
             sub_options.append("Set Access Level")
+        sub_options.append("Assign to share")
+        if group["shares"]:
+            sub_options.append("Remove from share")
         sub_options.append("Delete group")
         sub_idx = self._menu(
             stdscr, group["name"], sub_options,
@@ -1284,6 +1351,50 @@ class TUIWizard:
                 return None
             action = {"action": "revoke_group", "username": group["members"][midx], "group": group["name"]}
 
+        elif choice == "Assign to share":
+            # A real, persistent grant (unlike "Set Access Level" above) -
+            # any current or future member of the group gets this access,
+            # since Windows/Samba/macOS all resolve group membership live
+            # at connect time.
+            shares = [s["name"] for s in self.wizard.list_shares()]
+            if not shares:
+                self._message(stdscr, "No shares exist yet.")
+                return None
+            sidx = self._menu(stdscr, f"Grant '{group['name']}' access to which share?", shares)
+            if sidx is None:
+                return None
+            share_name = shares[sidx]
+            level_choice = self._menu(stdscr, f"Grant '{group['name']}' members:", ["Read-write", "Read-only"])
+            if level_choice is None:
+                return None
+            read_only = level_choice == 1
+            confirm = self._menu(
+                stdscr,
+                f"Grant '{group['name']}' {'read-only' if read_only else 'read-write'} access to '{share_name}'? "
+                f"Every current and future member gets this access.",
+                ["Yes, assign", "Cancel"],
+            )
+            if confirm != 0:
+                return None
+            action = {
+                "action": "assign_group_share", "group": group["name"], "share": share_name, "read_only": read_only
+            }
+
+        elif choice == "Remove from share":
+            if len(group["shares"]) == 1:
+                share_name = group["shares"][0]
+            else:
+                sidx = self._menu(stdscr, f"Remove '{group['name']}' from which share?", group["shares"])
+                if sidx is None:
+                    return None
+                share_name = group["shares"][sidx]
+            confirm = self._menu(
+                stdscr, f"Remove '{group['name']}''s access to '{share_name}'?", ["Yes, remove", "Cancel"]
+            )
+            if confirm != 0:
+                return None
+            action = {"action": "unassign_group_share", "group": group["name"], "share": share_name}
+
         else:
             confirm = self._menu(stdscr, f"Delete group '{group['name']}'?", ["Yes, delete", "Cancel"])
             if confirm != 0:
@@ -1309,6 +1420,9 @@ class TUIWizard:
             "assign_group": f"Adding '{action.get('username')}' to '{action.get('group')}'...",
             "revoke_group": f"Removing '{action.get('username')}' from '{action.get('group')}'...",
             "group_access": f"Setting access level for '{action.get('group')}' on '{action.get('share')}'...",
+            "create_group": f"Creating group '{action.get('name')}'...",
+            "assign_group_share": f"Assigning '{action.get('group')}' to '{action.get('share')}'...",
+            "unassign_group_share": f"Removing '{action.get('group')}''s access to '{action.get('share')}'...",
         }.get(action["action"], "Working...")
         self._run_privileged_action(stdscr, busy, lambda: self._users_groups_action_in_curses(action))
         return None

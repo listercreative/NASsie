@@ -243,6 +243,111 @@ class SMBWizard:
             return self.set_group_access_level(group_name, share_name, read_only)
         return self.elevate_and_change_group_access(group_name, share_name, read_only)
 
+    def create_group(self, name):
+        # Requires root/admin. Unlike a share's own ownership group
+        # (auto-created, filesystem-permission-only, never shown in the
+        # Groups UI - see _MANAGED_GROUP_PREFIX), this is a standalone,
+        # admin-requested access-control group: not tied to any share until
+        # explicitly assigned via assign_group_to_share(), and its members
+        # get real SMB-level access wherever it's assigned. Callers not
+        # already elevated should go through add_group() instead. Returns
+        # the actual system group name created (may be truncated/sanitized
+        # from `name`), or None on an unsupported platform.
+        system_name = self._access_group_system_name(name)
+        if self.system == "Linux":
+            self._ensure_group(system_name)
+        elif self.system == "Darwin":
+            self._ensure_macos_group(system_name)
+        elif self.system == "Windows":
+            self._ensure_windows_group(system_name)
+        else:
+            return None
+        return system_name
+
+    def add_group(self, name):
+        if self.has_admin_privileges():
+            return self.create_group(name)
+        return self.elevate_and_create_group(name)
+
+    def _access_group_system_name(self, name):
+        if self.system == "Windows":
+            return self._windows_access_group_name(name)
+        return self._posix_access_group_name(name)
+
+    def assign_group_to_share(self, group_name, share_name, read_only):
+        # Requires root/admin. Grants group_name real, persistent SMB-level
+        # access to share_name (Full or Read) - unlike set_group_access_level
+        # above, this is NOT a one-time snapshot: any current or future
+        # member of the group gets this access, since Windows/Samba/macOS
+        # all resolve group membership live at connect time. Deliberately
+        # opt-in and explicit (a separate action from share/user creation,
+        # which never touches this) - see _MANAGED_GROUP_PREFIX's comment
+        # on why this project stopped short of doing this automatically.
+        # Callers not already elevated should go through
+        # grant_group_share_access() instead.
+        if self.system == "Linux":
+            return self._assign_group_to_share_linux(group_name, share_name, read_only)
+        elif self.system == "Darwin":
+            return self._assign_group_to_share_macos(group_name, share_name, read_only)
+        elif self.system == "Windows":
+            return self._assign_group_to_share_windows(group_name, share_name, read_only)
+        return False
+
+    def grant_group_share_access(self, group_name, share_name, read_only):
+        if self.has_admin_privileges():
+            return self.assign_group_to_share(group_name, share_name, read_only)
+        return self.elevate_and_assign_group_to_share(group_name, share_name, read_only)
+
+    def unassign_group_from_share(self, group_name, share_name):
+        # Requires root/admin. The inverse of assign_group_to_share() -
+        # revokes the group's own grant on this one share; members keep
+        # whatever individual per-user access they were separately given.
+        # Callers not already elevated should go through
+        # revoke_group_share_access() instead.
+        if self.system == "Linux":
+            return self._unassign_group_from_share_linux(group_name, share_name)
+        elif self.system == "Darwin":
+            return self._unassign_group_from_share_macos(group_name, share_name)
+        elif self.system == "Windows":
+            return self._unassign_group_from_share_windows(group_name, share_name)
+        return False
+
+    def revoke_group_share_access(self, group_name, share_name):
+        if self.has_admin_privileges():
+            return self.unassign_group_from_share(group_name, share_name)
+        return self.elevate_and_unassign_group_from_share(group_name, share_name)
+
+    @staticmethod
+    def effective_share_access(shares, groups):
+        # For every (share, username) where a group assigned to that share
+        # (via assign_group_to_share) grants MORE access than the user's own
+        # per-user setting, records what's actually overriding them - so the
+        # UI can flag it instead of silently showing a read-only tag that
+        # Windows/Samba/the ACL will actually ignore. dict of
+        # (share_name, username) -> (group_name, group_read_only).
+        overrides = {}
+        member_of = {}
+        for g in groups:
+            for member in g["members"]:
+                member_of.setdefault(member, []).append(g["name"])
+
+        for share in shares:
+            access_group = share.get("access_group")
+            if not access_group:
+                continue
+            group_read_only = share.get("access_group_read_only", False)
+            for user in share.get("users", []):
+                username = user["username"]
+                if access_group not in member_of.get(username, []):
+                    continue
+                user_read_only = user.get("read_only", False)
+                # Full-via-group always beats a per-user read-only setting;
+                # a group grant that's itself read-only never overrides
+                # anything (it can't grant more than the user already has).
+                if user_read_only and not group_read_only:
+                    overrides[(share["name"], username)] = (access_group, group_read_only)
+        return overrides
+
     def remove_user_from_share(self, share_name, username):
         # Requires root. Revokes access to one share only (valid-users entry
         # + group membership) - the account itself, and its access to any
@@ -342,11 +447,14 @@ class SMBWizard:
             return self.remove_user_from_group(username, group_name)
         return self.elevate_and_revoke_group(username, group_name)
 
-    # Prefix Kelpie gives the group it creates per share, so groups it
-    # manages can be recognized even if a share block referencing them was
-    # since removed (an orphaned group left over from a deleted share is
-    # still worth surfacing, not silently hidden).
-    _MANAGED_GROUP_PREFIX = {"Linux": "smbshare_", "Darwin": "kelpie_"}
+    # Prefix for admin-created, user-facing access-control groups (New
+    # Group / Assign to Share) - distinct from the per-share ownership
+    # group (smbshare_<slug>/kelpie_<slug>/Kelpie_<share>, still created
+    # automatically for every share, still filesystem-permission-only)
+    # so list_groups() can show only the former: an ownership group was
+    # never something an admin asked for or can meaningfully act on, so
+    # it's never surfaced as if it were a real group.
+    _MANAGED_GROUP_PREFIX = {"Linux": "kelpiegrp_", "Darwin": "kelpiegrp_"}
 
     def list_groups(self):
         # Linux and macOS are both POSIX: the same grp-database read works
@@ -419,20 +527,28 @@ class SMBWizard:
         shares = self.list_shares()
         group_to_shares = {}
         for share in shares:
-            group = share.get("group")
+            group = share.get("access_group")
             if group:
                 group_to_shares.setdefault(group, []).append(share["name"])
 
         prefix = self._MANAGED_GROUP_PREFIX.get(self.system)
         groups = []
         for g in grp.getgrall():
-            if g.gr_name in group_to_shares or (prefix and g.gr_name.startswith(prefix)):
+            if prefix and g.gr_name.startswith(prefix):
                 groups.append({
                     "name": g.gr_name,
                     "members": sorted(g.gr_mem),
                     "shares": sorted(group_to_shares.get(g.gr_name, [])),
                 })
         return sorted(groups, key=lambda x: x["name"])
+
+    def _posix_access_group_name(self, name):
+        # Shared by Linux/macOS - both use the same kelpiegrp_ prefix (see
+        # _MANAGED_GROUP_PREFIX) since neither has a reason to distinguish
+        # them, unlike the ownership-group names which historically differ
+        # per platform.
+        slug = re.sub(r'[^a-z0-9_-]', '_', name.lower()).strip('_-') or "group"
+        return f"kelpiegrp_{slug}"[:32]
 
     def _group_for_path(self, path):
         # Shared by the Linux/macOS list_shares implementations: the group
@@ -694,6 +810,17 @@ class SMBWizard:
     def elevate_and_revoke_group(self, username, group_name):
         return self._elevated_relaunch("--revoke-group", {"username": username, "group": group_name})
 
+    def elevate_and_create_group(self, name):
+        return self._elevated_relaunch("--create-group", {"name": name})
+
+    def elevate_and_assign_group_to_share(self, group_name, share_name, read_only):
+        return self._elevated_relaunch(
+            "--assign-group-share", {"group": group_name, "share": share_name, "read_only": read_only}
+        )
+
+    def elevate_and_unassign_group_from_share(self, group_name, share_name):
+        return self._elevated_relaunch("--unassign-group-share", {"group": group_name, "share": share_name})
+
     @staticmethod
     def apply_from_file(path):
         try:
@@ -862,6 +989,51 @@ class SMBWizard:
         wizard._invoking_user_override = data.get('_invoking_user')
         wizard.remove_user_from_group(data['username'], data['group'])
 
+    @staticmethod
+    def create_group_from_file(path):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        wizard = SMBWizard()
+        wizard._invoking_user_override = data.get('_invoking_user')
+        wizard.create_group(data['name'])
+
+    @staticmethod
+    def assign_group_to_share_from_file(path):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        wizard = SMBWizard()
+        wizard._invoking_user_override = data.get('_invoking_user')
+        wizard.assign_group_to_share(data['group'], data['share'], data['read_only'])
+
+    @staticmethod
+    def unassign_group_from_share_from_file(path):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        wizard = SMBWizard()
+        wizard._invoking_user_override = data.get('_invoking_user')
+        wizard.unassign_group_from_share(data['group'], data['share'])
+
     _UNINSTALL_FOLDERS_RESULT_FILE = "kelpie_uninstall_folders.json"
 
     @staticmethod
@@ -955,23 +1127,30 @@ class SMBWizard:
         print("[Windows] Removing Kelpie-managed shares, accounts, and groups...")
         wizard = SMBWizard()
         marker = wizard._ps_quote(SMBWizard._WINDOWS_ACCOUNT_MARKER)
+
+        # A share is "Kelpie's" if its deterministically-named ownership
+        # group actually exists (see _list_shares_windows()) - NOT by
+        # scanning the share's own SMB ACL for a Kelpie-prefixed group the
+        # way an earlier version of this tried to: the ownership group is
+        # never itself granted SMB access (run_windows() grants per-user
+        # only), so that scan could never have matched anything for an
+        # ordinary share, only for one with an admin-assigned access-control
+        # group. Determined here in Python (reusing the already-correct
+        # list_shares() logic) rather than re-derived inside the PS script.
+        kelpie_share_names = [s["name"] for s in wizard.list_shares() if s.get("group")]
+        share_list_ps = "@(" + ",".join(f"'{wizard._ps_quote(n)}'" for n in kelpie_share_names) + ")"
+
         script = f"""
 $ErrorActionPreference = 'Stop'
-$kelpieGroups = Get-LocalGroup | Where-Object {{ $_.Name -like 'Kelpie_*' }}
-
-# A share is "Kelpie's" if one of its own Kelpie_* groups appears on its
-# ACL - checked here, before the groups themselves are removed below,
-# since a removed group's ACE degrades to an unresolvable SID and the
-# share could no longer be recognized as Kelpie's afterward.
-Get-SmbShare | Where-Object {{ $_.Name -notin @('ADMIN$','C$','IPC$','print$') }} | ForEach-Object {{
-    $shareName = $_.Name
-    $isKelpieShare = Get-SmbShareAccess -Name $shareName -ErrorAction SilentlyContinue | Where-Object {{
-        $_.AccountName.Split('\\')[-1] -like 'Kelpie_*'
-    }}
-    if ($isKelpieShare) {{
-        Remove-SmbShare -Name $shareName -Force -ErrorAction SilentlyContinue
-    }}
+foreach ($shareName in {share_list_ps}) {{
+    Remove-SmbShare -Name $shareName -Force -ErrorAction SilentlyContinue
 }}
+
+# 'Kelpie*' (no underscore) so this also catches KelpieGroup_* - the
+# admin-created access-control groups (New Group), distinct from the
+# per-share ownership groups (Kelpie_<share>) but equally Kelpie's to
+# clean up on a genuine uninstall.
+$kelpieGroups = Get-LocalGroup | Where-Object {{ $_.Name -like 'Kelpie*' }}
 
 $affectedUsers = @{{}}
 foreach ($g in $kelpieGroups) {{
@@ -1076,6 +1255,13 @@ foreach ($username in $affectedUsers.Keys) {{
     def _windows_group_name(self, share_name):
         cleaned = re.sub(r'[\"/\\\[\]:;|=,+*?<>@\x00-\x1f]', '_', share_name).strip()
         return f"Kelpie_{cleaned or 'Share'}"[:64]
+
+    def _windows_access_group_name(self, name):
+        # KelpieGroup_ (not Kelpie_<share>) so admin-created access-control
+        # groups are unambiguously distinct from the per-share ownership
+        # group - see _MANAGED_GROUP_PREFIX's comment.
+        cleaned = re.sub(r'[\"/\\\[\]:;|=,+*?<>@\x00-\x1f]', '_', name).strip()
+        return f"KelpieGroup_{cleaned or 'Group'}"[:64]
 
     def _run_ps_script(self, script, **kwargs):
         # For scripts too long/braces-heavy to safely embed as a single
@@ -1326,6 +1512,20 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         if isinstance(data, dict):
             data = [data]
 
+        # Which of the deterministically-named ownership groups (Kelpie_
+        # <share>) actually exist, so share["group"] below reflects reality
+        # instead of being set for shares Kelpie never touched. One extra
+        # Get-LocalGroup call, batched here rather than per-share.
+        group_cmd = "Get-LocalGroup | Where-Object { $_.Name -like 'Kelpie*' } | Select-Object -ExpandProperty Name"
+        group_proc = _run(["powershell", "-Command", group_cmd], capture_output=True, text=True)
+        existing_groups = set()
+        if group_proc.returncode == 0 and group_proc.stdout.strip():
+            try:
+                group_data = json.loads(group_proc.stdout)
+            except json.JSONDecodeError:
+                group_data = []
+            existing_groups = set(self._as_list(group_data))
+
         # Housekeeping/placeholder accounts that can show up in a share's
         # SMB ACL but were never a Kelpie-managed per-user grant - never
         # surfaced as if they were a real share user.
@@ -1340,12 +1540,32 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
 
         shares = []
         for s in data:
-            share = {"name": s["Name"], "path": s.get("Path", ""), "users": [], "group": None}
+            share_name = s["Name"]
+            # The ownership group is unconditionally created for every
+            # share (see run_windows()) but is never itself granted SMB
+            # access, so it can never be discovered by scanning the ACL
+            # below the way it used to try to (that branch was dead code -
+            # it never matched anything, which is why the Groups tree
+            # never showed a group's share). Compute its deterministic name
+            # directly, and only report it if that group actually exists.
+            ownership_group = self._windows_group_name(share_name)
+            share = {
+                "name": share_name,
+                "path": s.get("Path", ""),
+                "users": [],
+                "group": ownership_group if ownership_group in existing_groups else None,
+                "access_group": None,
+                "access_group_read_only": None,
+            }
             for entry in self._as_list(s.get("Access")):
                 account = entry.get("AccountName", "")
                 name = account.split("\\")[-1]
-                if name.startswith("Kelpie_"):
-                    share["group"] = name
+                if name.startswith("KelpieGroup_"):
+                    # Unlike the ownership group, an access-control group
+                    # (assign_group_to_share()) IS a real SMB ACE, so this
+                    # scan does find it.
+                    share["access_group"] = name
+                    share["access_group_read_only"] = entry.get("AccessRight") not in ("Full", "Change")
                     continue
                 if name in non_user_accounts or sid_pattern.match(name):
                     continue
@@ -1373,7 +1593,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         # pass through _list_shares_windows()'s own per-share loop - batch
         # groups+members into a single call, and reuse one shares fetch.
         cmd = (
-            "Get-LocalGroup | Where-Object { $_.Name -like 'Kelpie_*' } "
+            "Get-LocalGroup | Where-Object { $_.Name -like 'KelpieGroup_*' } "
             "| ForEach-Object { "
             "[PSCustomObject]@{ Name = $_.Name; "
             "Members = (Get-LocalGroupMember -Group $_.Name | Select-Object -ExpandProperty Name) } "
@@ -1391,7 +1611,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
 
         group_to_shares = {}
         for share in self._list_shares_windows():
-            group = share.get("group")
+            group = share.get("access_group")
             if group:
                 group_to_shares.setdefault(group, []).append(share["name"])
 
@@ -1431,6 +1651,32 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             f"-AccessRight {right} -Force"
         )
         _run(["powershell", "-Command", cmd], check=True, capture_output=True, text=True)
+
+    def _assign_group_to_share_windows(self, group_name, share_name, read_only):
+        # Same idempotent revoke-then-grant pattern as
+        # _set_windows_share_access, just targeting a group AccountName
+        # instead of a user - this is what makes it a real, persistent SMB
+        # grant (unlike the ownership group, which is never granted SMB
+        # access at all - see run_windows()'s comment on why per-user).
+        escaped_share = self._ps_quote(share_name)
+        escaped_group = self._ps_quote(group_name)
+        right = "Read" if read_only else "Full"
+        cmd = (
+            f"Revoke-SmbShareAccess -Name '{escaped_share}' -AccountName '{escaped_group}' "
+            f"-Force -ErrorAction SilentlyContinue | Out-Null; "
+            f"Grant-SmbShareAccess -Name '{escaped_share}' -AccountName '{escaped_group}' "
+            f"-AccessRight {right} -Force"
+        )
+        proc = _run(["powershell", "-Command", cmd], capture_output=True, text=True)
+        return proc.returncode == 0
+
+    def _unassign_group_from_share_windows(self, group_name, share_name):
+        cmd = (
+            f"Revoke-SmbShareAccess -Name '{self._ps_quote(share_name)}' "
+            f"-AccountName '{self._ps_quote(group_name)}' -Force -ErrorAction SilentlyContinue"
+        )
+        proc = _run(["powershell", "-Command", cmd], capture_output=True, text=True)
+        return proc.returncode == 0
 
     def _add_user_to_share_windows(self, share_name, username, password, read_only=False):
         shares = {s["name"]: s for s in self._list_shares_windows()}
@@ -1832,17 +2078,27 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
                 if key == 'path':
                     current["path"] = value
                 elif key == 'valid users':
-                    current["users"] = [
-                        {"username": u} for u in value.split() if u != self._NO_USERS_PLACEHOLDER
-                    ]
+                    tokens = [u for u in value.split() if u != self._NO_USERS_PLACEHOLDER]
+                    # A "@group" token is an admin-assigned access-control
+                    # group (assign_group_to_share), not a user - Samba
+                    # natively supports mixing "user1 @group1" in this
+                    # directive. At most one is ever written by Kelpie.
+                    current["users"] = [{"username": u} for u in tokens if not u.startswith('@')]
+                    group_tokens = [u[1:] for u in tokens if u.startswith('@')]
+                    current["access_group"] = group_tokens[0] if group_tokens else None
                 elif key == 'read list':
                     current["_read_only"] = value.split()
         flush()
         for share in shares:
             share["group"] = self._group_for_path(share.get("path"))
+            share.setdefault("access_group", None)
             read_only_usernames = share.pop("_read_only")
             for user in share["users"]:
                 user["read_only"] = user["username"] in read_only_usernames
+            access_group = share.get("access_group")
+            share["access_group_read_only"] = bool(
+                access_group and f"@{access_group}" in read_only_usernames
+            )
         return shares
 
     def _delete_share_linux(self, name):
@@ -1988,6 +2244,40 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
                 users.append(username)
             return users
         self._rewrite_read_list(share_name, mutate)
+
+    def _assign_group_to_share_linux(self, group_name, share_name, read_only):
+        # "@group" in "valid users" is Samba's native group-principal
+        # syntax, reusing the exact same rewrite helpers per-user access
+        # already goes through - see _rewrite_valid_users/_rewrite_read_list.
+        token = f"@{group_name}"
+
+        def mutate_valid(users):
+            users = [u for u in users if u != self._NO_USERS_PLACEHOLDER]
+            return users if token in users else users + [token]
+        self._rewrite_valid_users(share_name, mutate_valid)
+
+        def mutate_read(users):
+            users = [u for u in users if u != token]
+            if read_only:
+                users.append(token)
+            return users
+        self._rewrite_read_list(share_name, mutate_read)
+
+        try:
+            self._restart_samba_service()
+        except Exception as e:
+            print(f"[Linux] Assigned '{group_name}' to '{share_name}' but failed to restart Samba: {e}")
+        return True
+
+    def _unassign_group_from_share_linux(self, group_name, share_name):
+        token = f"@{group_name}"
+        self._rewrite_valid_users(share_name, lambda users: [u for u in users if u != token])
+        self._rewrite_read_list(share_name, lambda users: [u for u in users if u != token])
+        try:
+            self._restart_samba_service()
+        except Exception as e:
+            print(f"[Linux] Unassigned '{group_name}' from '{share_name}' but failed to restart Samba: {e}")
+        return True
 
     def _add_user_to_share_linux(self, share_name, username, password, read_only=False):
         shares = {s["name"]: s for s in self._list_shares_linux()}
@@ -2200,7 +2490,32 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             shares.append({"name": name, "path": path or "", "users": []})
         for share in shares:
             share["group"] = self._group_for_path(share.get("path"))
+            share["access_group"], share["access_group_read_only"] = self._read_access_group_acl(
+                share.get("path")
+            )
         return shares
+
+    def _read_access_group_acl(self, path):
+        # Scans for a positive "group:<name> allow ..." ACL entry written
+        # by _assign_group_to_share_macos() - `ls -le` is the standard way
+        # to see ACL entries on macOS (chmod itself has no "list" mode).
+        # Unverified like every other macOS code path in this project - no
+        # test coverage.
+        if not path:
+            return None, False
+        proc = _run(["ls", "-lde", path], capture_output=True, text=True)
+        if proc.returncode != 0:
+            return None, False
+        prefix = self._MANAGED_GROUP_PREFIX.get("Darwin", "")
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("group:") or " allow " not in stripped:
+                continue
+            name = stripped.split(":", 1)[1].split(" ", 1)[0].strip()
+            if prefix and name.startswith(prefix):
+                rights = stripped.split(" allow ", 1)[1]
+                return name, "write" not in rights
+        return None, False
 
     def _delete_share_macos(self, name):
         proc = _run(["sharing", "-r", name], capture_output=True, text=True)
@@ -2224,6 +2539,42 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         else:
             # Not check=True: fine if this ACE was never there to begin with.
             _run(["chmod", "-a", f"{username} deny {deny_rights}", share_path], capture_output=True, text=True)
+
+    def _assign_group_to_share_macos(self, group_name, share_name, read_only):
+        # Unlike Windows/Samba, macOS's `sharing` CLI has no separate
+        # SMB-layer ACL to grant a group through - filesystem permissions
+        # are all there is. A positive ACL grant targeting the group
+        # principal is the closest equivalent to Grant-SmbShareAccess/
+        # "valid users = @group": members gain access without needing to
+        # join the share's own ownership group. Revoke-then-grant for the
+        # same idempotency reason as _set_read_only_macos's deny-entry.
+        # Unverified like every other macOS code path in this project.
+        shares = {s["name"]: s for s in self._list_shares_macos()}
+        share = shares.get(share_name)
+        if not share or not share.get("path"):
+            print(f"[macOS] No such share: '{share_name}'")
+            return False
+        path = share["path"]
+        full_rights = "read,write,append,delete,writeattr,writeextattr"
+        _run(["chmod", "-a", f"group:{group_name} allow {full_rights}", path], capture_output=True, text=True)
+        _run(["chmod", "-a", f"group:{group_name} allow read", path], capture_output=True, text=True)
+        rights = "read" if read_only else full_rights
+        proc = _run(
+            ["chmod", "+a", f"group:{group_name} allow {rights}", path], capture_output=True, text=True
+        )
+        return proc.returncode == 0
+
+    def _unassign_group_from_share_macos(self, group_name, share_name):
+        shares = {s["name"]: s for s in self._list_shares_macos()}
+        share = shares.get(share_name)
+        if not share or not share.get("path"):
+            print(f"[macOS] No such share: '{share_name}'")
+            return False
+        path = share["path"]
+        full_rights = "read,write,append,delete,writeattr,writeextattr"
+        _run(["chmod", "-a", f"group:{group_name} allow {full_rights}", path], capture_output=True, text=True)
+        _run(["chmod", "-a", f"group:{group_name} allow read", path], capture_output=True, text=True)
+        return True
 
     def _add_user_to_share_macos(self, share_name, username, password, read_only=False):
         shares = {s["name"]: s for s in self._list_shares_macos()}
