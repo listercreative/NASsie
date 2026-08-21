@@ -943,19 +943,36 @@ class SMBWizard:
     def uninstall_cleanup_windows():
         # Run by the MSI's uninstall custom action (see kelpie.wxs), before
         # Kelpie's own files are removed - nothing else would ever clean
-        # these up otherwise, since they're real local Windows accounts and
-        # groups living outside the app entirely. Deletes every Kelpie_*
-        # group, then only the users tagged with _WINDOWS_ACCOUNT_MARKER -
-        # i.e. accounts Kelpie itself created. A pre-existing Windows
-        # account that was merely granted access to a Kelpie share (never
-        # tagged, since _configure_windows_user only marks genuinely new
-        # accounts) is always left alone, no matter its group memberships.
-        print("[Windows] Removing Kelpie-managed local accounts and groups...")
+        # these up otherwise, since the SMB shares and the local accounts/
+        # groups behind them live outside the app entirely (Get-SmbShare
+        # doesn't care whether Kelpie.exe still exists). Removes every
+        # share Kelpie created, then every Kelpie_* group, then only the
+        # users tagged with _WINDOWS_ACCOUNT_MARKER - i.e. accounts Kelpie
+        # itself created. A pre-existing Windows account that was merely
+        # granted access to a Kelpie share (never tagged, since
+        # _configure_windows_user only marks genuinely new accounts) is
+        # always left alone, no matter its group memberships.
+        print("[Windows] Removing Kelpie-managed shares, accounts, and groups...")
         wizard = SMBWizard()
         marker = wizard._ps_quote(SMBWizard._WINDOWS_ACCOUNT_MARKER)
         script = f"""
 $ErrorActionPreference = 'Stop'
 $kelpieGroups = Get-LocalGroup | Where-Object {{ $_.Name -like 'Kelpie_*' }}
+
+# A share is "Kelpie's" if one of its own Kelpie_* groups appears on its
+# ACL - checked here, before the groups themselves are removed below,
+# since a removed group's ACE degrades to an unresolvable SID and the
+# share could no longer be recognized as Kelpie's afterward.
+Get-SmbShare | Where-Object {{ $_.Name -notin @('ADMIN$','C$','IPC$','print$') }} | ForEach-Object {{
+    $shareName = $_.Name
+    $isKelpieShare = Get-SmbShareAccess -Name $shareName -ErrorAction SilentlyContinue | Where-Object {{
+        $_.AccountName.Split('\\')[-1] -like 'Kelpie_*'
+    }}
+    if ($isKelpieShare) {{
+        Remove-SmbShare -Name $shareName -Force -ErrorAction SilentlyContinue
+    }}
+}}
+
 $affectedUsers = @{{}}
 foreach ($g in $kelpieGroups) {{
     Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue | ForEach-Object {{
@@ -1312,6 +1329,13 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         # SMB ACL but were never a Kelpie-managed per-user grant - never
         # surfaced as if they were a real share user.
         non_user_accounts = {"Administrators", "Everyone", "SYSTEM", "Authenticated Users"}
+        # When the account behind an ACE no longer exists (deleted through
+        # Windows' own tools, not Kelpie's "Delete User" - which revokes
+        # share access first), Windows can no longer resolve it to a name
+        # and Get-SmbShareAccess reports the raw SID instead (e.g.
+        # "*S-1-5-21-..."). That's a dangling permission, not a user -
+        # never surface it as if it were one.
+        sid_pattern = re.compile(r"^\*?S-\d+-\d+(-\d+)+$", re.IGNORECASE)
 
         shares = []
         for s in data:
@@ -1322,7 +1346,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
                 if name.startswith("Kelpie_"):
                     share["group"] = name
                     continue
-                if name in non_user_accounts:
+                if name in non_user_accounts or sid_pattern.match(name):
                     continue
                 # run_windows()/_set_windows_share_access() only ever grant
                 # Full or Read directly - per-user, not via the group (see

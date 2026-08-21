@@ -513,6 +513,12 @@ class GUIWizard:
             self.users_list.delete(item)
 
     def _populate_shares_list(self, shares):
+        # list_shares() only reflects live share config (Get-SmbShare /
+        # smb.conf) - it has no idea whether the folder that config points
+        # at still exists, since the OS never removes a share just because
+        # its target got deleted out from under it. Flag that here instead,
+        # so an orphaned share (folder deleted outside Kelpie) is visibly
+        # different from a normal one rather than silently looking fine.
         for item in self.shares_list.get_children():
             self.shares_list.delete(item)
         for share in shares:
@@ -520,8 +526,11 @@ class GUIWizard:
                 u["username"] + (" (read-only)" if u.get("read_only") else "")
                 for u in share.get("users", [])
             ) or "(none)"
+            path = share.get("path") or "Unknown"
+            if path != "Unknown" and not os.path.isdir(path):
+                path = f"{path}  (folder missing!)"
             self.shares_list.insert(
-                "", tk.END, values=(share.get("name", "?"), share.get("path", "Unknown"), users)
+                "", tk.END, values=(share.get("name", "?"), path, users)
             )
 
     def _refresh_manage_list(self):

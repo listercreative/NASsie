@@ -10,7 +10,6 @@ set -e
 if { [ "$1" = "remove" ] || [ "$1" = "purge" ]; } && [ -z "$KELPIE_REINSTALLING" ]; then
     if command -v python3 >/dev/null 2>&1 && [ -f /usr/lib/kelpie/core.py ] && ( : < /dev/tty ) 2>/dev/null; then
         python3 - < /dev/tty > /dev/tty 2> /dev/tty <<'PYEOF' || true
-import shutil
 import sys
 sys.path.insert(0, '/usr/lib/kelpie')
 from core import SMBWizard
@@ -30,18 +29,20 @@ if shares:
     for s in shares:
         print(f"  {s['name']} -> {s['path']}")
     print()
-    answer = input("Delete these folders and everything in them? This cannot be undone. [y/N] ").strip().lower()
-    if answer in ('y', 'yes'):
-        for s in shares:
-            ok, message = w.check_share_path(s['path'])
-            if not ok:
-                print(f"Skipped '{s['path']}': {message}")
-                continue
-            try:
-                shutil.rmtree(s['path'])
-                print(f"Deleted: {s['path']}")
-            except Exception as e:
-                print(f"Failed to delete '{s['path']}': {e}")
+    answer = input("Delete these folders and everything in them too? This cannot be undone. [y/N] ").strip().lower()
+    delete_folders = answer in ('y', 'yes')
+    # delete_share() removes the [share] block from smb.conf and restarts
+    # Samba, not just the on-disk folder - apt itself has no idea these
+    # entries exist (they live in Samba's own config, not any package
+    # file), so nothing else would ever remove them. Same tested code
+    # path the in-app "Delete Share" action uses, rather than duplicating
+    # smb.conf-editing/rmtree logic here.
+    for s in shares:
+        ok = w.delete_share(s['name'], delete_folder=delete_folders)
+        if ok:
+            print(f"Removed share '{s['name']}' from Samba" + (" and deleted its folder." if delete_folders else "."))
+        else:
+            print(f"Failed to remove share '{s['name']}' from Samba.")
 PYEOF
     fi
 fi
