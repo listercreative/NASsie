@@ -1062,11 +1062,20 @@ class SMBWizard:
 
         try:
             wizard = SMBWizard()
-            shares = [
-                s for s in wizard.list_shares()
-                if s.get("group") and s["group"].startswith("Kelpie_") and s.get("path")
-            ]
-            if not shares:
+            shares = [s for s in wizard.list_shares() if s.get("group") and s.get("path")]
+
+            # Whether there's anything Kelpie-created to ask about removing
+            # at all - both the per-share ownership groups and any admin-
+            # created access-control ones ('Kelpie*' catches both, same
+            # wildcard uninstall_cleanup_windows() uses).
+            group_check = _run(
+                ["powershell", "-Command",
+                 "(Get-LocalGroup | Where-Object { $_.Name -like 'Kelpie*' } | Measure-Object).Count"],
+                capture_output=True, text=True,
+            )
+            has_accounts = group_check.returncode == 0 and group_check.stdout.strip() not in ("", "0")
+
+            if not shares and not has_accounts:
                 return
 
             import tkinter as tk
@@ -1079,21 +1088,34 @@ class SMBWizard:
 
             ttk.Label(
                 root, padding=10, justify="center",
-                text="Delete these share folders and their data too?\nThis cannot be undone.",
+                text="Kelpie is being uninstalled. Choose what else to remove:",
             ).pack()
 
-            list_frame = ttk.Frame(root, padding=(10, 0))
-            list_frame.pack()
             checks = []
-            for s in shares:
-                var = tk.BooleanVar(value=False)
-                ttk.Checkbutton(list_frame, text=f"{s['name']}  ({s['path']})", variable=var).pack(anchor="w")
-                checks.append((var, s["path"]))
+            if shares:
+                ttk.Label(root, padding=(10, 0), justify="left", text="Share folders and their data:").pack(
+                    anchor="w"
+                )
+                list_frame = ttk.Frame(root, padding=(20, 0))
+                list_frame.pack(anchor="w")
+                for s in shares:
+                    var = tk.BooleanVar(value=False)
+                    ttk.Checkbutton(list_frame, text=f"{s['name']}  ({s['path']})", variable=var).pack(anchor="w")
+                    checks.append((var, s["path"]))
 
-            chosen = []
+            remove_accounts_var = tk.BooleanVar(value=False)
+            if has_accounts:
+                ttk.Checkbutton(
+                    root, padding=(10, 10),
+                    text="Also remove Kelpie-created SMB user accounts and groups",
+                    variable=remove_accounts_var,
+                ).pack(anchor="w")
+
+            result = {}
 
             def on_continue():
-                chosen.extend(path for var, path in checks if var.get())
+                result["folders"] = [path for var, path in checks if var.get()]
+                result["remove_accounts"] = remove_accounts_var.get()
                 root.destroy()
 
             ttk.Button(root, text="Continue Uninstall", command=on_continue).pack(pady=10)
@@ -1105,11 +1127,11 @@ class SMBWizard:
             root.geometry(f"+{x}+{y}")
             root.mainloop()
 
-            if chosen:
+            if result:
                 with open(result_path, "w") as f:
-                    json.dump(chosen, f)
+                    json.dump(result, f)
         except Exception as e:
-            print(f"[Windows] Couldn't show folder-deletion prompt (nothing will be deleted): {e}")
+            print(f"[Windows] Couldn't show the uninstall prompt (folders/accounts will be left alone): {e}")
 
     @staticmethod
     def uninstall_cleanup_windows():
@@ -1117,16 +1139,39 @@ class SMBWizard:
         # Kelpie's own files are removed - nothing else would ever clean
         # these up otherwise, since the SMB shares and the local accounts/
         # groups behind them live outside the app entirely (Get-SmbShare
-        # doesn't care whether Kelpie.exe still exists). Removes every
-        # share Kelpie created, then every Kelpie_* group, then only the
-        # users tagged with _WINDOWS_ACCOUNT_MARKER - i.e. accounts Kelpie
-        # itself created. A pre-existing Windows account that was merely
-        # granted access to a Kelpie share (never tagged, since
-        # _configure_windows_user only marks genuinely new accounts) is
-        # always left alone, no matter its group memberships.
-        print("[Windows] Removing Kelpie-managed shares, accounts, and groups...")
+        # doesn't care whether Kelpie.exe still exists). Always removes
+        # every share Kelpie created (just SMB endpoint definitions, not
+        # data - leaving those dangling serves no one). Removing the
+        # Kelpie_*/KelpieGroup_* groups and the accounts tagged with
+        # _WINDOWS_ACCOUNT_MARKER is opt-in, per the choice
+        # prompt_uninstall_folders_windows() collected earlier (same reason
+        # folder deletion is opt-in there: this is real account/system
+        # state, not something to remove without asking). A pre-existing
+        # Windows account that was merely granted access to a Kelpie share
+        # (never tagged, since _configure_windows_user only marks genuinely
+        # new accounts) is always left alone regardless, no matter its
+        # group memberships.
+        print("[Windows] Removing Kelpie-managed shares...")
         wizard = SMBWizard()
         marker = wizard._ps_quote(SMBWizard._WINDOWS_ACCOUNT_MARKER)
+
+        # Read the choices prompt_uninstall_folders_windows() collected
+        # earlier - see that method's docstring-comment for why this can't
+        # just ask the question itself. No file, missing keys, or any read
+        # failure all mean "remove nothing beyond the shares themselves."
+        result_path = os.path.join(tempfile.gettempdir(), SMBWizard._UNINSTALL_FOLDERS_RESULT_FILE)
+        try:
+            with open(result_path, "r") as f:
+                prompt_result = json.load(f)
+        except Exception:
+            prompt_result = {}
+        finally:
+            try:
+                os.remove(result_path)
+            except Exception:
+                pass
+        paths = prompt_result.get("folders", [])
+        remove_accounts = prompt_result.get("remove_accounts", False)
 
         # A share is "Kelpie's" if its deterministically-named ownership
         # group actually exists (see _list_shares_windows()) - NOT by
@@ -1140,16 +1185,14 @@ class SMBWizard:
         kelpie_share_names = [s["name"] for s in wizard.list_shares() if s.get("group")]
         share_list_ps = "@(" + ",".join(f"'{wizard._ps_quote(n)}'" for n in kelpie_share_names) + ")"
 
-        script = f"""
-$ErrorActionPreference = 'Stop'
-foreach ($shareName in {share_list_ps}) {{
-    Remove-SmbShare -Name $shareName -Force -ErrorAction SilentlyContinue
-}}
-
-# 'Kelpie*' (no underscore) so this also catches KelpieGroup_* - the
-# admin-created access-control groups (New Group), distinct from the
-# per-share ownership groups (Kelpie_<share>) but equally Kelpie's to
-# clean up on a genuine uninstall.
+        accounts_script = ""
+        if remove_accounts:
+            print("[Windows] Also removing Kelpie-created accounts and groups (selected during uninstall)...")
+            # 'Kelpie*' (no underscore) so this also catches KelpieGroup_* -
+            # the admin-created access-control groups (New Group), distinct
+            # from the per-share ownership groups (Kelpie_<share>) but
+            # equally Kelpie's to clean up here.
+            accounts_script = f"""
 $kelpieGroups = Get-LocalGroup | Where-Object {{ $_.Name -like 'Kelpie*' }}
 
 $affectedUsers = @{{}}
@@ -1169,25 +1212,19 @@ foreach ($username in $affectedUsers.Keys) {{
     }}
 }}
 """
+        else:
+            print("[Windows] Leaving Kelpie-created accounts and groups in place (not selected during uninstall).")
+
+        script = f"""
+$ErrorActionPreference = 'Stop'
+foreach ($shareName in {share_list_ps}) {{
+    Remove-SmbShare -Name $shareName -Force -ErrorAction SilentlyContinue
+}}
+{accounts_script}
+"""
         proc = wizard._run_ps_script(script, capture_output=True, text=True)
         if proc.returncode != 0:
             print(f"[Windows] Cleanup warning: {proc.stderr}")
-
-        # Folder deletion, only ever from the file prompt_uninstall_folders_
-        # windows() wrote earlier - see that method's docstring-comment for
-        # why this can't just ask the question itself. No file, an empty
-        # list, or any read failure all mean "delete nothing."
-        result_path = os.path.join(tempfile.gettempdir(), SMBWizard._UNINSTALL_FOLDERS_RESULT_FILE)
-        try:
-            with open(result_path, "r") as f:
-                paths = json.load(f)
-        except Exception:
-            paths = []
-        finally:
-            try:
-                os.remove(result_path)
-            except Exception:
-                pass
 
         for path in paths:
             ok, message = wizard.check_share_path(path)
