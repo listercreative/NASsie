@@ -321,16 +321,28 @@ class GUIWizard:
 
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
 
         self.shares_list = ttk.Treeview(tree_frame, columns=("name", "path", "users"), show="headings")
         self.shares_list.heading("name", text="Share Name")
         self.shares_list.heading("path", text="Path")
         self.shares_list.heading("users", text="Users")
-        self.shares_list.pack(side="left", fill="both", expand=True)
+        # stretch=False so a long path or SID (e.g. an unresolvable ACE's
+        # raw "*S-1-5-21-..." form) can push the row past the visible
+        # width and actually reach the horizontal scrollbar below, rather
+        # than Treeview silently squeezing columns to fit and truncating
+        # the text with no way to see the rest.
+        self.shares_list.column("name", width=110, stretch=False)
+        self.shares_list.column("path", width=220, stretch=False)
+        self.shares_list.column("users", width=320, stretch=False)
+        self.shares_list.grid(row=0, column=0, sticky="nsew")
 
-        shares_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.shares_list.yview)
-        self.shares_list.configure(yscrollcommand=shares_scroll.set)
-        shares_scroll.pack(side="right", fill="y")
+        shares_vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.shares_list.yview)
+        shares_vscroll.grid(row=0, column=1, sticky="ns")
+        shares_hscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.shares_list.xview)
+        shares_hscroll.grid(row=1, column=0, sticky="ew")
+        self.shares_list.configure(yscrollcommand=shares_vscroll.set, xscrollcommand=shares_hscroll.set)
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x", padx=8, pady=(0, 8))
@@ -347,12 +359,21 @@ class GUIWizard:
         # hierarchy itself conveys the relationship.
         groups_frame = ttk.LabelFrame(frame, text="Groups")
         groups_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        groups_frame.rowconfigure(0, weight=1)
+        groups_frame.columnconfigure(0, weight=1)
         self.groups_list = ttk.Treeview(groups_frame, show="tree", height=6)
-        self.groups_list.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        # A long nested line (e.g. "share: <name> (read-only)" next to a
+        # raw SID entry) can exceed this without ever showing past the
+        # window edge otherwise - stretch=False plus the horizontal
+        # scrollbar below is what actually makes the rest reachable.
+        self.groups_list.column("#0", width=400, stretch=False)
+        self.groups_list.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
 
-        groups_scroll = ttk.Scrollbar(groups_frame, orient="vertical", command=self.groups_list.yview)
-        self.groups_list.configure(yscrollcommand=groups_scroll.set)
-        groups_scroll.pack(side="right", fill="y", pady=4)
+        groups_vscroll = ttk.Scrollbar(groups_frame, orient="vertical", command=self.groups_list.yview)
+        groups_vscroll.grid(row=0, column=1, sticky="ns", pady=4)
+        groups_hscroll = ttk.Scrollbar(groups_frame, orient="horizontal", command=self.groups_list.xview)
+        groups_hscroll.grid(row=1, column=0, sticky="ew", padx=(4, 0))
+        self.groups_list.configure(yscrollcommand=groups_vscroll.set, xscrollcommand=groups_hscroll.set)
 
         # Two rows - four buttons packed side="left" don't reliably fit the
         # default 560px window width (see the earlier users_btn_row1/2/3
@@ -377,12 +398,23 @@ class GUIWizard:
 
         users_frame = ttk.LabelFrame(frame, text="Users")
         users_frame.pack(fill="both", expand=True, padx=8, pady=(4, 4))
+        users_frame.rowconfigure(0, weight=1)
+        users_frame.columnconfigure(0, weight=1)
         self.system_users_list = ttk.Treeview(users_frame, show="tree", height=6)
-        self.system_users_list.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
+        self.system_users_list.column("#0", width=400, stretch=False)
+        self.system_users_list.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
 
-        system_users_scroll = ttk.Scrollbar(users_frame, orient="vertical", command=self.system_users_list.yview)
-        self.system_users_list.configure(yscrollcommand=system_users_scroll.set)
-        system_users_scroll.pack(side="right", fill="y", pady=4)
+        system_users_vscroll = ttk.Scrollbar(
+            users_frame, orient="vertical", command=self.system_users_list.yview
+        )
+        system_users_vscroll.grid(row=0, column=1, sticky="ns", pady=4)
+        system_users_hscroll = ttk.Scrollbar(
+            users_frame, orient="horizontal", command=self.system_users_list.xview
+        )
+        system_users_hscroll.grid(row=1, column=0, sticky="ew", padx=(4, 0))
+        self.system_users_list.configure(
+            yscrollcommand=system_users_vscroll.set, xscrollcommand=system_users_hscroll.set
+        )
 
         # Two rows, not one - six buttons packed side="left" don't fit the
         # default 560px window width, and pack() doesn't wrap on its own;

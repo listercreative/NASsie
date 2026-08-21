@@ -1311,7 +1311,8 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         cmd = (
             "Get-SmbShare | Where-Object { $_.Name -notin @('ADMIN$','C$','IPC$','print$') } "
             "| ForEach-Object { "
-            "$access = Get-SmbShareAccess -Name $_.Name | Select-Object AccountName,AccessRight; "
+            "$access = Get-SmbShareAccess -Name $_.Name | Select-Object AccountName,"
+            "@{Name='AccessRight';Expression={$_.AccessRight.ToString()}}; "
             "[PSCustomObject]@{ Name = $_.Name; Path = $_.Path; Access = $access } "
             "} | ConvertTo-Json -Compress -Depth 4"
         )
@@ -1353,6 +1354,12 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
                 # run_windows()'s comment on why: Windows unions permissions
                 # from every applicable source, so a group-wide grant would
                 # make an individual downgrade meaningless).
+                # AccessRight is a CIM enum - the PS command above forces
+                # .ToString() on it before JSON-encoding, because without
+                # that ConvertTo-Json serializes it as its raw numeric
+                # value (not the "Full"/"Change"/"Read" name), which made
+                # this comparison false for every entry and reported every
+                # single user as read-only regardless of actual access.
                 share["users"].append({
                     "username": name,
                     "read_only": entry.get("AccessRight") not in ("Full", "Change"),
