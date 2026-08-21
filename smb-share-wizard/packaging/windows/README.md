@@ -40,3 +40,22 @@ next verification step, not an assumption that this already works.
 build (`sys.frozen`) and re-invoke the bundled exe directly with
 `--apply <file>` instead of assuming a separate `python.exe main.py`
 pair, since that's what a real installed copy looks like.
+
+## Branding
+
+`banner.bmp` (493x58) and `dialog.bmp` (493x312) are generated from
+`assets/kelpie_icon.png`, flattened onto a white background (BMP has no
+alpha channel). To regenerate them after changing the source logo:
+
+```python
+from PIL import Image
+logo = Image.open("assets/kelpie_icon.png").convert("RGBA")
+
+banner = Image.new("RGBA", (493, 58), (255, 255, 255, 255))
+banner.alpha_composite(logo.resize((46, 46), Image.LANCZOS), (10, 6))
+banner.convert("RGB").save("packaging/windows/banner.bmp")
+
+dialog = Image.new("RGBA", (493, 312), (255, 255, 255, 255))
+dialog.alpha_composite(logo.resize((140, 140), Image.LANCZOS), (12, 86))
+dialog.convert("RGB").save("packaging/windows/dialog.bmp")
+```

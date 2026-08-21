@@ -84,6 +84,13 @@
     </InstallExecuteSequence>
 
     <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <!-- Standard WixUI branding slots: banner.bmp (493x58) is the thin
+         strip atop every dialog after Welcome/Exit; dialog.bmp (493x312)
+         is the full background behind Welcome/Exit itself. Both generated
+         from assets/kelpie_icon.png - see packaging/windows/README.md if
+         they ever need regenerating from a different source image. -->
+    <WixVariable Id="WixUIBannerBmp" Value="banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="dialog.bmp" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <ui:WixUI Id="WixUI_InstallDir" />
 
