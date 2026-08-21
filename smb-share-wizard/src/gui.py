@@ -215,6 +215,22 @@ class GUIWizard:
         self._build_manage_tab()
         self._build_users_groups_tab()
         self._refresh_all_lists()
+        self._bring_to_front()
+
+    def _bring_to_front(self):
+        # When Kelpie is launched by the "Launch Kelpie" checkbox
+        # (WixShellExec, run from the installer's own process, not the
+        # user's foreground one), Windows' foreground-lock restrictions
+        # silently ignore a plain lift()/focus_force() from a background
+        # process, leaving the window open but buried behind others.
+        # Toggling -topmost forces a z-order change instead, which isn't
+        # subject to that restriction, and reliably drags the window to
+        # front as a side effect.
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(200, lambda: self.root.attributes("-topmost", False))
+        self.root.focus_force()
 
     def run(self):
         self.root.mainloop()
