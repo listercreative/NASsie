@@ -62,7 +62,24 @@
                   Impersonate="no"
                   Return="ignore" />
 
+    <!-- KelpieUninstallCleanup above runs deferred as SYSTEM, which is
+         required to reliably get admin rights for account/group deletion,
+         but a SYSTEM-context deferred action can't show UI on the user's
+         desktop at all (Windows session isolation). So folder-deletion
+         choices are collected separately here, by an *immediate* action
+         (default Execute, runs in the same interactive session as the
+         uninstall itself) that writes them to a temp file; the deferred
+         step above reads that file. Any failure here - the dialog can't
+         show, the user closes it, whatever - simply results in no file
+         being written, which the deferred step treats as "delete
+         nothing," never the reverse. -->
+    <CustomAction Id="KelpiePromptUninstallFolders"
+                  FileRef="KelpieExe"
+                  ExeCommand="--uninstall-folder-prompt"
+                  Return="ignore" />
+
     <InstallExecuteSequence>
+      <Custom Action="KelpiePromptUninstallFolders" Before="KelpieUninstallCleanup" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
       <Custom Action="KelpieUninstallCleanup" Before="RemoveFiles" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
     </InstallExecuteSequence>
 

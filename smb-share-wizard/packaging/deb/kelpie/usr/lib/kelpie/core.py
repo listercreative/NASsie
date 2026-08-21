@@ -862,6 +862,83 @@ class SMBWizard:
         wizard._invoking_user_override = data.get('_invoking_user')
         wizard.remove_user_from_group(data['username'], data['group'])
 
+    _UNINSTALL_FOLDERS_RESULT_FILE = "kelpie_uninstall_folders.json"
+
+    @staticmethod
+    def prompt_uninstall_folders_windows():
+        # Runs as an IMMEDIATE custom action (see kelpie.wxs), in the same
+        # session as the interactive install/uninstall itself - unlike
+        # uninstall_cleanup_windows() below, which runs deferred as SYSTEM
+        # specifically to guarantee admin rights, and precisely because of
+        # that cannot show UI on the user's desktop at all (Windows session
+        # isolation). This step exists only to ask the question somewhere
+        # it's actually possible to ask it, then hands the answer off via a
+        # temp file.
+        #
+        # Fail-safe by construction: any failure here (dialog can't show,
+        # tkinter unavailable, exception of any kind, user closes the
+        # window without choosing) results in no result file being written
+        # - uninstall_cleanup_windows() treats a missing/unreadable file as
+        # "delete nothing," never the reverse. A confirmation prompt that
+        # might not always work is acceptable; folders vanishing without
+        # one is not.
+        result_path = os.path.join(tempfile.gettempdir(), SMBWizard._UNINSTALL_FOLDERS_RESULT_FILE)
+        try:
+            os.remove(result_path)
+        except Exception:
+            pass
+
+        try:
+            wizard = SMBWizard()
+            shares = [
+                s for s in wizard.list_shares()
+                if s.get("group") and s["group"].startswith("Kelpie_") and s.get("path")
+            ]
+            if not shares:
+                return
+
+            import tkinter as tk
+            from tkinter import ttk
+
+            root = tk.Tk()
+            root.title("Kelpie Uninstall")
+            root.resizable(False, False)
+            root.attributes("-topmost", True)
+
+            ttk.Label(
+                root, padding=10, justify="center",
+                text="Delete these share folders and their data too?\nThis cannot be undone.",
+            ).pack()
+
+            list_frame = ttk.Frame(root, padding=(10, 0))
+            list_frame.pack()
+            checks = []
+            for s in shares:
+                var = tk.BooleanVar(value=False)
+                ttk.Checkbutton(list_frame, text=f"{s['name']}  ({s['path']})", variable=var).pack(anchor="w")
+                checks.append((var, s["path"]))
+
+            chosen = []
+
+            def on_continue():
+                chosen.extend(path for var, path in checks if var.get())
+                root.destroy()
+
+            ttk.Button(root, text="Continue Uninstall", command=on_continue).pack(pady=10)
+
+            root.update_idletasks()
+            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+            x = (root.winfo_screenwidth() - w) // 2
+            y = (root.winfo_screenheight() - h) // 2
+            root.geometry(f"+{x}+{y}")
+            root.mainloop()
+
+            if chosen:
+                with open(result_path, "w") as f:
+                    json.dump(chosen, f)
+        except Exception as e:
+            print(f"[Windows] Couldn't show folder-deletion prompt (nothing will be deleted): {e}")
+
     @staticmethod
     def uninstall_cleanup_windows():
         # Run by the MSI's uninstall custom action (see kelpie.wxs), before
@@ -899,6 +976,33 @@ foreach ($username in $affectedUsers.Keys) {{
         proc = wizard._run_ps_script(script, capture_output=True, text=True)
         if proc.returncode != 0:
             print(f"[Windows] Cleanup warning: {proc.stderr}")
+
+        # Folder deletion, only ever from the file prompt_uninstall_folders_
+        # windows() wrote earlier - see that method's docstring-comment for
+        # why this can't just ask the question itself. No file, an empty
+        # list, or any read failure all mean "delete nothing."
+        result_path = os.path.join(tempfile.gettempdir(), SMBWizard._UNINSTALL_FOLDERS_RESULT_FILE)
+        try:
+            with open(result_path, "r") as f:
+                paths = json.load(f)
+        except Exception:
+            paths = []
+        finally:
+            try:
+                os.remove(result_path)
+            except Exception:
+                pass
+
+        for path in paths:
+            ok, message = wizard.check_share_path(path)
+            if not ok:
+                print(f"[Windows] Skipped '{path}': {message}")
+                continue
+            try:
+                shutil.rmtree(path)
+                print(f"[Windows] Deleted: {path}")
+            except Exception as e:
+                print(f"[Windows] Failed to delete '{path}': {e}")
 
     def _ps_quote(self, s):
         # Escape for embedding inside a PowerShell single-quoted string.

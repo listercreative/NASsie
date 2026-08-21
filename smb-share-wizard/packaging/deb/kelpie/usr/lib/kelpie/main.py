@@ -60,7 +60,14 @@ Usage:
     }
 
     try:
-        if len(sys.argv) >= 2 and sys.argv[1] == "--uninstall-cleanup":
+        if len(sys.argv) >= 2 and sys.argv[1] == "--uninstall-folder-prompt":
+            # Internal only - invoked by the MSI's uninstall sequence as an
+            # immediate (interactive-session) custom action, before
+            # --uninstall-cleanup below runs deferred as SYSTEM and can't
+            # show UI at all. Not user-facing.
+            from core import SMBWizard
+            SMBWizard.prompt_uninstall_folders_windows()
+        elif len(sys.argv) >= 2 and sys.argv[1] == "--uninstall-cleanup":
             # Internal only - invoked by the MSI's uninstall custom action
             # (see kelpie.wxs), not user-facing. Takes no payload file,
             # unlike the elevation relaunch handlers below.
