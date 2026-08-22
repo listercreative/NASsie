@@ -196,6 +196,12 @@ class GUIWizard:
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+        # Without a floor, shrinking the window below what the button grids
+        # (Groups, Users & Groups) actually need squishes them into an
+        # overlapping, unreadable mess instead of just clipping/scrolling -
+        # the window is otherwise freely resizable (no resizable(False)
+        # call), so this is the only thing stopping that.
+        self.root.minsize(width, height)
         self._load_icon_image()
         self._set_window_icon()
         self._build_header()
