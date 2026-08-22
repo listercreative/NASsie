@@ -424,38 +424,28 @@ class GUIWizard:
             yscrollcommand=system_users_vscroll.set, xscrollcommand=system_users_hscroll.set
         )
 
-        # Two rows, not one - six buttons packed side="left" don't fit the
-        # default 560px window width, and pack() doesn't wrap on its own;
-        # the overflow buttons (this bit everyone with "Reset Password &
-        # Show QR...") just get pushed off the visible edge instead of onto
-        # a new row.
-        users_btn_row1 = ttk.Frame(frame)
-        users_btn_row1.pack(fill="x", padx=8, pady=(0, 2))
-        ttk.Button(users_btn_row1, text="New User...", command=self._create_new_user).pack(side="left", padx=4)
-        ttk.Button(users_btn_row1, text="Assign to Group...", command=self._assign_selected_user_to_group).pack(
-            side="left", padx=4
-        )
-        ttk.Button(
-            users_btn_row1, text="Remove from Group...", command=self._remove_selected_user_from_group
-        ).pack(side="left", padx=4)
+        # A grid of equal-width columns instead of left-packed rows of
+        # varying button widths - same fix as the Groups buttons above,
+        # for the same reason (packed rows of differently-sized labels
+        # left every row a different total width). Grouped the same way
+        # too: user lifecycle, group membership, then share access.
+        users_btn_frame = ttk.Frame(frame)
+        users_btn_frame.pack(fill="x", padx=8, pady=(0, 4))
+        for col in range(3):
+            users_btn_frame.columnconfigure(col, weight=1, uniform="users_btn")
 
-        users_btn_row2 = ttk.Frame(frame)
-        users_btn_row2.pack(fill="x", padx=8, pady=(0, 2))
-        ttk.Button(users_btn_row2, text="Revoke Access...", command=self._revoke_selected_user_access).pack(
-            side="left", padx=4
-        )
-        ttk.Button(
-            users_btn_row2, text="Change Access Level...", command=self._change_access_level_for_selected_user
-        ).pack(side="left", padx=4)
+        def user_button(text, command, row, col):
+            ttk.Button(users_btn_frame, text=text, command=command).grid(
+                row=row, column=col, sticky="ew", padx=4, pady=2
+            )
 
-        users_btn_row3 = ttk.Frame(frame)
-        users_btn_row3.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Button(
-            users_btn_row3, text="Reset Password & Show QR...", command=self._reset_password_for_selected_user
-        ).pack(side="left", padx=4)
-        ttk.Button(users_btn_row3, text="Delete User", command=self._delete_selected_user).pack(
-            side="left", padx=4
-        )
+        user_button("New User...", self._create_new_user, 0, 0)
+        user_button("Delete User", self._delete_selected_user, 0, 1)
+        user_button("Assign to Group...", self._assign_selected_user_to_group, 1, 0)
+        user_button("Remove from Group...", self._remove_selected_user_from_group, 1, 1)
+        user_button("Revoke Access...", self._revoke_selected_user_access, 2, 0)
+        user_button("Change Access Level...", self._change_access_level_for_selected_user, 2, 1)
+        user_button("Reset Password & Show QR...", self._reset_password_for_selected_user, 2, 2)
 
         ttk.Button(frame, text="Refresh", command=self._refresh_users_groups).pack(
             padx=8, pady=(0, 8), anchor="w"
