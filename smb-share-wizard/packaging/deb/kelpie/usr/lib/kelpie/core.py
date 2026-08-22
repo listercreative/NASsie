@@ -1404,8 +1404,16 @@ Remove-Item $cfgPath,$dbPath -ErrorAction SilentlyContinue
             self._deny_interactive_logon_windows(username)
 
     def _add_windows_user_to_group(self, username, group_name):
+        # -ErrorAction SilentlyContinue is what makes this idempotent (a
+        # user re-added to a group they're already in is a normal,
+        # expected case here - e.g. resetting their password later doesn't
+        # remove them first). check=True doesn't belong on top of that:
+        # PowerShell's host can still set its own process exit code to 1
+        # for a suppressed non-terminating error even though nothing
+        # actually failed, which made check=True raise here for exactly
+        # the "already a member" case -ErrorAction was there to allow.
         cmd = f"Add-LocalGroupMember -Group '{self._ps_quote(group_name)}' -Member '{self._ps_quote(username)}' -ErrorAction SilentlyContinue"
-        _run(["powershell", "-Command", cmd], check=True, capture_output=True, text=True)
+        _run(["powershell", "-Command", cmd], capture_output=True, text=True)
 
     def _grant_windows_ntfs_permissions(self, share_path, group_name):
         # icacls is invoked directly (no shell), so no PowerShell quoting needed.
