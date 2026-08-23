@@ -1,5 +1,5 @@
 #!/bin/sh
-# Shows Kelpie's own terminal UI (banner + arrow-key menu) to explain what's
+# Shows NASsie's own terminal UI (banner + arrow-key menu) to explain what's
 # about to be installed, BEFORE apt is invoked at all - this is the only
 # way to run our UI ahead of apt's own dependency-resolution summary, since
 # no .deb-internal hook (preinst included) fires before apt starts.
@@ -22,13 +22,13 @@ case " $DISTRO_ID $DISTRO_LIKE " in
     *)
         echo "This installer only supports Debian/Ubuntu-family distros (it installs a .deb via apt)." >&2
         echo "Detected: ${DISTRO_ID:-unknown}${DISTRO_LIKE:+ (like: $DISTRO_LIKE)}" >&2
-        echo "Kelpie isn't packaged for this distro yet - see ../../src/main.py to run it directly with Python 3." >&2
+        echo "NASsie isn't packaged for this distro yet - see ../../src/main.py to run it directly with Python 3." >&2
         exit 1
         ;;
 esac
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-DEB_PATH="$SCRIPT_DIR/kelpie_0.1.0_all.deb"
+DEB_PATH="$SCRIPT_DIR/nassie_0.1.0_all.deb"
 
 if [ ! -f "$DEB_PATH" ]; then
     echo "Could not find $DEB_PATH — build it first: $SCRIPT_DIR/build.sh" >&2
@@ -49,20 +49,20 @@ fi
 
 if [ "$status" = 2 ]; then
     echo
-    echo "=== Kelpie installer ==="
+    echo "=== NASsie installer ==="
     echo
     echo "This will install:"
-    echo "  - kelpie   (the SMB share wizard itself)"
+    echo "  - nassie   (the SMB share wizard itself)"
     echo "  - samba    (the SMB/CIFS file-sharing server, pulled in automatically)"
     echo
-    echo "Each time you create a share through Kelpie, it will also, on this"
+    echo "Each time you create a share through NASsie, it will also, on this"
     echo "machine, with your permission at that point:"
     echo "  - create a dedicated Linux system user per configured Samba user"
     echo "  - create a dedicated Unix group for that share"
     echo "  - write a new share block into /etc/samba/smb.conf"
     echo "  - restart the Samba services"
     echo
-    printf 'Continue with installing kelpie and samba? [y/N] '
+    printf 'Continue with installing nassie and samba? [y/N] '
     read -r answer
     case "$answer" in
         [yY]|[yY][eE][sS]) ;;
@@ -70,18 +70,18 @@ if [ "$status" = 2 ]; then
     esac
 fi
 
-if dpkg -s kelpie >/dev/null 2>&1; then
+if dpkg -s nassie >/dev/null 2>&1; then
     echo
-    echo "Kelpie is already installed - removing it first for a clean reinstall..."
-    # KELPIE_REINSTALLING tells prerm this is install.sh's own
+    echo "NASsie is already installed - removing it first for a clean reinstall..."
+    # NASSIE_REINSTALLING tells prerm this is install.sh's own
     # reinstall/upgrade cycle, not a real uninstall - without it, every
     # routine update would ask "delete your share folders?", which nobody
     # wants. `sudo VAR=value cmd` passes it through even with env_reset.
-    sudo KELPIE_REINSTALLING=1 apt-get remove -y kelpie
+    sudo NASSIE_REINSTALLING=1 apt-get remove -y nassie
     # apt won't remove this directory itself if anything untracked (like
     # Python's __pycache__) got left in it after install - clear it so the
     # reinstall below starts from nothing rather than picking up stale files.
-    sudo rm -rf /usr/lib/kelpie
+    sudo rm -rf /usr/lib/nassie
 fi
 
 # apt's download sandbox runs as the unprivileged _apt user, which can't
@@ -92,7 +92,7 @@ fi
 # (13: Permission denied)"). Stage the .deb somewhere universally readable
 # instead of asking anyone to loosen their home directory just to install
 # this.
-STAGE_DEB=$(mktemp /tmp/kelpie-install-XXXXXX.deb)
+STAGE_DEB=$(mktemp /tmp/nassie-install-XXXXXX.deb)
 cp "$DEB_PATH" "$STAGE_DEB"
 chmod 644 "$STAGE_DEB"
 trap 'rm -f "$STAGE_DEB"' EXIT

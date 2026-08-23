@@ -2,7 +2,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
-  <Package Name="Kelpie"
+  <Package Name="NASsie"
            Manufacturer="Caden Lister"
            Version="0.1.0.0"
            UpgradeCode="4c2e7f0a-9b1d-4e3a-8c6f-2a1b5d7e9f30"
@@ -16,34 +16,34 @@
          reinstalling the same version (new ProductCode, same Version) is
          invisible to MajorUpgrade's logic entirely: it neither upgrades
          nor blocks, it just installs as a second, unrelated product -
-         which is exactly how Kelpie ended up installable multiple times. -->
+         which is exactly how NASsie ended up installable multiple times. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
-                  DowngradeErrorMessage="A newer version of Kelpie is already installed." />
+                  DowngradeErrorMessage="A newer version of NASsie is already installed." />
 
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="KelpieIcon" SourceFile="kelpie_icon.ico" />
-    <Property Id="ARPPRODUCTICON" Value="KelpieIcon" />
+    <Icon Id="NASsieIcon" SourceFile="nassie_icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="NASsieIcon" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Kelpie">
+      <Directory Id="INSTALLFOLDER" Name="NASsie">
         <Component Id="MainExecutable" Guid="6e1e9f53-8c4b-4e01-9c39-4d5e12a9b701">
-          <File Id="KelpieExe" Source="Kelpie.exe" KeyPath="yes" />
+          <File Id="NASsieExe" Source="NASsie.exe" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ApplicationProgramsFolder" Name="Kelpie">
+      <Directory Id="ApplicationProgramsFolder" Name="NASsie">
         <Component Id="ApplicationShortcut" Guid="1b7c9e24-3a2d-4f6b-9e01-7c8d4a6b2e15">
           <Shortcut Id="AppStartMenuShortcut"
-                    Name="Kelpie"
-                    Target="[INSTALLFOLDER]Kelpie.exe"
+                    Name="NASsie"
+                    Target="[INSTALLFOLDER]NASsie.exe"
                     WorkingDirectory="INSTALLFOLDER"
-                    Icon="KelpieIcon" />
+                    Icon="NASsieIcon" />
           <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
           <RegistryValue Root="HKCU"
-                          Key="Software\Kelpie"
+                          Key="Software\NASsie"
                           Name="installed"
                           Type="integer"
                           Value="1"
@@ -52,12 +52,12 @@
       </Directory>
     </StandardDirectory>
 
-    <Feature Id="MainFeature" Title="Kelpie" Level="1">
+    <Feature Id="MainFeature" Title="NASsie" Level="1">
       <ComponentRef Id="MainExecutable" />
       <ComponentRef Id="ApplicationShortcut" />
     </Feature>
 
-    <!-- Kelpie-created local users/groups live outside the app entirely -
+    <!-- NASsie-created local users/groups live outside the app entirely -
          nothing else would ever clean them up. Runs before files are
          removed, only on a genuine uninstall (never as part of an
          upgrade's remove-old-version step, which would otherwise wipe out
@@ -65,14 +65,14 @@
          deferred execution run this with the same admin rights the MSI
          itself already has; Return="ignore" means a cleanup failure can
          never block the uninstall from completing. -->
-    <CustomAction Id="KelpieUninstallCleanup"
-                  FileRef="KelpieExe"
+    <CustomAction Id="NASsieUninstallCleanup"
+                  FileRef="NASsieExe"
                   ExeCommand="--uninstall-cleanup"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />
 
-    <!-- KelpieUninstallCleanup above runs deferred as SYSTEM, which is
+    <!-- NASsieUninstallCleanup above runs deferred as SYSTEM, which is
          required to reliably get admin rights for account/group deletion,
          but a SYSTEM-context deferred action can't show UI on the user's
          desktop at all (Windows session isolation). So folder-deletion
@@ -83,28 +83,28 @@
          show, the user closes it, whatever - simply results in no file
          being written, which the deferred step treats as "delete
          nothing," never the reverse. -->
-    <CustomAction Id="KelpiePromptUninstallFolders"
-                  FileRef="KelpieExe"
+    <CustomAction Id="NASsiePromptUninstallFolders"
+                  FileRef="NASsieExe"
                   ExeCommand="--uninstall-folder-prompt"
                   Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="KelpiePromptUninstallFolders" Before="KelpieUninstallCleanup" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
-      <Custom Action="KelpieUninstallCleanup" Before="RemoveFiles" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+      <Custom Action="NASsiePromptUninstallFolders" Before="NASsieUninstallCleanup" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+      <Custom Action="NASsieUninstallCleanup" Before="RemoveFiles" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
     </InstallExecuteSequence>
 
     <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
     <!-- Standard WixUI branding slots: banner.bmp (493x58) is the thin
          strip atop every dialog after Welcome/Exit; dialog.bmp (493x312)
          is the full background behind Welcome/Exit itself. Both generated
-         from assets/kelpie_icon.png - see packaging/windows/README.md if
+         from assets/nassie_icon.png - see packaging/windows/README.md if
          they ever need regenerating from a different source image. -->
     <WixVariable Id="WixUIBannerBmp" Value="banner.bmp" />
     <WixVariable Id="WixUIDialogBmp" Value="dialog.bmp" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <ui:WixUI Id="WixUI_InstallDir" />
 
-    <!-- "Launch Kelpie" checkbox on the final install page. The checkbox's
+    <!-- "Launch NASsie" checkbox on the final install page. The checkbox's
          checked-state is its own property, separate from its label text -
          setting only the text left it unchecked by default (an MSI
          property with no explicit value starts unset/false), so nothing
@@ -114,9 +114,9 @@
          WixShellExec (from the Util extension) is the standard way to run
          an arbitrary file from a custom action; Impersonate="yes" runs it
          as the logged-in user rather than as the elevated installer. -->
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Kelpie" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch NASsie" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
-    <Property Id="WixShellExecTarget" Value="[#KelpieExe]" />
+    <Property Id="WixShellExecTarget" Value="[#NASsieExe]" />
     <CustomAction Id="LaunchApplication" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" />
     <UI>
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"

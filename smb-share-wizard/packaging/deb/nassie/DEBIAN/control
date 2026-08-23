@@ -1,4 +1,4 @@
-Package: kelpie
+Package: nassie
 Version: 0.1.0
 Section: admin
 Priority: optional
@@ -6,9 +6,9 @@ Architecture: all
 Depends: python3 (>= 3.8), python3-rich, python3-tk, samba
 Recommends: policykit-1, python3-qrcode
 Maintainer: Caden Lister <cadenlister@gmail.com>
-Description: Kelpie - cross-platform SMB share configuration wizard
- A terminal-UI wizard by default ('kelpie'), with a graphical desktop UI
- available via 'kelpie --gui', for creating and managing SMB (Samba)
+Description: NASsie - cross-platform SMB share configuration wizard
+ A terminal-UI wizard by default ('nassie'), with a graphical desktop UI
+ available via 'nassie --gui', for creating and managing SMB (Samba)
  shares. Walks the user through share name, path, and
  user credentials, then applies the configuration on Linux by
  installing Samba if needed, writing the smb.conf share block,

@@ -27,7 +27,7 @@ class CLIWizard(SMBWizard):
 
     def _offer_qr_code(self, share_name, username, password):
         # Only ever offered right when a password was just set (share
-        # creation / add user) - Kelpie never persists plaintext passwords,
+        # creation / add user) - NASsie never persists plaintext passwords,
         # so this can't be regenerated later for an existing user.
         confirm = console.input("\nShow a QR code for easy external configuration? [y/N] ").strip().lower()
         if confirm not in ('y', 'yes'):
@@ -523,7 +523,7 @@ class CLIWizard(SMBWizard):
                 options.append("Launch Desktop UI")
             options.append("Exit")
 
-            print("\n=== Kelpie Menu ===")
+            print("\n=== NASsie Menu ===")
             for i, opt in enumerate(options, start=1):
                 print(f"{i}. {opt}")
             choice = input("Select an option: ").strip()

@@ -1,29 +1,29 @@
 #!/bin/sh
 # One-line install: curl -fsSL <raw-url-to-this-file> | sh
 #
-# Downloads the current Kelpie source from GitHub, builds the .deb fresh,
+# Downloads the current NASsie source from GitHub, builds the .deb fresh,
 # and runs the normal install.sh - this only automates *fetching* the
 # files, it doesn't skip install.sh's own preview/confirmation step.
 set -e
 
-REPO_URL="https://github.com/listercreative/Kelpie.git"
-TARBALL_URL="https://github.com/listercreative/Kelpie/archive/refs/heads/main.tar.gz"
+REPO_URL="https://github.com/listercreative/NASsie.git"
+TARBALL_URL="https://github.com/listercreative/NASsie/archive/refs/heads/main.tar.gz"
 
 if ! command -v git >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
-    echo "Need either git or curl installed to download Kelpie." >&2
+    echo "Need either git or curl installed to download NASsie." >&2
     exit 1
 fi
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-echo "Downloading Kelpie..."
+echo "Downloading NASsie..."
 if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 "$REPO_URL" "$TMPDIR/Kelpie" >/dev/null 2>&1
-    REPO_DIR="$TMPDIR/Kelpie"
+    git clone --depth 1 "$REPO_URL" "$TMPDIR/NASsie" >/dev/null 2>&1
+    REPO_DIR="$TMPDIR/NASsie"
 else
     curl -fsSL "$TARBALL_URL" | tar -xz -C "$TMPDIR"
-    REPO_DIR="$TMPDIR/Kelpie-main"
+    REPO_DIR="$TMPDIR/NASsie-main"
 fi
 
 cd "$REPO_DIR/smb-share-wizard/packaging/deb"
