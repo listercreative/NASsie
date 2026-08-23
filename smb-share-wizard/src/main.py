@@ -32,13 +32,13 @@ if __name__ == "__main__":
         CLIWizard().start()
 
     def print_help():
-        print("""Kelpie - cross-platform SMB share configuration wizard
+        print("""NASsie - cross-platform SMB share configuration wizard
 
 Usage:
-  kelpie                Launch the terminal UI (TUI)
-  kelpie --gui           Launch the graphical desktop UI
-  kelpie --cli           Launch the basic prompt-based wizard
-  kelpie --help, -h      Show this help message and exit""")
+  nassie                Launch the terminal UI (TUI)
+  nassie --gui           Launch the graphical desktop UI
+  nassie --cli           Launch the basic prompt-based wizard
+  nassie --help, -h      Show this help message and exit""")
 
     # Each of these is a relaunch target for SMBWizard._elevated_relaunch():
     # the flag matches what elevate_and_*() passed as arg_flag, and the
@@ -72,7 +72,7 @@ Usage:
             SMBWizard.prompt_uninstall_folders_windows()
         elif len(sys.argv) >= 2 and sys.argv[1] == "--uninstall-cleanup":
             # Internal only - invoked by the MSI's uninstall custom action
-            # (see kelpie.wxs), not user-facing. Takes no payload file,
+            # (see nassie.wxs), not user-facing. Takes no payload file,
             # unlike the elevation relaunch handlers below.
             from core import SMBWizard
             SMBWizard.uninstall_cleanup_windows()
@@ -85,7 +85,7 @@ Usage:
             unknown = [a for a in args if a not in recognized]
             if unknown:
                 print(f"Unknown option: {unknown[0]}", file=sys.stderr)
-                print("See 'kelpie --help' for usage.", file=sys.stderr)
+                print("See 'nassie --help' for usage.", file=sys.stderr)
                 sys.exit(2)
 
             if "--help" in args or "-h" in args:
@@ -95,7 +95,7 @@ Usage:
             elif "--cli" in args:
                 run_basic_cli()
             elif os.name == "nt":
-                # A --windowed PyInstaller build (how Kelpie.exe is built)
+                # A --windowed PyInstaller build (how NASsie.exe is built)
                 # has no console to attach a curses TUI to, whether it was
                 # launched by double-click or from a terminal - GUI is the
                 # only usable default here until/unless a separate

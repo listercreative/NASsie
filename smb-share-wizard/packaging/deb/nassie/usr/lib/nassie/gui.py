@@ -121,7 +121,7 @@ class ChoiceDialog(tk.Toplevel):
 
 class QrCodeDialog(tk.Toplevel):
     """Shows a LockNAS bridge QR code for one just-created (or just-granted)
-    user. Only ever constructible with a payload already in hand - Kelpie
+    user. Only ever constructible with a payload already in hand - NASsie
     doesn't persist plaintext passwords, so this can't be regenerated later
     for an existing user from a "Manage Shares" style screen."""
     def __init__(self, parent, share_name, username, payload):
@@ -181,12 +181,12 @@ class GUIWizard:
         self.pending_users = []
 
         # className sets WM_CLASS, which is what taskbars/docks/app-switchers
-        # use to match this running window back to kelpie.desktop (and thus
+        # use to match this running window back to nassie.desktop (and thus
         # its Icon=) - without it Tk defaults to the generic class "Tk" and
         # the tray/taskbar icon can end up generic even though the titlebar
         # icon (set below) looks right.
-        self.root = tk.Tk(className="Kelpie")
-        self.root.title("Kelpie")
+        self.root = tk.Tk(className="NASsie")
+        self.root.title("NASsie")
         # Tk has no built-in "center on screen" - left alone, the window
         # manager decides placement, which is commonly the top-left corner
         # rather than anywhere near the middle of the display.
@@ -224,7 +224,7 @@ class GUIWizard:
         self._bring_to_front()
 
     def _bring_to_front(self):
-        # When Kelpie is launched by the "Launch Kelpie" checkbox
+        # When NASsie is launched by the "Launch NASsie" checkbox
         # (WixShellExec, run from the installer's own process, not the
         # user's foreground one), Windows' foreground-lock restrictions
         # silently ignore a plain lift()/focus_force() from a background
@@ -251,7 +251,7 @@ class GUIWizard:
             base_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
         else:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(base_dir, "kelpie_icon.png")
+        icon_path = os.path.join(base_dir, "nassie_icon.png")
         try:
             self._icon_image = tk.PhotoImage(file=icon_path)
         except tk.TclError:
@@ -273,7 +273,7 @@ class GUIWizard:
             self._header_icon_image = self._icon_image.subsample(scale, scale)
             ttk.Label(header, image=self._header_icon_image).pack(side="left", padx=(0, 10))
 
-        ttk.Label(header, text="Kelpie", font=("TkDefaultFont", 18, "bold")).pack(side="left")
+        ttk.Label(header, text="NASsie", font=("TkDefaultFont", 18, "bold")).pack(side="left")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=8, pady=(10, 0))
 
@@ -566,7 +566,7 @@ class GUIWizard:
         # smb.conf) - it has no idea whether the folder that config points
         # at still exists, since the OS never removes a share just because
         # its target got deleted out from under it. Flag that here instead,
-        # so an orphaned share (folder deleted outside Kelpie) is visibly
+        # so an orphaned share (folder deleted outside NASsie) is visibly
         # different from a normal one rather than silently looking fine.
         overrides = overrides or {}
         for item in self.shares_list.get_children():
@@ -1304,7 +1304,7 @@ class GUIWizard:
     def _offer_qr_codes(self, share_name, users):
         # users: [{"username": ..., "password": ...}, ...] - only ever
         # offered right when a password was just set (share creation / add
-        # user), since Kelpie never persists plaintext passwords and so has
+        # user), since NASsie never persists plaintext passwords and so has
         # no way to regenerate this later for an existing user.
         if not messagebox.askyesno(
             "QR Code",

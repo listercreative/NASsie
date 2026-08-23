@@ -1,4 +1,4 @@
-# Build Kelpie.msi on a real Windows machine.
+# Build NASsie.msi on a real Windows machine.
 # Run from this directory (packaging\windows) in PowerShell.
 #
 # Prerequisites:
@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 # $ErrorActionPreference only catches PowerShell-native errors, not a
 # non-zero exit code from an external .exe - check that explicitly after
 # each native tool invocation so a failed step can't silently fall through
-# to "Built Kelpie.msi".
+# to "Built NASsie.msi".
 function Assert-LastExitCode($what) {
     if ($LASTEXITCODE -ne 0) {
         throw "$what failed (exit code $LASTEXITCODE)"
@@ -37,7 +37,7 @@ python -m pip install --upgrade pip
 python -m pip install pyinstaller rich "qrcode[pil]"
 
 # Verify the exact same Python that ran pip above can actually import
-# everything Kelpie needs bundled, before PyInstaller ever runs. Windows
+# everything NASsie needs bundled, before PyInstaller ever runs. Windows
 # commonly has more than one Python on PATH (python.org install, Microsoft
 # Store stub, Anaconda, ...) - "pip install X" and the bare "pyinstaller"
 # command can silently resolve to two different interpreters, so X being
@@ -60,9 +60,9 @@ python -m PyInstaller `
   --onefile `
   --windowed `
   --uac-admin `
-  --name Kelpie `
-  --icon (Join-Path $PSScriptRoot "kelpie_icon.ico") `
-  --add-data "$(Join-Path $RepoSrc 'kelpie_icon.png');." `
+  --name NASsie `
+  --icon (Join-Path $PSScriptRoot "nassie_icon.ico") `
+  --add-data "$(Join-Path $RepoSrc 'nassie_icon.png');." `
   --hidden-import=core --hidden-import=cli --hidden-import=gui --hidden-import=tui `
   --collect-all=rich `
   --collect-all=qrcode `
@@ -74,7 +74,7 @@ python -m PyInstaller `
 Assert-LastExitCode "pyinstaller"
 
 Set-Location $PSScriptRoot
-wix build (Join-Path $PSScriptRoot "kelpie.wxs") -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -out (Join-Path $PSScriptRoot "Kelpie.msi")
+wix build (Join-Path $PSScriptRoot "nassie.wxs") -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -out (Join-Path $PSScriptRoot "NASsie.msi")
 Assert-LastExitCode "wix build"
 
-Write-Host "Built Kelpie.msi"
+Write-Host "Built NASsie.msi"

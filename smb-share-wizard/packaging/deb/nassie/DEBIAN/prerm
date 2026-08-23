@@ -3,29 +3,29 @@ set -e
 
 # Only for a genuine removal, never install.sh's own reinstall/upgrade
 # cycle (which does an explicit `apt-get remove` internally, indistinguishable
-# from a real uninstall otherwise - see install.sh's KELPIE_REINSTALLING).
+# from a real uninstall otherwise - see install.sh's NASSIE_REINSTALLING).
 # Runs in prerm, not postrm: the package's files (including core.py, which
 # this needs to import) still exist at this point - by postrm they'd
 # already be gone.
-if { [ "$1" = "remove" ] || [ "$1" = "purge" ]; } && [ -z "$KELPIE_REINSTALLING" ]; then
-    if command -v python3 >/dev/null 2>&1 && [ -f /usr/lib/kelpie/core.py ] && ( : < /dev/tty ) 2>/dev/null; then
+if { [ "$1" = "remove" ] || [ "$1" = "purge" ]; } && [ -z "$NASSIE_REINSTALLING" ]; then
+    if command -v python3 >/dev/null 2>&1 && [ -f /usr/lib/nassie/core.py ] && ( : < /dev/tty ) 2>/dev/null; then
         python3 - < /dev/tty > /dev/tty 2> /dev/tty <<'PYEOF' || true
 import sys
-sys.path.insert(0, '/usr/lib/kelpie')
+sys.path.insert(0, '/usr/lib/nassie')
 from core import SMBWizard
 
 w = SMBWizard()
-# Only shares carrying Kelpie's own group-naming signature - a share
-# Kelpie didn't create (pre-existing, or made through some other tool)
+# Only shares carrying NASsie's own group-naming signature - a share
+# NASsie didn't create (pre-existing, or made through some other tool)
 # should never be touched here.
 shares = [
     s for s in w.list_shares()
-    if s.get('group') and (s['group'].startswith('smbshare_') or s['group'].startswith('kelpie_')) and s.get('path')
+    if s.get('group') and (s['group'].startswith('smbshare_') or s['group'].startswith('nassie_')) and s.get('path')
 ]
 
 if shares:
     print()
-    print("=== Kelpie shares still configured ===")
+    print("=== NASsie shares still configured ===")
     for s in shares:
         print(f"  {s['name']} -> {s['path']}")
     print()

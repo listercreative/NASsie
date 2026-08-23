@@ -1,9 +1,9 @@
 #!/bin/sh
 # PYTHONDONTWRITEBYTECODE: without it, Python writes __pycache__/*.pyc into
-# /usr/lib/kelpie the first time Kelpie runs as root/elevated (the
+# /usr/lib/nassie the first time NASsie runs as root/elevated (the
 # directory is writable) - those files were never part of the package, so
 # dpkg correctly refuses to remove the directory on uninstall ("directory
 # not empty"), leaving stale files behind. Not writing them in the first
 # place is the real fix, not cleaning up after the fact.
 export PYTHONDONTWRITEBYTECODE=1
-exec python3 /usr/lib/kelpie/main.py "$@"
+exec python3 /usr/lib/nassie/main.py "$@"

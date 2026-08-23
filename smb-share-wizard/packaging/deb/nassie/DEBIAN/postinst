@@ -4,13 +4,13 @@ set -e
 if [ "$1" = "configure" ]; then
     if ( : < /dev/tty ) 2>/dev/null; then
         echo
-        echo "=== Kelpie ==="
+        echo "=== NASsie ==="
         echo "Samba is installed. Launching the wizard to set up your first share now"
         echo "(select 'Exit' in the menu to skip this and configure one later)."
         echo
-        /usr/bin/kelpie < /dev/tty > /dev/tty 2> /dev/tty || true
+        /usr/bin/nassie < /dev/tty > /dev/tty 2> /dev/tty || true
     else
-        echo "Kelpie installed. Run 'kelpie' (or 'kelpie --gui' for the desktop UI) to configure a share."
+        echo "NASsie installed. Run 'nassie' (or 'nassie --gui' for the desktop UI) to configure a share."
     fi
 fi
 

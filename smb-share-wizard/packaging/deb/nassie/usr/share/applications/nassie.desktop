@@ -1,9 +1,9 @@
 [Desktop Entry]
-Name=Kelpie
+Name=NASsie
 Comment=Create and manage SMB (Samba) shares
-Exec=kelpie --gui
-Icon=kelpie
-StartupWMClass=Kelpie
+Exec=nassie --gui
+Icon=nassie
+StartupWMClass=NASsie
 Terminal=false
 Type=Application
 Categories=System;Settings;

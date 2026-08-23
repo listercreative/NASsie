@@ -1,6 +1,6 @@
 # Linux packaging — building the installer tarball
 
-This directory builds `kelpie-linux-installer.tar.gz`: a self-contained
+This directory builds `nassie-linux-installer.tar.gz`: a self-contained
 bundle you can host anywhere (e.g. your website) for people to download
 and run on Ubuntu/Debian. It contains `install.sh`, `preview.py`, the built
 `.deb`, and a short `README.txt` — nothing else is needed, and there's no
@@ -22,21 +22,21 @@ From this directory:
 ```
 
 This rebuilds the `.deb` from current source (`build.sh`) and then bundles
-it into `kelpie-linux-installer.tar.gz` in this same directory. That one
+it into `nassie-linux-installer.tar.gz` in this same directory. That one
 file is what you upload to your website.
 
 ## What downloaders actually do
 
 ```sh
-tar -xzf kelpie-linux-installer.tar.gz
-cd kelpie-installer
+tar -xzf nassie-linux-installer.tar.gz
+cd nassie-installer
 ./install.sh
 ```
 
 `install.sh` shows a preview of what will be installed (curses UI if
 there's a real terminal, plain text otherwise), asks for confirmation,
-then installs `kelpie` + `samba` via `apt`. It also removes and cleanly
-reinstalls automatically if Kelpie is already present, so re-running it
+then installs `nassie` + `samba` via `apt`. It also removes and cleanly
+reinstalls automatically if NASsie is already present, so re-running it
 against a newer tarball works as an update path.
 
 Either of these requires a terminal - most Linux file managers don't
@@ -50,7 +50,7 @@ tarball or `install.sh` itself.
 ## One-line install (curl | sh)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/listercreative/Kelpie/main/smb-share-wizard/packaging/deb/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/listercreative/NASsie/main/smb-share-wizard/packaging/deb/bootstrap.sh | sh
 ```
 
 `bootstrap.sh` clones the repo, builds the `.deb` from current source, and
@@ -58,7 +58,7 @@ runs `install.sh` - same preview/confirmation step as above, this only
 automates *fetching* the files. It explicitly redirects `install.sh` to
 `/dev/tty` rather than inherited stdin/stdout, since a `curl | sh`
 invocation's own stdin is the piped script source, not the terminal - the
-same reason `postinst` does the same redirect for Kelpie's first-run
+same reason `postinst` does the same redirect for NASsie's first-run
 launch after install.
 
 ## Double-click alternative (no terminal)
@@ -81,13 +81,13 @@ being clearly stated wherever it's offered.
 
 **Bump the version before rebuilding**, in two places:
 
-- `kelpie/DEBIAN/control` — the `Version:` field
+- `nassie/DEBIAN/control` — the `Version:` field
 - `dist.sh` — the `VERSION` variable (cosmetic, only used in the bundled
   `README.txt`'s text)
 
 This isn't optional cosmetics — `apt` compares versions to decide whether
 there's anything to do. If you rebuild with the **same** version number,
-`apt install` on a machine that already has Kelpie installed will report
+`apt install` on a machine that already has NASsie installed will report
 "already the newest version" and silently do nothing, even though the
 package's file contents changed. `install.sh`'s `apt install --reinstall`
 covers the *install* side of that gap (forces a reinstall of a
@@ -96,7 +96,7 @@ change show up as an actual upgrade rather than a same-version reinstall,
 and is expected practice for any package intended for real distribution.
 
 Also note `build.sh`/`dist.sh` currently hardcode the filename
-`kelpie_0.1.0_all.deb` — if you bump the version, update that filename
+`nassie_0.1.0_all.deb` — if you bump the version, update that filename
 references in both scripts to match (or the build will look for/produce a
 file under the old name).
 
@@ -104,9 +104,9 @@ file under the old name).
 
 | File | Purpose |
 |---|---|
-| `build.sh` | Rebuilds `kelpie_0.1.0_all.deb` from `../../src/*.py` |
+| `build.sh` | Rebuilds `nassie_0.1.0_all.deb` from `../../src/*.py` |
 | `dist.sh` | Runs `build.sh`, then bundles the distributable tarball |
 | `install.sh` | What end users run — preview, confirm, `apt install` |
 | `bootstrap.sh` | `curl \| sh` one-liner: clones the repo, builds, runs `install.sh` |
 | `preview.py` | The pre-install curses preview screen (self-contained, no imports from `src/`, so the tarball needs only these files) |
-| `kelpie/` | The `.deb`'s staged file tree (`DEBIAN/control`, `postinst`, etc.) |
+| `nassie/` | The `.deb`'s staged file tree (`DEBIAN/control`, `postinst`, etc.) |

@@ -28,12 +28,12 @@ def _run(args, **kwargs):
 
 # Shown by all three UIs before resetting an existing user's password to
 # generate a QR code for them - explains this is a structural limitation of
-# how SMB/Samba/Windows store passwords, not a Kelpie shortcoming, and that
-# Kelpie itself never saves any username/password information; it's purely
+# how SMB/Samba/Windows store passwords, not a NASsie shortcoming, and that
+# NASsie itself never saves any username/password information; it's purely
 # an interface layer over the SMB/Samba tech underneath.
 QR_PASSWORD_RESET_NOTE = (
     "SMB has no way to retrieve an existing password - Samba, Windows, and "
-    "macOS all store it as a one-way hash, never the plaintext, and Kelpie "
+    "macOS all store it as a one-way hash, never the plaintext, and NASsie "
     "itself never saves any username/password information either; it's "
     "purely an interface layer over the SMB/Samba tech underneath, not a "
     "credential store. Generating a QR code for an existing user means "
@@ -82,7 +82,7 @@ class SMBWizard:
         return None
 
     def list_shares(self):
-        # Kelpie is just a helper for Samba/NTFS sharing - it doesn't keep
+        # NASsie is just a helper for Samba/NTFS sharing - it doesn't keep
         # its own record of what shares exist, because that copy can drift
         # from reality (a share that failed to apply would still show up as
         # "created"; a share removed some other way would linger forever).
@@ -122,7 +122,7 @@ class SMBWizard:
     def _delete_share_folder(self, path):
         # Same unsafe-path guard used before ever creating a share -
         # defense in depth before an rm -rf-equivalent, even though this
-        # path came from Kelpie's own live share listing rather than fresh
+        # path came from NASsie's own live share listing rather than fresh
         # user input. This project exists because of a past incident where
         # a permission/path mistake wiped out the wrong directory - a
         # recursive delete gets no less scrutiny than share creation did.
@@ -224,7 +224,7 @@ class SMBWizard:
         # snapshot, not a persistent group-level grant. A user added to the
         # group later doesn't automatically inherit this; re-run it (or set
         # them individually) if that's needed. Deliberately this simple:
-        # groups aren't first-class access-control principals in Kelpie's
+        # groups aren't first-class access-control principals in NASsie's
         # model, individual users are - this is just a convenience for
         # applying the same individual change to many of them at once.
         # Requires root/admin; callers not already elevated should go
@@ -449,12 +449,12 @@ class SMBWizard:
 
     # Prefix for admin-created, user-facing access-control groups (New
     # Group / Assign to Share) - distinct from the per-share ownership
-    # group (smbshare_<slug>/kelpie_<slug>/Kelpie_<share>, still created
+    # group (smbshare_<slug>/nassie_<slug>/NASsie_<share>, still created
     # automatically for every share, still filesystem-permission-only)
     # so list_groups() can show only the former: an ownership group was
     # never something an admin asked for or can meaningfully act on, so
     # it's never surfaced as if it were a real group.
-    _MANAGED_GROUP_PREFIX = {"Linux": "kelpiegrp_", "Darwin": "kelpiegrp_"}
+    _MANAGED_GROUP_PREFIX = {"Linux": "nassiegrp_", "Darwin": "nassiegrp_"}
 
     def list_groups(self):
         # Linux and macOS are both POSIX: the same grp-database read works
@@ -500,9 +500,9 @@ class SMBWizard:
         # Regular (non-system/service) local accounts, platform-appropriate:
         # Ubuntu/Debian's useradd defaults to UID_MIN=1000; macOS's regular
         # accounts start at 501 (Apple's own convention, distinct from
-        # Linux's). This is what Kelpie's own _configure_linux_user/
+        # Linux's). This is what NASsie's own _configure_linux_user/
         # _configure_macos_user create accounts as, so it naturally includes
-        # every user Kelpie could plausibly manage.
+        # every user NASsie could plausibly manage.
         if self.system in ("Linux", "Darwin"):
             import pwd
             min_uid = 1000 if self.system == "Linux" else 500
@@ -543,12 +543,12 @@ class SMBWizard:
         return sorted(groups, key=lambda x: x["name"])
 
     def _posix_access_group_name(self, name):
-        # Shared by Linux/macOS - both use the same kelpiegrp_ prefix (see
+        # Shared by Linux/macOS - both use the same nassiegrp_ prefix (see
         # _MANAGED_GROUP_PREFIX) since neither has a reason to distinguish
         # them, unlike the ownership-group names which historically differ
         # per platform.
         slug = re.sub(r'[^a-z0-9_-]', '_', name.lower()).strip('_-') or "group"
-        return f"kelpiegrp_{slug}"[:32]
+        return f"nassiegrp_{slug}"[:32]
 
     def _group_for_path(self, path):
         # Shared by the Linux/macOS list_shares implementations: the group
@@ -1034,11 +1034,11 @@ class SMBWizard:
         wizard._invoking_user_override = data.get('_invoking_user')
         wizard.unassign_group_from_share(data['group'], data['share'])
 
-    _UNINSTALL_FOLDERS_RESULT_FILE = "kelpie_uninstall_folders.json"
+    _UNINSTALL_FOLDERS_RESULT_FILE = "nassie_uninstall_folders.json"
 
     @staticmethod
     def prompt_uninstall_folders_windows():
-        # Runs as an IMMEDIATE custom action (see kelpie.wxs), in the same
+        # Runs as an IMMEDIATE custom action (see nassie.wxs), in the same
         # session as the interactive install/uninstall itself - unlike
         # uninstall_cleanup_windows() below, which runs deferred as SYSTEM
         # specifically to guarantee admin rights, and precisely because of
@@ -1081,7 +1081,7 @@ class SMBWizard:
             from tkinter import ttk
 
             root = tk.Tk()
-            root.title("Kelpie Uninstall")
+            root.title("NASsie Uninstall")
             root.resizable(False, False)
             root.attributes("-topmost", True)
 
@@ -1121,15 +1121,15 @@ class SMBWizard:
 
     @staticmethod
     def uninstall_cleanup_windows():
-        # Run by the MSI's uninstall custom action (see kelpie.wxs), before
-        # Kelpie's own files are removed - nothing else would ever clean
+        # Run by the MSI's uninstall custom action (see nassie.wxs), before
+        # NASsie's own files are removed - nothing else would ever clean
         # these up otherwise, since the SMB shares and the local accounts/
         # groups behind them live outside the app entirely (Get-SmbShare
-        # doesn't care whether Kelpie.exe still exists). Always removes
-        # every share Kelpie created and every Kelpie_*/KelpieGroup_* group
+        # doesn't care whether NASsie.exe still exists). Always removes
+        # every share NASsie created and every NASsie_*/NASsieGroup_* group
         # and account it tagged - unconditionally, no confirmation, since
         # none of this is user data: just SMB endpoint definitions and
-        # local Windows accounts/groups Kelpie itself created. That's also
+        # local Windows accounts/groups NASsie itself created. That's also
         # the only option here in practice - Settings > Apps > Uninstall
         # (confirmed by testing) runs completely silently with no desktop
         # session at all, so prompt_uninstall_folders_windows() often can't
@@ -1138,24 +1138,24 @@ class SMBWizard:
         # that stays opt-in via that prompt, since deleting actual data
         # without an explicit yes is the one mistake this project can't
         # afford to repeat. A pre-existing Windows account that was merely
-        # granted access to a Kelpie share (never tagged, since
+        # granted access to a NASsie share (never tagged, since
         # _configure_windows_user only marks genuinely new accounts) is
         # always left alone, no matter its group memberships.
-        print("[Windows] Removing Kelpie-managed shares, accounts, and groups...")
+        print("[Windows] Removing NASsie-managed shares, accounts, and groups...")
         wizard = SMBWizard()
         marker = wizard._ps_quote(SMBWizard._WINDOWS_ACCOUNT_MARKER)
 
-        # A share is "Kelpie's" if its deterministically-named ownership
+        # A share is "NASsie's" if its deterministically-named ownership
         # group actually exists (see _list_shares_windows()) - NOT by
-        # scanning the share's own SMB ACL for a Kelpie-prefixed group the
+        # scanning the share's own SMB ACL for a NASsie-prefixed group the
         # way an earlier version of this tried to: the ownership group is
         # never itself granted SMB access (run_windows() grants per-user
         # only), so that scan could never have matched anything for an
         # ordinary share, only for one with an admin-assigned access-control
         # group. Determined here in Python (reusing the already-correct
         # list_shares() logic) rather than re-derived inside the PS script.
-        kelpie_share_names = [s["name"] for s in wizard.list_shares() if s.get("group")]
-        share_list_ps = "@(" + ",".join(f"'{wizard._ps_quote(n)}'" for n in kelpie_share_names) + ")"
+        nassie_share_names = [s["name"] for s in wizard.list_shares() if s.get("group")]
+        share_list_ps = "@(" + ",".join(f"'{wizard._ps_quote(n)}'" for n in nassie_share_names) + ")"
 
         script = f"""
 $ErrorActionPreference = 'Stop'
@@ -1163,14 +1163,14 @@ foreach ($shareName in {share_list_ps}) {{
     Remove-SmbShare -Name $shareName -Force -ErrorAction SilentlyContinue
 }}
 
-# 'Kelpie*' (no underscore) so this also catches KelpieGroup_* - the
+# 'NASsie*' (no underscore) so this also catches NASsieGroup_* - the
 # admin-created access-control groups (New Group), distinct from the
-# per-share ownership groups (Kelpie_<share>) but equally Kelpie's to
+# per-share ownership groups (NASsie_<share>) but equally NASsie's to
 # clean up on a genuine uninstall.
-$kelpieGroups = Get-LocalGroup | Where-Object {{ $_.Name -like 'Kelpie*' }}
+$nassieGroups = Get-LocalGroup | Where-Object {{ $_.Name -like 'NASsie*' }}
 
 $affectedUsers = @{{}}
-foreach ($g in $kelpieGroups) {{
+foreach ($g in $nassieGroups) {{
     Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue | ForEach-Object {{
         $name = $_.Name.Split('\\')[-1]
         $affectedUsers[$name] = $true
@@ -1251,7 +1251,7 @@ foreach ($username in $affectedUsers.Keys) {{
         # Matches LockNAS's own BridgeQrCode.decode() format exactly (see
         # NASPicker/app/src/main/java/.../storage/BridgeQrCode.kt) so a scan
         # populates a new bridge with zero manual entry. Only ever call this
-        # right when a password is set (share creation / add user) - Kelpie
+        # right when a password is set (share creation / add user) - NASsie
         # doesn't persist plaintext passwords anywhere, so there's no way to
         # generate this later for an existing user.
         # "name" is the bridge's own display name (the computer/NAS being
@@ -1271,14 +1271,14 @@ foreach ($username in $affectedUsers.Keys) {{
 
     def _windows_group_name(self, share_name):
         cleaned = re.sub(r'[\"/\\\[\]:;|=,+*?<>@\x00-\x1f]', '_', share_name).strip()
-        return f"Kelpie_{cleaned or 'Share'}"[:64]
+        return f"NASsie_{cleaned or 'Share'}"[:64]
 
     def _windows_access_group_name(self, name):
-        # KelpieGroup_ (not Kelpie_<share>) so admin-created access-control
+        # NASsieGroup_ (not NASsie_<share>) so admin-created access-control
         # groups are unambiguously distinct from the per-share ownership
         # group - see _MANAGED_GROUP_PREFIX's comment.
         cleaned = re.sub(r'[\"/\\\[\]:;|=,+*?<>@\x00-\x1f]', '_', name).strip()
-        return f"KelpieGroup_{cleaned or 'Group'}"[:64]
+        return f"NASsieGroup_{cleaned or 'Group'}"[:64]
 
     def _run_ps_script(self, script, **kwargs):
         # For scripts too long/braces-heavy to safely embed as a single
@@ -1302,13 +1302,13 @@ foreach ($username in $affectedUsers.Keys) {{
         _run(["powershell", "-Command", cmd], check=True, capture_output=True, text=True)
 
     # Written to a genuinely new account's -Description so later code (in
-    # particular uninstall_cleanup_windows) can tell "Kelpie created this"
-    # apart from "Kelpie was merely given an existing account to use" -
+    # particular uninstall_cleanup_windows) can tell "NASsie created this"
+    # apart from "NASsie was merely given an existing account to use" -
     # without keeping any separate log file of our own (see core.py's
     # existing list_shares()/list_users()/list_groups() convention: the
     # live account IS the source of truth, this marker lives on it, and
     # can never drift out of sync the way a side file could).
-    _WINDOWS_ACCOUNT_MARKER = "Created by Kelpie"
+    _WINDOWS_ACCOUNT_MARKER = "Created by NASsie"
 
     def _windows_user_exists(self, username):
         escaped = self._ps_quote(username)
@@ -1328,15 +1328,15 @@ foreach ($username in $affectedUsers.Keys) {{
         # (password/audit policy etc). Per-user, not per-group: applying
         # this to a whole share group would also lock out anyone who
         # already had a real Windows login and was simply given share
-        # access - only ever call this for an account Kelpie itself just
+        # access - only ever call this for an account NASsie itself just
         # created, never one it was handed to reuse.
         escaped = self._ps_quote(username)
         script = f"""
 $ErrorActionPreference = 'Stop'
 $user = Get-LocalUser -Name '{escaped}'
 $sid = $user.SID.Value
-$cfgPath = Join-Path $env:TEMP 'kelpie_secpol.cfg'
-$dbPath = Join-Path $env:TEMP 'kelpie_secedit.sdb'
+$cfgPath = Join-Path $env:TEMP 'nassie_secpol.cfg'
+$dbPath = Join-Path $env:TEMP 'nassie_secedit.sdb'
 secedit /export /cfg $cfgPath /quiet | Out-Null
 $lines = Get-Content $cfgPath
 function Add-Right($lines, $key, $sid) {{
@@ -1359,7 +1359,7 @@ Remove-Item $cfgPath,$dbPath -ErrorAction SilentlyContinue
         self._run_ps_script(script, check=True, capture_output=True, text=True)
 
     def _hide_windows_account_from_logon(self, username):
-        # Kelpie-created accounts shouldn't appear as sign-in tiles on the
+        # NASsie-created accounts shouldn't appear as sign-in tiles on the
         # Windows Welcome/lock screen - they're SMB-only, not meant to be
         # logged into. This is the standard Windows mechanism for hiding a
         # specific local account from that list without affecting its
@@ -1381,21 +1381,21 @@ Remove-Item $cfgPath,$dbPath -ErrorAction SilentlyContinue
         escaped_user = self._ps_quote(username)
         if is_new:
             cmd = (
-                f"$pw = ConvertTo-SecureString $env:KELPIE_TEMP_PW -AsPlainText -Force; "
+                f"$pw = ConvertTo-SecureString $env:NASSIE_TEMP_PW -AsPlainText -Force; "
                 f"New-LocalUser -Name '{escaped_user}' -Password $pw -PasswordNeverExpires -AccountNeverExpires "
                 f"-Description '{self._ps_quote(self._WINDOWS_ACCOUNT_MARKER)}'"
             )
         else:
             cmd = (
-                f"$pw = ConvertTo-SecureString $env:KELPIE_TEMP_PW -AsPlainText -Force; "
+                f"$pw = ConvertTo-SecureString $env:NASSIE_TEMP_PW -AsPlainText -Force; "
                 f"Set-LocalUser -Name '{escaped_user}' -Password $pw"
             )
         env = dict(os.environ)
-        env["KELPIE_TEMP_PW"] = password
+        env["NASSIE_TEMP_PW"] = password
         _run(["powershell", "-Command", cmd], check=True, capture_output=True, text=True, env=env)
 
         if is_new:
-            # Only ever hide/restrict an account Kelpie itself just
+            # Only ever hide/restrict an account NASsie itself just
             # created - never one it was handed to reuse. A pre-existing
             # Windows account granted share access keeps its normal
             # ability to log in locally/via RDP and its usual sign-in
@@ -1457,7 +1457,7 @@ Remove-Item $cfgPath,$dbPath -ErrorAction SilentlyContinue
             # grant would always win). -FullAccess Administrators here is
             # just to satisfy New-SmbShare needing *some* access parameter
             # (omitting one risks defaulting to "Everyone: Read" on some
-            # Windows versions) - it grants nothing to Kelpie-created users,
+            # Windows versions) - it grants nothing to NASsie-created users,
             # who are never members of Administrators.
             cmd = (
                 f"if (-not (Get-SmbShare -Name '{escaped_share}' -ErrorAction SilentlyContinue)) {{ "
@@ -1537,12 +1537,12 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         if isinstance(data, dict):
             data = [data]
 
-        # Which of the deterministically-named ownership groups (Kelpie_
+        # Which of the deterministically-named ownership groups (NASsie_
         # <share>) actually exist, so share["group"] below reflects reality
-        # instead of being set for shares Kelpie never touched. One extra
+        # instead of being set for shares NASsie never touched. One extra
         # Get-LocalGroup call, batched here rather than per-share.
         group_cmd = (
-            "Get-LocalGroup | Where-Object { $_.Name -like 'Kelpie*' } "
+            "Get-LocalGroup | Where-Object { $_.Name -like 'NASsie*' } "
             "| Select-Object -ExpandProperty Name | ConvertTo-Json -Compress"
         )
         group_proc = _run(["powershell", "-Command", group_cmd], capture_output=True, text=True)
@@ -1555,11 +1555,11 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             existing_groups = set(self._as_list(group_data))
 
         # Housekeeping/placeholder accounts that can show up in a share's
-        # SMB ACL but were never a Kelpie-managed per-user grant - never
+        # SMB ACL but were never a NASsie-managed per-user grant - never
         # surfaced as if they were a real share user.
         non_user_accounts = {"Administrators", "Everyone", "SYSTEM", "Authenticated Users"}
         # When the account behind an ACE no longer exists (deleted through
-        # Windows' own tools, not Kelpie's "Delete User" - which revokes
+        # Windows' own tools, not NASsie's "Delete User" - which revokes
         # share access first), Windows can no longer resolve it to a name
         # and Get-SmbShareAccess reports the raw SID instead (e.g.
         # "*S-1-5-21-..."). That's a dangling permission, not a user -
@@ -1588,7 +1588,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             for entry in self._as_list(s.get("Access")):
                 account = entry.get("AccountName", "")
                 name = account.split("\\")[-1]
-                if name.startswith("KelpieGroup_"):
+                if name.startswith("NASsieGroup_"):
                     # Unlike the ownership group, an access-control group
                     # (assign_group_to_share()) IS a real SMB ACE, so this
                     # scan does find it.
@@ -1621,7 +1621,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         # pass through _list_shares_windows()'s own per-share loop - batch
         # groups+members into a single call, and reuse one shares fetch.
         cmd = (
-            "Get-LocalGroup | Where-Object { $_.Name -like 'KelpieGroup_*' } "
+            "Get-LocalGroup | Where-Object { $_.Name -like 'NASsieGroup_*' } "
             "| ForEach-Object { "
             "[PSCustomObject]@{ Name = $_.Name; "
             "Members = (Get-LocalGroupMember -Group $_.Name | Select-Object -ExpandProperty Name) } "
@@ -1938,7 +1938,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         # deleted and recreated; group names are reused but a fresh
         # groupadd gets a new GID, and a lingering directory never gets
         # re-synced to it), that's unambiguous evidence this is stale
-        # bookkeeping from Kelpie itself, not some unrelated directory, so
+        # bookkeeping from NASsie itself, not some unrelated directory, so
         # it's safe to repair. Returns True if a repair happened. Called
         # both when a share's directory already existed at creation time,
         # and whenever a user is granted access later - group membership
@@ -2110,7 +2110,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
                     # A "@group" token is an admin-assigned access-control
                     # group (assign_group_to_share), not a user - Samba
                     # natively supports mixing "user1 @group1" in this
-                    # directive. At most one is ever written by Kelpie.
+                    # directive. At most one is ever written by NASsie.
                     current["users"] = [{"username": u} for u in tokens if not u.startswith('@')]
                     group_tokens = [u[1:] for u in tokens if u.startswith('@')]
                     current["access_group"] = group_tokens[0] if group_tokens else None
@@ -2425,7 +2425,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
 
     def _macos_group_name(self, share_name):
         slug = re.sub(r'[^a-zA-Z0-9_-]', '_', share_name).strip('_-') or 'share'
-        return f"kelpie_{slug}"
+        return f"nassie_{slug}"
 
     def _ensure_macos_group(self, group_name):
         exists = _run(["dscl", ".", "-read", f"/Groups/{group_name}"], capture_output=True, text=True).returncode == 0

@@ -1,12 +1,12 @@
 # Windows packaging (.msi)
 
-`kelpie.wxs` builds an MSI using WiX v5's `WixUI_InstallDir` UI —
+`nassie.wxs` builds an MSI using WiX v5's `WixUI_InstallDir` UI —
 the standard native Windows Installer wizard (Welcome → License →
 install-directory chooser → Progress → Finish). Windows Installer itself
 triggers the UAC elevation prompt for the per-machine `Program Files`
 install; nothing extra is needed for that part.
 
-The MSI wraps a single `Kelpie.exe` produced by PyInstaller from
+The MSI wraps a single `NASsie.exe` produced by PyInstaller from
 `src/main.py` (bundling `core.py`/`cli.py`/`gui.py`/`tui.py`, `rich`, and
 `tkinter`), so the target machine does **not** need Python installed. It's
 built `--windowed`, so launching it (Start Menu shortcut, installed by this
@@ -25,7 +25,7 @@ prerequisites at the top of `build.ps1`.
 
 ## Verification status
 
-I wrote and validated the structure of `kelpie.wxs` against the
+I wrote and validated the structure of `nassie.wxs` against the
 real WiX v5.0.2 compiler (installed locally via the cross-platform `wix`
 .NET global tool), but **could not fully compile it in this environment**:
 WiX explicitly only supports Windows, and on Linux its directory-path
@@ -44,12 +44,12 @@ pair, since that's what a real installed copy looks like.
 ## Branding
 
 `banner.bmp` (493x58) and `dialog.bmp` (493x312) are generated from
-`assets/kelpie_icon.png`, flattened onto a white background (BMP has no
+`assets/nassie_icon.png`, flattened onto a white background (BMP has no
 alpha channel). To regenerate them after changing the source logo:
 
 ```python
 from PIL import Image
-logo = Image.open("assets/kelpie_icon.png").convert("RGBA")
+logo = Image.open("assets/nassie_icon.png").convert("RGBA")
 
 # Logo sits at the right edge of the banner - WixUI draws the dialog
 # title/description text on top of this bitmap, left-aligned starting
