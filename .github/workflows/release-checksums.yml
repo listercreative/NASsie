@@ -1,0 +1,37 @@
+name: Attach release checksums
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  checksums:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --dir assets \
+            --clobber
+
+      - name: Generate checksums.txt
+        run: |
+          cd assets
+          rm -f checksums.txt
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Upload checksums.txt to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            assets/checksums.txt \
+            --repo "${{ github.repository }}" \
+            --clobber
