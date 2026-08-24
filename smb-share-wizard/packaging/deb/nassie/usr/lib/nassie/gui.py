@@ -190,18 +190,6 @@ class GUIWizard:
         # Tk has no built-in "center on screen" - left alone, the window
         # manager decides placement, which is commonly the top-left corner
         # rather than anywhere near the middle of the display.
-        width, height = 560, 600
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
-        x = max(0, (screen_w - width) // 2)
-        y = max(0, (screen_h - height) // 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-        # Without a floor, shrinking the window below what the button grids
-        # (Groups, Users & Groups) actually need squishes them into an
-        # overlapping, unreadable mess instead of just clipping/scrolling -
-        # the window is otherwise freely resizable (no resizable(False)
-        # call), so this is the only thing stopping that.
-        self.root.minsize(width, height)
         self._load_icon_image()
         self._set_window_icon()
         self._build_header()
@@ -221,6 +209,33 @@ class GUIWizard:
         self._build_manage_tab()
         self._build_users_groups_tab()
         self._refresh_all_lists()
+
+        # Tk has no built-in "center on screen" - left alone, the window
+        # manager decides placement, which is commonly the top-left corner
+        # rather than anywhere near the middle of the display.
+        #
+        # The floor is measured from the widgets themselves (via
+        # winfo_reqwidth/reqheight, after update_idletasks lays everything
+        # out) rather than a hardcoded guess - a fixed constant here doesn't
+        # track content, so when the Users & Groups tab's button grid needed
+        # more room than the guess, shrinking to "minimum" still hid those
+        # buttons below the window edge instead of just clipping/scrolling.
+        # ttk.Notebook sizes itself to its largest pane, so this also covers
+        # the Groups and Users button grids even while another tab is shown.
+        self.root.update_idletasks()
+        width = max(560, self.root.winfo_reqwidth())
+        height = max(600, self.root.winfo_reqheight())
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        # Without a floor, shrinking the window below what the button grids
+        # (Groups, Users & Groups) actually need squishes them into an
+        # overlapping, unreadable mess instead of just clipping/scrolling -
+        # the window is otherwise freely resizable (no resizable(False)
+        # call), so this is the only thing stopping that.
+        self.root.minsize(width, height)
         self._bring_to_front()
 
     def _bring_to_front(self):
