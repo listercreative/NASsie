@@ -26,8 +26,39 @@ jobs:
             --repo "${{ github.repository }}" \
             --clobber
 
+  build-msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install WiX v5 CLI
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add --global WixToolset.UI.wixext/5.0.2
+          wix extension add --global WixToolset.Util.wixext/5.0.2
+
+      - name: Build NASsie.msi
+        working-directory: smb-share-wizard/packaging/windows
+        run: .\build.ps1
+
+      - name: Upload MSI + checksum to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd smb-share-wizard/packaging/windows
+          sha256sum NASsie.msi > NASsie.msi.sha256
+          gh release upload "${{ github.event.release.tag_name }}" \
+            NASsie.msi NASsie.msi.sha256 \
+            --repo "${{ github.repository }}" \
+            --clobber
+
   checksums:
-    needs: build-linux-installer
+    needs: [build-linux-installer, build-msi]
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets
