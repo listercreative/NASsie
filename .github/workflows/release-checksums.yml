@@ -8,7 +8,26 @@ permissions:
   contents: write
 
 jobs:
+  build-linux-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Linux installer tarball
+        run: smb-share-wizard/packaging/deb/dist.sh
+
+      - name: Upload tarball + checksum to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            smb-share-wizard/packaging/deb/nassie-linux-installer.tar.gz \
+            smb-share-wizard/packaging/deb/nassie-linux-installer.tar.gz.sha256 \
+            --repo "${{ github.repository }}" \
+            --clobber
+
   checksums:
+    needs: build-linux-installer
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets
