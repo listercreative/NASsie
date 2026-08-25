@@ -22,8 +22,14 @@ From this directory:
 ```
 
 This rebuilds the `.deb` from current source (`build.sh`) and then bundles
-it into `nassie-linux-installer.tar.gz` in this same directory. That one
-file is what you upload to your website.
+it into `nassie-linux-installer.tar.gz` in this same directory, alongside a
+`nassie-linux-installer.tar.gz.sha256` checksum file. Upload both — the
+tarball is what people install, the checksum lets them verify the download
+wasn't corrupted or tampered with:
+
+```sh
+sha256sum -c nassie-linux-installer.tar.gz.sha256
+```
 
 ## What downloaders actually do
 
@@ -105,7 +111,7 @@ file under the old name).
 | File | Purpose |
 |---|---|
 | `build.sh` | Rebuilds `nassie_0.1.0_all.deb` from `../../src/*.py` |
-| `dist.sh` | Runs `build.sh`, then bundles the distributable tarball |
+| `dist.sh` | Runs `build.sh`, then bundles the distributable tarball and its `.sha256` checksum |
 | `install.sh` | What end users run — preview, confirm, `apt install` |
 | `bootstrap.sh` | `curl \| sh` one-liner: clones the repo, builds, runs `install.sh` |
 | `preview.py` | The pre-install curses preview screen (self-contained, no imports from `src/`, so the tarball needs only these files) |
