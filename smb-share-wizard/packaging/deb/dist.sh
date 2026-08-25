@@ -33,4 +33,7 @@ EOF
 tar -C "$STAGE" -czf "$OUT" nassie-installer
 rm -rf "$STAGE"
 
+(cd "$SCRIPT_DIR" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256")
+
 echo "Built $OUT"
+echo "Checksum: $SCRIPT_DIR/$(basename "$OUT").sha256"
