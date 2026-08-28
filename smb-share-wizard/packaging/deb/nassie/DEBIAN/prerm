@@ -9,7 +9,17 @@ set -e
 # already be gone.
 if { [ "$1" = "remove" ] || [ "$1" = "purge" ]; } && [ -z "$NASSIE_REINSTALLING" ]; then
     if command -v python3 >/dev/null 2>&1 && [ -f /usr/lib/nassie/core.py ] && ( : < /dev/tty ) 2>/dev/null; then
-        python3 - < /dev/tty > /dev/tty 2> /dev/tty <<'PYEOF' || true
+        # The script has to come from somewhere other than fd 0: input()
+        # below needs stdin free to redirect to /dev/tty for the actual
+        # interactive prompt. A heredoc directly on the python3 command
+        # (as this used to do) binds to fd 0 too, so python3 -'s own
+        # source-reading silently consumes it first, leaving nothing for
+        # input() to read - it hit EOFError on every uninstall, which
+        # `|| true` below was swallowing, so shares/folders were never
+        # actually cleaned up. Writing it to a temp file instead frees
+        # fd 0 for /dev/tty.
+        nassie_prerm_script=$(mktemp)
+        cat > "$nassie_prerm_script" <<'PYEOF'
 import sys
 sys.path.insert(0, '/usr/lib/nassie')
 from core import SMBWizard
@@ -22,6 +32,12 @@ shares = [
     s for s in w.list_shares()
     if s.get('group') and (s['group'].startswith('smbshare_') or s['group'].startswith('nassie_')) and s.get('path')
 ]
+
+# Every NASsie-owned share's ownership group - captured before
+# delete_share() below removes the share, since list_groups() never
+# surfaces these (only the admin-created nassiegrp_* access-control
+# groups are - see _MANAGED_GROUP_PREFIX's comment in core.py).
+ownership_groups = {s['group'] for s in shares}
 
 if shares:
     print()
@@ -43,7 +59,36 @@ if shares:
             print(f"Removed share '{s['name']}' from Samba" + (" and deleted its folder." if delete_folders else "."))
         else:
             print(f"Failed to remove share '{s['name']}' from Samba.")
+
+# Groups/accounts live outside the package entirely too (local group/
+# passwd database, not any package file) - nothing else would ever clean
+# these up either. Unconditional, no confirmation, mirroring Windows'
+# uninstall_cleanup_windows(): every NASsie-owned group (ownership groups
+# for the shares just removed, plus every admin-created nassiegrp_*
+# access-control group from "New Group", used or not) and every account
+# NASsie itself created for sharing. Runs even if there were no shares
+# above - an access-control group can exist unassigned to any share.
+access_groups = {g['name'] for g in w.list_groups()}
+all_groups = ownership_groups | access_groups
+
+# Every account NASsie itself created (list_users()'s "managed" field -
+# _configure_linux_user only sets the nologin shell this is keyed on when
+# the account didn't already exist) - checked directly against every
+# local account, not derived from group membership, so this can't sweep
+# up a pre-existing account someone was merely granted share access to
+# (never "managed", no matter what group it's in) and can't miss a
+# NASsie-created account that isn't currently in any group (e.g. made via
+# "Create User" but never assigned to a share). Mirrors uninstall_
+# cleanup_windows()'s Description-marker check on Windows.
+for u in w.list_users():
+    if u.get('managed') and w.delete_user(u['username']):
+        print(f"Deleted account '{u['username']}'.")
+
+for name in sorted(all_groups):
+    w.delete_group(name)
 PYEOF
+        python3 "$nassie_prerm_script" < /dev/tty > /dev/tty 2> /dev/tty || true
+        rm -f "$nassie_prerm_script"
     fi
 fi
 
