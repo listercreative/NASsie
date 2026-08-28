@@ -5,7 +5,15 @@ __pycache__/
 
 CLAUDE.md
 
-# Built installer artifacts - regenerate with packaging/*/build.sh or build.ps1
-smb-share-wizard/packaging/deb/nassie_0.1.1_all.deb
+# Built installer artifacts - regenerate with packaging/*/build.sh or
+# build.ps1. CI (release-checksums.yml) builds and attaches these to each
+# GitHub release, which is the source of truth for what people download -
+# git shouldn't carry its own, separately-built (and immediately stale)
+# copy. Wildcarded rather than pinned to one version, so a version bump
+# never has to touch this file.
+smb-share-wizard/packaging/deb/nassie_*_all.deb
+smb-share-wizard/packaging/deb/nassie-linux-installer.tar.gz
+smb-share-wizard/packaging/deb/nassie-linux-installer.tar.gz.sha256
 smb-share-wizard/packaging/windows/*.exe
 smb-share-wizard/packaging/windows/*.msi
+smb-share-wizard/packaging/windows/*.msi.sha256

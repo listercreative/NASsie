@@ -61,7 +61,6 @@ sed -i "s/Version=\"${CURRENT_VERSION}\.0\"/Version=\"${VERSION}.0\"/" "$WXS"
 sed -i "s/VERSION=\"${CURRENT_VERSION}\"/VERSION=\"${VERSION}\"/" "$DIST_SH"
 sed -i "s/${OLD_DEB}/${NEW_DEB}/g" "$DIST_SH" "$BUILD_SH" "$INSTALL_SH"
 sed -i "s/^Version: ${CURRENT_VERSION}\$/Version: ${VERSION}/" "$CONTROL"
-sed -i "s/${OLD_DEB}/${NEW_DEB}/g" .gitignore
 
 grep -q "Version=\"${VERSION}.0\"" "$WXS" || { echo "Failed to update $WXS - aborting." >&2; exit 1; }
 grep -q "^Version: ${VERSION}\$" "$CONTROL" || { echo "Failed to update $CONTROL - aborting." >&2; exit 1; }
