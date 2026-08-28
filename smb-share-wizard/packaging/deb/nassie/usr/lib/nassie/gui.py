@@ -9,6 +9,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
 
 from core import SMBWizard, QR_PASSWORD_RESET_NOTE
+from tour import GuiTour, has_seen_tour, mark_tour_seen
 
 
 def _center_over_parent(win, parent):
@@ -194,16 +195,16 @@ class GUIWizard:
         self._set_window_icon()
         self._build_header()
 
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.create_tab = ttk.Frame(notebook)
-        self.manage_tab = ttk.Frame(notebook)
-        self.users_groups_tab = ttk.Frame(notebook)
-        notebook.add(self.create_tab, text="Create Share")
-        notebook.add(self.manage_tab, text="Manage Shares")
-        notebook.add(self.users_groups_tab, text="Users & Groups")
-        notebook.bind("<<NotebookTabChanged>>", lambda e: self._refresh_all_lists())
+        self.create_tab = ttk.Frame(self.notebook)
+        self.manage_tab = ttk.Frame(self.notebook)
+        self.users_groups_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.create_tab, text="Create Share")
+        self.notebook.add(self.manage_tab, text="Manage Shares")
+        self.notebook.add(self.users_groups_tab, text="Users & Groups")
+        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self._refresh_all_lists())
 
         self._build_create_tab()
         self._build_manage_tab()
@@ -237,6 +238,15 @@ class GUIWizard:
         # call), so this is the only thing stopping that.
         self.root.minsize(width, height)
         self._bring_to_front()
+
+        if not has_seen_tour():
+            mark_tour_seen()
+            # Marked seen up front, not after the tour finishes - a crash
+            # or force-quit mid-tour shouldn't leave it re-triggering on
+            # every subsequent launch. Deferred via after() so the window
+            # is fully mapped (real winfo_rootx/rooty) before the tour
+            # measures widget positions.
+            self.root.after(400, self._start_tour)
 
     def _bring_to_front(self):
         # When NASsie is launched by the "Launch NASsie" checkbox
@@ -289,8 +299,19 @@ class GUIWizard:
             ttk.Label(header, image=self._header_icon_image).pack(side="left", padx=(0, 10))
 
         ttk.Label(header, text="NASsie", font=("TkDefaultFont", 18, "bold")).pack(side="left")
+        ttk.Button(header, text="Take a Tour", command=self._start_tour).pack(side="right")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=8, pady=(10, 0))
+
+    def notebook_select(self, tab_index):
+        self.notebook.select(tab_index)
+
+    def _start_tour(self):
+        # Rebuilt each time rather than cached - a stale GuiTour with a
+        # half-run index would otherwise resume mid-tour instead of
+        # restarting from step one on the next click.
+        self._tour = GuiTour(self)
+        self._tour.start()
 
     def _build_create_tab(self):
         frame = self.create_tab
@@ -308,7 +329,7 @@ class GUIWizard:
         self.path_entry.grid(row=1, column=1, sticky="w", pady=4)
         self._last_suggested_path = self.wizard.default_share_path()
         self.path_entry.insert(0, self._last_suggested_path)
-        ttk.Button(form, text="Browse...", command=self._browse_path).grid(row=1, column=2, padx=4)
+        ttk.Button(form, text="Browse", command=self._browse_path).grid(row=1, column=2, padx=4)
 
         users_label_frame = ttk.LabelFrame(frame, text="Users")
         users_label_frame.pack(fill="both", expand=False, padx=8, pady=8)
@@ -323,7 +344,7 @@ class GUIWizard:
 
         users_btn_frame = ttk.Frame(users_label_frame)
         users_btn_frame.pack(side="left", fill="y", padx=4, pady=4)
-        ttk.Button(users_btn_frame, text="Add User...", command=self._add_user).pack(fill="x", pady=2)
+        ttk.Button(users_btn_frame, text="Add User", command=self._add_user).pack(fill="x", pady=2)
         ttk.Button(users_btn_frame, text="Remove Selected", command=self._remove_user).pack(fill="x", pady=2)
 
         action_frame = ttk.Frame(frame)
@@ -368,7 +389,7 @@ class GUIWizard:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Button(btn_frame, text="Refresh", command=self._refresh_manage_list).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Add User...", command=self._add_user_to_selected_share).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Add User", command=self._add_user_to_selected_share).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Delete Selected", command=self._delete_selected_share).pack(side="left", padx=4)
 
     def _build_users_groups_tab(self):
@@ -411,13 +432,13 @@ class GUIWizard:
                 row=row, column=col, sticky="ew", padx=4, pady=2
             )
 
-        group_button("New Group...", self._create_new_group, 0, 0)
+        group_button("New Group", self._create_new_group, 0, 0)
         group_button("Delete Group", self._delete_selected_group, 0, 1)
-        group_button("Add Member...", self._add_group_member, 1, 0)
-        group_button("Remove Member...", self._remove_group_member, 1, 1)
-        group_button("Assign to Share...", self._assign_group_to_share, 2, 0)
-        group_button("Remove from Share...", self._unassign_group_from_share, 2, 1)
-        group_button("Set Access Level...", self._set_access_level_for_group, 2, 2)
+        group_button("Add Member", self._add_group_member, 1, 0)
+        group_button("Remove Member", self._remove_group_member, 1, 1)
+        group_button("Assign to Share", self._assign_group_to_share, 2, 0)
+        group_button("Remove from Share", self._unassign_group_from_share, 2, 1)
+        group_button("Set Access Level", self._set_access_level_for_group, 2, 2)
 
         users_frame = ttk.LabelFrame(frame, text="Users")
         users_frame.pack(fill="both", expand=True, padx=8, pady=(4, 4))
@@ -454,13 +475,13 @@ class GUIWizard:
                 row=row, column=col, sticky="ew", padx=4, pady=2
             )
 
-        user_button("New User...", self._create_new_user, 0, 0)
+        user_button("New User", self._create_new_user, 0, 0)
         user_button("Delete User", self._delete_selected_user, 0, 1)
-        user_button("Assign to Group...", self._assign_selected_user_to_group, 1, 0)
-        user_button("Remove from Group...", self._remove_selected_user_from_group, 1, 1)
-        user_button("Revoke Access...", self._revoke_selected_user_access, 2, 0)
-        user_button("Change Access Level...", self._change_access_level_for_selected_user, 2, 1)
-        user_button("Reset Password & Show QR...", self._reset_password_for_selected_user, 2, 2)
+        user_button("Assign to Group", self._assign_selected_user_to_group, 1, 0)
+        user_button("Remove from Group", self._remove_selected_user_from_group, 1, 1)
+        user_button("Revoke Access", self._revoke_selected_user_access, 2, 0)
+        user_button("Change Access Level", self._change_access_level_for_selected_user, 2, 1)
+        user_button("Reset Password & Show QR", self._reset_password_for_selected_user, 2, 2)
 
         ttk.Button(frame, text="Refresh", command=self._refresh_users_groups).pack(
             padx=8, pady=(0, 8), anchor="w"
@@ -1073,7 +1094,7 @@ class GUIWizard:
 
     def _create_new_group(self):
         # A standalone access-control group, not tied to any share until
-        # explicitly assigned via "Assign to Share..." - unlike a share's
+        # explicitly assigned via "Assign to Share" - unlike a share's
         # own auto-created ownership group (filesystem-permission-only,
         # never shown here), this one grants real, persistent SMB access
         # to whatever it's assigned to.

@@ -101,16 +101,17 @@ same-version package), but a real version bump is still what makes the
 change show up as an actual upgrade rather than a same-version reinstall,
 and is expected practice for any package intended for real distribution.
 
-Also note `build.sh`/`dist.sh` currently hardcode the filename
-`nassie_0.1.0_all.deb` — if you bump the version, update that filename
-references in both scripts to match (or the build will look for/produce a
-file under the old name).
+Also note `build.sh`/`dist.sh`/`install.sh` currently hardcode the versioned
+filename (e.g. `nassie_0.1.0_all.deb`) — bumping the version means updating
+that filename in all three, plus `DEBIAN/control`'s own `Version:` and
+`../windows/nassie.wxs`'s `Version=`, or they'll drift out of sync with each
+other. The repo root's `push.sh` does all of this for you in one step.
 
 ## Files in this directory
 
 | File | Purpose |
 |---|---|
-| `build.sh` | Rebuilds `nassie_0.1.0_all.deb` from `../../src/*.py` |
+| `build.sh` | Rebuilds the `.deb` from `../../src/*.py` |
 | `dist.sh` | Runs `build.sh`, then bundles the distributable tarball and its `.sha256` checksum |
 | `install.sh` | What end users run — preview, confirm, `apt install` |
 | `bootstrap.sh` | `curl \| sh` one-liner: clones the repo, builds, runs `install.sh` |
