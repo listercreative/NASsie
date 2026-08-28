@@ -120,6 +120,149 @@ class ChoiceDialog(tk.Toplevel):
         self.destroy()
 
 
+class ExistingUserDialog(tk.Toplevel):
+    """Shown from 'New User' instead of silently resetting a password when
+    the typed name already exists - lays out what that account already has
+    (shares/groups) and offers the specific actions someone in that
+    situation actually wants, rather than a bare 'already exists' error.
+
+    Its button set depends on user_info["managed"]: a NASsie-managed
+    account (one NASsie itself created for sharing) can be freely
+    deleted/reset - that's what it's for. An unmanaged account is a real
+    person's pre-existing sign-in that NASsie was merely handed to grant
+    access to; Delete/Reset Password are never offered for one of those,
+    since either would touch a real login NASsie has no business touching."""
+    def __init__(self, parent, gui, user_info, password):
+        super().__init__(parent)
+        self.gui = gui
+        self.username = user_info["username"]
+        self.password = password
+        self.managed = user_info.get("managed", False)
+        self.title("User Already Exists")
+        self.resizable(False, False)
+        self.transient(parent)
+
+        if self.managed:
+            headline = f"'{self.username}' already exists."
+        else:
+            headline = f"'{self.username}' is an existing computer account, not one NASsie created."
+        ttk.Label(
+            self, text=headline, font=("TkDefaultFont", 11, "bold"), padding=(12, 12, 12, 4), wraplength=360,
+        ).pack(anchor="w")
+        if not self.managed:
+            ttk.Label(
+                self,
+                text="NASsie won't delete this account or change its password - only manage its "
+                     "share/group access.",
+                padding=(12, 0, 12, 4), wraplength=360,
+            ).pack(anchor="w")
+
+        info = ttk.Frame(self, padding=(12, 0, 12, 8))
+        info.pack(fill="both", expand=True)
+        shares = user_info.get("shares") or []
+        groups = user_info.get("groups") or []
+        ttk.Label(info, text="Shares: " + (", ".join(shares) if shares else "(none)")).pack(anchor="w")
+        ttk.Label(info, text="Groups: " + (", ".join(groups) if groups else "(none)")).pack(anchor="w")
+
+        btn_frame = ttk.Frame(self, padding=(12, 0, 12, 12))
+        btn_frame.pack(fill="x")
+        num_buttons = 5 if self.managed else 3
+        for col in range(num_buttons):
+            btn_frame.columnconfigure(col, weight=1, uniform="existing_user_btn")
+
+        col = 0
+        if self.managed:
+            ttk.Button(btn_frame, text="Delete User", command=self._delete).grid(
+                row=0, column=col, sticky="ew", padx=2
+            )
+            col += 1
+            ttk.Button(btn_frame, text="Reset Password", command=self._reset_password).grid(
+                row=0, column=col, sticky="ew", padx=2
+            )
+            col += 1
+        ttk.Button(btn_frame, text="Add to Group", command=self._add_group).grid(
+            row=0, column=col, sticky="ew", padx=2
+        )
+        col += 1
+        ttk.Button(btn_frame, text="Add to Share", command=self._add_share).grid(
+            row=0, column=col, sticky="ew", padx=2
+        )
+        col += 1
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).grid(row=0, column=col, sticky="ew", padx=2)
+
+        _center_over_parent(self, parent)
+        self.grab_set()
+
+    def _delete(self):
+        if not messagebox.askyesno(
+            "Delete user",
+            f"Delete user '{self.username}' entirely? This removes their account everywhere, not just one share.",
+            parent=self,
+        ):
+            return
+        threading.Thread(target=self.gui._delete_user_worker, args=(self.username,), daemon=True).start()
+        self.destroy()
+
+    def _reset_password(self):
+        if not messagebox.askokcancel(
+            "Reset Password",
+            "This sets a new password for '" + self.username + "' right now - the old one (and anything "
+            "still using it) will stop working until it's reconnected with the new one.",
+            parent=self,
+        ):
+            return
+        threading.Thread(
+            target=self.gui._create_user_worker, args=(self.username, self.password), daemon=True
+        ).start()
+        self.destroy()
+
+    def _add_group(self):
+        groups = self.gui.wizard.list_groups()
+        if not groups:
+            messagebox.showinfo("Add to group", "No groups exist to assign to.", parent=self)
+            return
+        choice = ChoiceDialog(
+            self, "Add to Group", f"Assign '{self.username}' to:",
+            [g["name"] for g in groups], ok_label="Assign",
+        )
+        if not choice.result:
+            return
+        threading.Thread(
+            target=self.gui._assign_group_worker, args=(self.username, choice.result), daemon=True
+        ).start()
+        self.destroy()
+
+    def _add_share(self):
+        shares = self.gui.wizard.list_shares()
+        if not shares:
+            messagebox.showinfo("Add to share", "No shares exist yet.", parent=self)
+            return
+        if not self.managed and not messagebox.askyesno(
+            "Existing computer account", self.gui.existing_account_grant_message(self.username), parent=self,
+        ):
+            return
+        share_choice = ChoiceDialog(
+            self, "Choose share", f"Grant '{self.username}' access to which share?",
+            [s["name"] for s in shares], ok_label="Next",
+        )
+        if not share_choice.result:
+            return
+        level_choice = ChoiceDialog(
+            self, "Access level", f"Grant '{self.username}':", ["Read-write", "Read-only"], ok_label="Grant",
+        )
+        if not level_choice.result:
+            return
+        read_only = level_choice.result == "Read-only"
+        # Never touch Windows' real login password for an unmanaged account - see
+        # GUIWizard.existing_account_grant_message()/_add_user_to_share_windows.
+        password = None if (not self.managed and self.gui.wizard.system == "Windows") else self.password
+        threading.Thread(
+            target=self.gui._grant_access_worker,
+            args=(share_choice.result, self.username, password, read_only), daemon=True,
+        ).start()
+        self.destroy()
+
+
 class QrCodeDialog(tk.Toplevel):
     """Shows a LockNAS bridge QR code for one just-created (or just-granted)
     user. Only ever constructible with a payload already in hand - NASsie
@@ -508,6 +651,14 @@ class GUIWizard:
         for item in self.system_users_list.get_children():
             self.system_users_list.delete(item)
         for u in users:
+            # list_users() returns every OS-level account on the machine
+            # (it has to, so "Add User"/"Add Member" pickers can offer an
+            # existing person) - but showing all of those here, unlabeled,
+            # means someone's own Windows sign-in or a family member's
+            # account shows up in a sharing tool with no explanation of
+            # what it is. Only show accounts NASsie actually has a hand in.
+            if not u["shares"] and not u["groups"]:
+                continue
             uid = self.system_users_list.insert("", tk.END, text=u["username"], open=True)
             for g in u["groups"]:
                 self.system_users_list.insert(uid, tk.END, text=f"group: {g}")
@@ -639,16 +790,48 @@ class GUIWizard:
             messagebox.showinfo("Add user", "Select a share first.")
             return
         share_name = self.shares_list.item(selection[0], "values")[0]
-        existing = [u["username"] for u in self.wizard.list_users()]
-        dialog = AddUserDialog(self.root, existing_usernames=existing)
+        all_users = self.wizard.list_users()
+        dialog = AddUserDialog(self.root, existing_usernames=[u["username"] for u in all_users])
         if not dialog.result:
             return
         username = dialog.result["username"]
         password = dialog.result["password"]
         read_only = dialog.result.get("read_only", False)
+
+        # A name matching a real, pre-existing computer account (not one
+        # NASsie created) needs a heads-up before granting it access, and
+        # on Windows must never actually use the typed password - see
+        # existing_account_grant_message()/_add_user_to_share_windows.
+        existing_user = next((u for u in all_users if u["username"] == username), None)
+        if existing_user and not existing_user.get("managed", False):
+            if not messagebox.askyesno(
+                "Existing computer account", self.existing_account_grant_message(username)
+            ):
+                return
+            if self.wizard.system == "Windows":
+                password = None
+
         threading.Thread(
             target=self._grant_access_worker, args=(share_name, username, password, read_only), daemon=True
         ).start()
+
+    def existing_account_grant_message(self, username):
+        if self.wizard.system == "Windows":
+            return (
+                f"'{username}' is an existing Windows account, not one NASsie created.\n\n"
+                "Granting access won't change their Windows password - they'll keep signing in "
+                "the same way. Add them to this share?"
+            )
+        if self.wizard.system == "Linux":
+            return (
+                f"'{username}' is an existing Linux account, not one NASsie created.\n\n"
+                "This sets/updates their separate file-sharing (Samba) password only - it "
+                "won't touch their regular login password. Add them to this share?"
+            )
+        return (
+            f"'{username}' already exists on this computer, not created by NASsie.\n\n"
+            "Add them to this share? This sets the password used for sharing access."
+        )
 
     def _reset_password_for_selected_user(self):
         # Passwords are stored as hashes everywhere (Samba, Windows, macOS)
@@ -666,6 +849,21 @@ class GUIWizard:
         shares = user.get("shares", []) if user else []
         if not shares:
             messagebox.showinfo("Reset Password & Show QR", f"'{username}' doesn't have access to any share yet.")
+            return
+
+        # On Windows this would reset the account's real sign-in password
+        # (no separate SMB password store there - see
+        # _add_user_to_share_windows) - never do that to an account NASsie
+        # didn't create. Linux is unaffected: Samba's password is already
+        # independent of the real login password, so resetting it here
+        # can't lock anyone out of their actual account.
+        if not user.get("managed", False) and self.wizard.system == "Windows":
+            messagebox.showinfo(
+                "Reset Password & Show QR",
+                f"'{username}' is an existing Windows account, not one NASsie created - resetting its "
+                "password here would also change what they sign in with, so NASsie won't do that. "
+                "Reset their password from Windows' own account settings instead.",
+            )
             return
 
         if not messagebox.askokcancel("Reset Password & Show QR", QR_PASSWORD_RESET_NOTE):
@@ -774,7 +972,12 @@ class GUIWizard:
             self._append_log(log_output)
         if added:
             messagebox.showinfo("Added", f"Added '{username}' to share '{share_name}'.")
-            self._offer_qr_codes(share_name, [{"username": username, "password": password}])
+            # password is None for an existing, unmanaged Windows account
+            # NASsie deliberately left untouched (see
+            # _add_user_to_share_windows) - there's no password to encode,
+            # and it must never be guessed at or invented for the QR code.
+            if password is not None:
+                self._offer_qr_codes(share_name, [{"username": username, "password": password}])
         else:
             messagebox.showerror("Failed", f"Could not add '{username}' to share '{share_name}' — see log.")
         self._refresh_all_lists()
@@ -1007,6 +1210,19 @@ class GUIWizard:
         if not username:
             messagebox.showinfo("Delete user", "Select a user first.")
             return
+        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
+        if not (user and user.get("managed", False)):
+            # Never delete an account NASsie didn't create - that's a real
+            # person's computer account, not an SMB-only one NASsie can
+            # freely remove. Revoking share/group access is still fine;
+            # deleting the account itself is not NASsie's call to make.
+            messagebox.showinfo(
+                "Delete user",
+                f"'{username}' is an existing computer account, not one NASsie created - NASsie won't "
+                "delete it. Remove it from this share/group instead, or delete the account itself from "
+                "your computer's own account settings.",
+            )
+            return
         if not messagebox.askyesno(
             "Delete user", f"Delete user '{username}' entirely? This removes their account everywhere, not just one share."
         ):
@@ -1037,12 +1253,26 @@ class GUIWizard:
         # user get set up ahead of deciding what to grant them access to,
         # instead of forcing a throwaway share into existence just to get
         # the account created.
-        existing = [u["username"] for u in self.wizard.list_users()]
-        dialog = AddUserDialog(self.root, existing_usernames=existing, show_access_level=False)
+        all_users = self.wizard.list_users()
+        dialog = AddUserDialog(
+            self.root, existing_usernames=[u["username"] for u in all_users], show_access_level=False
+        )
         if not dialog.result:
             return
         username = dialog.result["username"]
         password = dialog.result["password"]
+
+        # add_user() silently resets the password of an account that's
+        # already there rather than failing - which is exactly the
+        # confusing-if-unlabeled behavior this dialog exists to surface
+        # instead: someone who typed an existing name (by mistake, or on
+        # purpose to manage that account) sees what it already has and
+        # picks the specific thing they actually meant to do.
+        existing_user = next((u for u in all_users if u["username"] == username), None)
+        if existing_user:
+            ExistingUserDialog(self.root, self, existing_user, password)
+            return
+
         threading.Thread(target=self._create_user_worker, args=(username, password), daemon=True).start()
 
     def _create_user_worker(self, username, password):
@@ -1059,9 +1289,9 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if created:
-            messagebox.showinfo("Created", f"Created user '{username}'.")
+            messagebox.showinfo("Done", f"'{username}' now has this password.")
         else:
-            messagebox.showerror("Failed", f"Could not create user '{username}' — see log.")
+            messagebox.showerror("Failed", f"Could not set up user '{username}' — see log.")
         self._refresh_all_lists()
 
     def _delete_selected_group(self):
