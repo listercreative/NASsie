@@ -11,11 +11,30 @@ _CALLOUT_BG = "#eaf6f8"
 _BORDER_THICKNESS = 3
 
 
+def _real_home():
+    # Root via sudo - notably the postinst-launched wizard, which always
+    # runs as root regardless of who ran `apt install` - has HOME=/root.
+    # For most users that IS their first-ever look at NASsie, so the
+    # marker has to land in the real invoking user's home instead: written
+    # against /root, it'd not just miss recording that user's actual first
+    # look, it'd permanently hide the tour from every later real launch
+    # too, since has_seen_tour() would then only ever check root's own
+    # copy. Same signal core.py's SMBWizard._real_home() uses.
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        try:
+            import pwd
+            return pwd.getpwnam(sudo_user).pw_dir
+        except (KeyError, ImportError):
+            pass
+    return os.path.expanduser("~")
+
+
 def _first_run_marker_path():
     if platform.system() == "Windows" and os.environ.get("APPDATA"):
         base = os.path.join(os.environ["APPDATA"], "NASsie")
     else:
-        base = os.path.expanduser("~/.config/nassie")
+        base = os.path.join(_real_home(), ".config", "nassie")
     return os.path.join(base, "tour_seen")
 
 
@@ -25,50 +44,83 @@ def has_seen_tour():
 
 def mark_tour_seen():
     path = _first_run_marker_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
     with open(path, "w"):
         pass
+    _chown_to_real_user(directory, path)
+
+
+def _chown_to_real_user(*paths):
+    # Only meaningful for the same root-via-sudo case _real_home() handles
+    # - without this, a directory/file created (as root) inside another
+    # user's home would end up root-owned, leaving that user unable to
+    # write anything else of their own into ~/.config/nassie later.
+    if os.name != "posix" or os.geteuid() != 0:
+        return
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user or sudo_user == "root":
+        return
+    try:
+        import pwd
+        pw = pwd.getpwnam(sudo_user)
+    except KeyError:
+        return
+    for p in paths:
+        try:
+            os.chown(p, pw.pw_uid, pw.pw_gid)
+        except OSError:
+            pass
 
 
 class _HighlightBox:
-    """Four thin borderless windows forming a rectangle outline around a
-    widget - avoids relying on Tk's poorly-supported, Windows-only
-    -transparentcolor trick to punch a see-through hole in one overlay."""
+    """Four thin frames forming a rectangle outline around a widget -
+    placed directly on the GUI's own root window (via place()) rather
+    than as separate overrideredirect Toplevels. Toplevels bypass the
+    window manager entirely, which on Linux WMs with virtual desktops
+    (GNOME/Mutter included) means they aren't hidden/shown per-workspace
+    the way real windows are - they just render at a fixed screen
+    position on whatever workspace happens to be active, drifting onto
+    an unrelated window if the GUI itself ended up on a different one.
+    Being real child widgets of root ties this to the window by
+    construction: it moves, raises, minimizes, and switches workspaces
+    exactly as the window does, with nothing to get out of sync."""
 
     def __init__(self, root):
-        self.bars = [tk.Toplevel(root) for _ in range(4)]
-        for bar in self.bars:
-            bar.overrideredirect(True)
-            bar.configure(bg=_HIGHLIGHT_COLOR)
-            bar.attributes("-topmost", True)
+        self.root = root
+        self.bars = [tk.Frame(root, bg=_HIGHLIGHT_COLOR, bd=0, highlightthickness=0) for _ in range(4)]
 
     def place_around(self, widget):
         widget.update_idletasks()
         pad = 4
-        x = widget.winfo_rootx() - pad
-        y = widget.winfo_rooty() - pad
+        # Relative to root's own top-left corner, not the screen -
+        # place() positions children within their container, while
+        # winfo_rootx/rooty return absolute screen coordinates.
+        x = widget.winfo_rootx() - self.root.winfo_rootx() - pad
+        y = widget.winfo_rooty() - self.root.winfo_rooty() - pad
         w = widget.winfo_width() + pad * 2
         h = widget.winfo_height() + pad * 2
         t = _BORDER_THICKNESS
         top, bottom, left, right = self.bars
-        top.geometry(f"{w}x{t}+{x}+{y}")
-        bottom.geometry(f"{w}x{t}+{x}+{y + h - t}")
-        left.geometry(f"{t}x{h}+{x}+{y}")
-        right.geometry(f"{t}x{h}+{x + w - t}+{y}")
+        top.place(x=x, y=y, width=w, height=t)
+        bottom.place(x=x, y=y + h - t, width=w, height=t)
+        left.place(x=x, y=y, width=t, height=h)
+        right.place(x=x + w - t, y=y, width=t, height=h)
+        for bar in self.bars:
+            bar.lift()
 
     def destroy(self):
         for bar in self.bars:
             bar.destroy()
 
 
-class _Callout(tk.Toplevel):
+class _Callout(tk.Frame):
+    # Same reasoning as _HighlightBox: a real child widget of root, placed
+    # via place() instead of a floating overrideredirect Toplevel, so it
+    # can never end up displayed on top of some other window.
     def __init__(self, root, title, text, step_num, step_total, on_next, on_back, on_skip):
-        super().__init__(root)
-        self.overrideredirect(True)
-        self.attributes("-topmost", True)
-        # A 2px frame in the highlight color doubles as the callout's own
-        # border - one less widget to draw and keep aligned.
-        self.configure(bg=_HIGHLIGHT_COLOR, padx=2, pady=2)
+        super().__init__(root, bg=_HIGHLIGHT_COLOR, bd=0, highlightthickness=0, padx=2, pady=2)
+        self.root = root
 
         inner = tk.Frame(self, bg=_CALLOUT_BG)
         inner.pack(fill="both", expand=True)
@@ -92,22 +144,27 @@ class _Callout(tk.Toplevel):
         if step_num > 1:
             ttk.Button(btn_row, text="Back", command=on_back).pack(side="right", padx=(4, 0))
 
-    def place_near(self, widget, screen_w, screen_h):
+    def place_near(self, widget):
         self.update_idletasks()
         w = self.winfo_reqwidth()
         h = self.winfo_reqheight()
 
-        wx = widget.winfo_rootx()
-        wy = widget.winfo_rooty()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+
+        wx = widget.winfo_rootx() - self.root.winfo_rootx()
+        wy = widget.winfo_rooty() - self.root.winfo_rooty()
         ww = widget.winfo_width()
         wh = widget.winfo_height()
 
         # Prefer sitting below the widget; flip above it if there isn't
-        # room, then clamp horizontally so it never runs off either edge.
-        x = min(max(wx, 0), max(screen_w - w, 0))
+        # room, then clamp horizontally so it never runs off either edge
+        # of the window (its own bounds now, not the screen's).
+        x = min(max(wx, 0), max(root_w - w, 0))
         below_y = wy + wh + 14
-        y = below_y if below_y + h <= screen_h else max(wy - h - 14, 0)
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        y = below_y if below_y + h <= root_h else max(wy - h - 14, 0)
+        self.place(x=x, y=y, width=w, height=h)
+        self.lift()
 
 
 class GuiTour:
@@ -166,7 +223,7 @@ class GuiTour:
             self.root, title, text, self.index + 1, len(self.steps),
             on_next=self._next, on_back=self._back, on_skip=self.stop,
         )
-        self._callout.place_near(widget, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        self._callout.place_near(widget)
 
     def _next(self):
         if self.index + 1 >= len(self.steps):
