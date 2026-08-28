@@ -472,7 +472,7 @@ class SMBWizard:
         # view instead of being visible to assign. Samba's own user
         # database (passdb.tdb) is root-only and can't be queried
         # unprivileged just to populate a list, so this reads the OS
-        # account list instead - see _list_regular_usernames().
+        # account list instead - see _list_regular_accounts().
         shares = self.list_shares()
         groups = self.list_groups()
 
@@ -486,41 +486,65 @@ class SMBWizard:
             for member in g["members"]:
                 user_groups.setdefault(member, set()).add(g["name"])
 
-        usernames = set(user_shares) | set(user_groups) | self._list_regular_usernames()
+        accounts = self._list_regular_accounts()
+        usernames = set(user_shares) | set(user_groups) | set(accounts)
         return [
             {
                 "username": u,
                 "shares": sorted(user_shares.get(u, set())),
                 "groups": sorted(user_groups.get(u, set())),
+                # False (not just "unknown") for a username that only shows
+                # up via a share/group but is missing from the account scan
+                # (e.g. filtered out by the UID range) - never assume
+                # "managed" without a positive signal, since that's what
+                # gates whether NASsie will delete/reset it.
+                "managed": accounts.get(u, False),
             }
             for u in sorted(usernames)
         ]
 
-    def _list_regular_usernames(self):
+    def _list_regular_accounts(self):
         # Regular (non-system/service) local accounts, platform-appropriate:
         # Ubuntu/Debian's useradd defaults to UID_MIN=1000; macOS's regular
         # accounts start at 501 (Apple's own convention, distinct from
         # Linux's). This is what NASsie's own _configure_linux_user/
         # _configure_macos_user create accounts as, so it naturally includes
         # every user NASsie could plausibly manage.
+        #
+        # Returns {username: managed} - "managed" means NASsie itself
+        # created this account for sharing (safe to delete/reset its
+        # password), as opposed to a real person's pre-existing sign-in
+        # that NASsie was merely handed to grant access to. Getting this
+        # wrong in the "managed" direction would let NASsie silently reset
+        # or delete someone's actual login - see is_nassie_managed_account's
+        # comment on the per-platform signals used (and macOS's gap: no
+        # signal exists there yet, so every macOS account is treated as
+        # unmanaged/real, never offered for delete/reset).
         if self.system in ("Linux", "Darwin"):
             import pwd
             min_uid = 1000 if self.system == "Linux" else 500
-            return {p.pw_name for p in pwd.getpwall() if min_uid <= p.pw_uid < 65534}
+            result = {}
+            for p in pwd.getpwall():
+                if min_uid <= p.pw_uid < 65534:
+                    result[p.pw_name] = self.system == "Linux" and p.pw_shell == self._LINUX_NOLOGIN_SHELL
+            return result
         elif self.system == "Windows":
-            cmd = "Get-LocalUser | Select-Object Name | ConvertTo-Json -Compress"
+            cmd = "Get-LocalUser | Select-Object Name, Description | ConvertTo-Json -Compress"
             proc = _run(["powershell", "-Command", cmd], capture_output=True, text=True)
             if proc.returncode != 0 or not proc.stdout.strip():
-                return set()
+                return {}
             try:
                 data = json.loads(proc.stdout)
             except json.JSONDecodeError:
-                return set()
+                return {}
             if isinstance(data, dict):
                 data = [data]
             builtin = {"Administrator", "Guest", "DefaultAccount", "WDAGUtilityAccount"}
-            return {d["Name"] for d in data if d.get("Name") not in builtin}
-        return set()
+            return {
+                d["Name"]: d.get("Description") == self._WINDOWS_ACCOUNT_MARKER
+                for d in data if d.get("Name") not in builtin
+            }
+        return {}
 
     def _list_groups_posix(self):
         import grp
@@ -1707,13 +1731,26 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         return proc.returncode == 0
 
     def _add_user_to_share_windows(self, share_name, username, password, read_only=False):
+        # password=None means "grant access without touching this account's
+        # password" - the caller's signal that username is a real person's
+        # existing Windows sign-in, not one NASsie created. That's safe to
+        # skip here specifically because Windows SMB has no separate
+        # password store of its own; it authenticates against the same
+        # local account password the user already signs in with, so
+        # nothing needs to be (re)set for them to connect. Only ever pass
+        # None for an account that's confirmed to already exist - there's
+        # nothing to reuse a password from if it doesn't.
         shares = {s["name"]: s for s in self._list_shares_windows()}
         share = shares.get(share_name)
         if not share:
             print(f"[Windows] No such share: '{share_name}'")
             return False
 
-        self._configure_windows_user(username, password)
+        if password is not None:
+            self._configure_windows_user(username, password)
+        elif not self._windows_user_exists(username):
+            print(f"[Windows] '{username}' doesn't exist and no password was given to create it.")
+            return False
 
         group_name = share.get("group") or self._windows_group_name(share_name)
         self._ensure_windows_group(group_name)
@@ -1904,11 +1941,20 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             f.write(block)
         print(f"[Linux] Appended share definition to {smb_conf}")
 
+    # Shared with _list_regular_accounts()'s "managed" detection - a regular
+    # account with this exact shell is one NASsie itself created (SMB-only,
+    # never meant to be logged into), distinct from a real person's normal
+    # login shell.
+    _LINUX_NOLOGIN_SHELL = "/usr/sbin/nologin"
+
     def _configure_linux_user(self, username, password):
         exists = _run(["id", username], capture_output=True, text=True).returncode == 0
         if not exists:
             print(f"[Linux] Creating system user '{username}'...")
-            _run(["useradd", "-M", "-s", "/usr/sbin/nologin", username], check=True, capture_output=True, text=True)
+            _run(
+                ["useradd", "-M", "-s", self._LINUX_NOLOGIN_SHELL, username],
+                check=True, capture_output=True, text=True,
+            )
 
         print(f"[Linux] Setting Samba password for '{username}'...")
         proc = _run(
