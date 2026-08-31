@@ -127,26 +127,33 @@ class _Callout(tk.Toplevel):
     # child of whatever window it's pointing into. That was the original
     # design (see _HighlightBox's docstring for why: a child widget
     # follows its window across workspace switches for free, a Toplevel
-    # doesn't), but it silently assumes the target window is bigger than
-    # the callout - a place() child is clipped to its parent's own
+    # doesn't), but a place() child is clipped to its parent's own
     # bounds, so once a tour step points into a window SHORTER than the
     # callout itself (a small compact dialog - see "Create Share"'s name
     # page, or "New User"), there is no position inside that parent where
     # the callout fits without covering the very field it's explaining.
-    # Screen coordinates have no such ceiling. The tradeoff (staying put
-    # if the target window itself moves or changes workspace) is fine
-    # here: every tour step lasts seconds, and every window a step can
-    # point into is modal/transient and centered right when it opens, so
-    # it isn't going anywhere while its step is showing. No Next/Back
-    # buttons - see GuiTour's docstring for why each step advances itself
-    # once its real action actually happens, rather than being paced by
-    # clicks through a narrated slideshow. Skip is the one manual escape
-    # hatch throughout (relabeled "Close" for the final, non-gated step).
+    # Screen coordinates have no such ceiling. Unlike _HighlightBox, this
+    # doesn't get the "moves with its window for free" property, so
+    # GuiTour re-runs place_near() on the container's <Configure> event to
+    # track it explicitly instead - see GuiTour._track_container(). No
+    # Next/Back buttons - see GuiTour's docstring for why each step
+    # advances itself once its real action actually happens, rather than
+    # being paced by clicks through a narrated slideshow. Skip is the one
+    # manual escape hatch throughout (relabeled "Close" for the final,
+    # non-gated step).
     def __init__(self, parent_window, title, text, step_num, step_total, on_skip, skip_label="Skip Tour"):
         super().__init__(parent_window)
         self.transient(parent_window)
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
+        # No "-topmost": that pins it above EVERY window on the desktop,
+        # not just NASsie's own - switch to an unrelated app and the
+        # callout stayed floating on top of it too, since an
+        # overrideredirect window isn't WM-managed and nothing else was
+        # ever telling it to get out of the way. GuiTour's focus-in/out
+        # tracking on the container (also set up in _track_container())
+        # raises/lowers this instead, so it only stays above other
+        # windows while NASsie itself is the focused app - the same as
+        # any of NASsie's own dialogs behave.
         self.configure(bg=_HIGHLIGHT_COLOR, padx=2, pady=2)
 
         inner = tk.Frame(self, bg=_CALLOUT_BG)
@@ -173,26 +180,60 @@ class _Callout(tk.Toplevel):
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
 
-        # Positioned below/above the widget's whole CONTAINING WINDOW, not
-        # just the widget itself - a compact dialog (the "Username and
-        # Password" step, for one) can have several fields stacked close
-        # together, and "below the highlighted field" alone often still
-        # landed on top of one of the OTHERS (e.g. right onto the
-        # password fields sitting just under the username one). Below/
-        # above the entire window it's actually in avoids that regardless
-        # of where inside it the highlighted widget sits - the highlight
-        # box (a separate, unaffected overlay) is still what points at
-        # the SPECIFIC field; this bubble just needs to stay clear of all
-        # of them, not sit right next to the one it's talking about.
+        # Anchored on the widget itself by default - a bubble that always
+        # jumped to the edge of its whole containing window (a prior
+        # version of this method) reads as disconnected from what it's
+        # actually explaining once that window is bigger than the bubble
+        # (e.g. the ~500px gap between the "New Share" button, near the
+        # main window's TOP, and a callout pinned to that window's
+        # bottom edge). Below/above the WIDGET only falls back to the
+        # window's edge for the case that whole-window anchoring was
+        # originally solving: a compact dialog (the "Username and
+        # Password" step, for one) where several fields sit stacked close
+        # together and there's no room around the specific widget within
+        # its own window without covering one of the others.
+        wx = widget.winfo_rootx()
+        wy = widget.winfo_rooty()
+        ww = widget.winfo_width()
+        wh = widget.winfo_height()
+
         container = widget.winfo_toplevel()
+        # GuiTour re-invokes this outside the step's own initial setup -
+        # on the container's <Configure> event, to track it being dragged
+        # (see GuiTour._track_container()) - so unlike widget above (which
+        # is always freshly laid out by the _show_step() call that owns
+        # this invocation), container's cached winfo_* values here can't
+        # be assumed fresh: without this, a container geometry read still
+        # mid-settle (observed right after a dialog closes and focus/
+        # geometry events are still landing) could hand back stale rootx/
+        # rooty/height - a 0 in particular reliably drove every branch
+        # below into the same degenerate (0, 0) corner.
+        container.update_idletasks()
         cx = container.winfo_rootx()
         cy = container.winfo_rooty()
-        ch = container.winfo_reqheight()
+        # winfo_height(), not winfo_reqheight(): the main window is
+        # explicitly floored to a minimum size larger than its packed
+        # content's natural request (see GUIWizard's sizing block in
+        # gui.py), so reqheight() under-reports it - that put "below the
+        # window" comfortably inside its actual bottom edge instead.
+        # winfo_height() is the real, currently-mapped size regardless of
+        # why it ended up that size.
+        cbottom = cy + container.winfo_height()
 
         margin = 14
-        below_y = cy + ch + margin
-        y = below_y if below_y + h <= screen_h else max(cy - margin - h, 0)
-        x = max(0, min(cx, screen_w - w))
+        below_widget_y = wy + wh + margin
+        above_widget_y = wy - margin - h
+        if below_widget_y + h <= min(cbottom, screen_h):
+            x, y = wx, below_widget_y
+        elif above_widget_y >= max(cy, 0):
+            x, y = wx, above_widget_y
+        else:
+            # No room around the widget itself within its own window -
+            # the compact-dialog case - so clear the whole window instead.
+            below_container_y = cbottom + margin
+            y = below_container_y if below_container_y + h <= screen_h else max(cy - margin - h, 0)
+            x = cx
+        x = max(0, min(x, screen_w - w))
         y = max(0, min(y, screen_h - h))
         self.geometry(f"+{x}+{y}")
         self.lift()
@@ -227,6 +268,9 @@ class GuiTour:
         self._highlight = None
         self._callout = None
         self._wait_event = None
+        # (bound_widget, event_name, funcid) for the current step's
+        # container tracking - see _track_container()/_untrack_container().
+        self._tracking = []
         # Whichever dialog/window the CURRENT (or most recently opened)
         # step's action happened in - starts out None (nothing but the
         # main window exists yet); updated by on_event()'s window= arg
@@ -302,6 +346,57 @@ class GuiTour:
         self._callout = _Callout(container, title, text, self.index + 1, len(self.steps), on_skip=self.stop)
         self._callout.place_near(widget)
         self._wait_event = wait_event
+        self._track_container(container, widget)
+
+    def _track_container(self, container, widget):
+        # _HighlightBox is a real child widget of container, so it already
+        # moves for free when the window is dragged - place() coordinates
+        # are relative to the parent's own client area, not the screen.
+        # _Callout is a separate Toplevel in absolute screen coordinates
+        # (see its docstring for why), so nothing repositions it on its
+        # own - re-run place_near() whenever the container actually moves
+        # or resizes. Same idea for stacking: bind focus in/out on the
+        # container to raise/lower the callout with it, so it only sits
+        # above other apps' windows while NASsie is the focused one,
+        # rather than the global "-topmost" this used to rely on.
+        def reposition(event=None):
+            if self._callout is None:
+                return
+            try:
+                self._highlight.place_around(widget)
+                self._callout.place_near(widget)
+            except tk.TclError:
+                pass
+
+        def raise_callout(event=None):
+            if self._callout is not None:
+                try:
+                    self._callout.lift()
+                except tk.TclError:
+                    pass
+
+        def lower_callout(event=None):
+            if self._callout is not None:
+                try:
+                    self._callout.lower()
+                except tk.TclError:
+                    pass
+
+        self._tracking = [
+            (container, "<Configure>", container.bind("<Configure>", reposition, add="+")),
+            (container, "<FocusIn>", container.bind("<FocusIn>", raise_callout, add="+")),
+            (container, "<FocusOut>", container.bind("<FocusOut>", lower_callout, add="+")),
+        ]
+
+    def _untrack_container(self):
+        for widget, event, funcid in self._tracking:
+            try:
+                widget.unbind(event, funcid)
+            except tk.TclError:
+                # Same reasoning as _HighlightBox.destroy() - the window
+                # it was bound to may already be gone.
+                pass
+        self._tracking = []
 
     def on_event(self, event, window=None):
         # Called by GUIWizard right when the action a visible step is
@@ -337,11 +432,13 @@ class GuiTour:
         )
         self._callout.place_near(widget)
         self._wait_event = None
+        self._track_container(self.root, widget)
 
     def stop(self):
         self._teardown_current()
 
     def _teardown_current(self):
+        self._untrack_container()
         if self._highlight:
             self._highlight.destroy()
             self._highlight = None
