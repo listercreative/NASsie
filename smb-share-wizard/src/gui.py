@@ -8,8 +8,48 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from tkinter.scrolledtext import ScrolledText
 
-from core import SMBWizard, QR_PASSWORD_RESET_NOTE
+from core import (
+    SMBWizard, QR_PASSWORD_RESET_NOTE, pick_directory_native,
+    SHARE_NAME_MAX_LEN, SHARE_NAME_RE,
+    USERNAME_MAX_LEN, USERNAME_RE,
+)
 from tour import GuiTour, has_seen_tour, mark_tour_seen
+
+
+def _patch_messagebox_front(messagebox_module, simpledialog_module):
+    # tkinter.messagebox/simpledialog build their own Toplevel internally -
+    # there's no hook to run _bring_window_to_front() on it directly the
+    # way every one of NASsie's own dialogs does. Same GNOME/Wayland
+    # focus-stealing-prevention issue as those, though: a plain showinfo()
+    # can open silently buried behind the main window. Toggling the
+    # PARENT's own -topmost around the (blocking) call achieves the same
+    # effect indirectly - a transient dialog stacks directly above
+    # whatever it's transient-for, so a topmost parent drags its dialog
+    # to the front along with it.
+    def _wrap(fn):
+        def wrapper(*args, **kwargs):
+            parent = kwargs.get("parent") or tk._default_root
+            if parent is not None:
+                try:
+                    parent.attributes("-topmost", True)
+                except tk.TclError:
+                    parent = None
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if parent is not None:
+                    try:
+                        parent.attributes("-topmost", False)
+                    except tk.TclError:
+                        pass
+        return wrapper
+
+    for name in ("showinfo", "showwarning", "showerror", "askyesno", "askokcancel", "askquestion"):
+        setattr(messagebox_module, name, _wrap(getattr(messagebox_module, name)))
+    simpledialog_module.askstring = _wrap(simpledialog_module.askstring)
+
+
+_patch_messagebox_front(messagebox, simpledialog)
 
 
 def _center_over_parent(win, parent):
@@ -22,68 +62,341 @@ def _center_over_parent(win, parent):
     win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
 
+def _bring_window_to_front(win):
+    # Some window managers (seen here under GNOME/Wayland via Xwayland)
+    # don't reliably honor a plain lift()/focus_force() for a window that
+    # wasn't just freshly mapped by the WM itself - a background process
+    # raising its own window gets silently ignored by focus-stealing
+    # prevention. Toggling -topmost forces a z-order change instead, which
+    # isn't subject to that restriction, and reliably drags the window to
+    # front as a side effect. Used by every popup (dialogs, and
+    # LogWindow/UserManagementWindow's show()), not just the main window.
+    win.deiconify()
+    win.lift()
+    win.attributes("-topmost", True)
+    win.after(200, lambda: win.attributes("-topmost", False))
+    win.focus_force()
+
+
+class _Tooltip:
+    """Small hover label for an icon-only button. Icons alone (no text
+    label) don't need translation, but they still need to be discoverable
+    without guessing - this is the standard way icon toolbars solve that
+    everywhere (VS Code, browsers, ...)."""
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    def _show(self, event=None):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 8
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        try:
+            self.tip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        ttk.Label(
+            self.tip, text=self.text, background="#ffffe0", relief="solid", borderwidth=1, padding=(4, 2),
+        ).pack()
+
+    def _hide(self, event=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+def _icon_button(parent, icon, tooltip, command, **kwargs):
+    # A plain "+" (or any single glyph) at the default button font size
+    # reads as thin/washed-out next to full-color emoji icons - a larger
+    # size (see the "Icon.TButton" style) gives it comparable visual
+    # weight without needing to fall back to a colored-pill emoji glyph
+    # just for "add".
+    btn = ttk.Button(
+        parent, text=icon, command=command, width=3, style="Icon.TButton", **kwargs
+    )
+    _Tooltip(btn, tooltip)
+    return btn
+
+
+class _RowActionBar:
+    """A horizontal strip of icon buttons that floats over a Treeview,
+    positioned in line with whichever row is currently selected - not a
+    fixed side panel. build_fn(container, item_id) populates container
+    with whatever buttons apply to that row (it's cleared first) and
+    returns True if it added any, False to keep the bar hidden for that
+    row - pack each one with fill="y" so it stretches to match the row's
+    own height (set via place() in update() below) instead of sitting as
+    a smaller, oddly-padded blob centered on it. The tree is rebuilt from
+    scratch on every refresh, which fires <<TreeviewSelect>> again as
+    selection is restored, so this stays in sync without any extra wiring
+    on the caller's part."""
+    def __init__(self, tree, scrollbar, build_fn):
+        self.tree = tree
+        self.build_fn = build_fn
+        self.bar = ttk.Frame(tree)
+        tree.bind("<<TreeviewSelect>>", lambda e: self.update(), add="+")
+        tree.bind("<Configure>", lambda e: self.update(), add="+")
+        # Scrolling doesn't fire either of the above - reposition (or hide,
+        # if the selected row scrolled out of view) after the fact, once
+        # the scroll itself has actually been applied.
+        tree.bind("<MouseWheel>", lambda e: tree.after_idle(self.update), add="+")
+        tree.bind("<Button-4>", lambda e: tree.after_idle(self.update), add="+")
+        tree.bind("<Button-5>", lambda e: tree.after_idle(self.update), add="+")
+        if scrollbar is not None:
+            scrollbar.bind("<B1-Motion>", lambda e: tree.after_idle(self.update), add="+")
+            scrollbar.bind("<ButtonRelease-1>", lambda e: tree.after_idle(self.update), add="+")
+
+    def update(self):
+        for child in self.bar.winfo_children():
+            child.destroy()
+        selection = self.tree.selection()
+        if not selection:
+            self.bar.place_forget()
+            return
+        item = selection[0]
+        bbox = self.tree.bbox(item)
+        if not bbox:
+            # Selected row not currently visible (scrolled out, or the
+            # tree hasn't finished laying out yet right after a refresh).
+            self.bar.place_forget()
+            return
+        if not self.build_fn(self.bar, item):
+            self.bar.place_forget()
+            return
+        self.bar.update_idletasks()
+        x, y, _w, h = bbox
+        bar_w = self.bar.winfo_reqwidth()
+        margin = 4
+
+        tree_w = self.tree.winfo_width()
+        if bar_w + margin > tree_w:
+            # Whatever the window's startup width was computed to fit,
+            # it's not enough for this bar - rather than clip it (which
+            # kept happening: icon glyph rendering is font/theme-
+            # dependent enough that no startup guess reliably gets this
+            # right), grow the window itself, right now, by the exact
+            # shortfall. Self-correcting regardless of why the room ran
+            # out, instead of a second guess that could just as easily
+            # still be wrong.
+            toplevel = self.tree.winfo_toplevel()
+            toplevel.update_idletasks()
+            shortfall = (bar_w + margin) - tree_w
+            new_w = toplevel.winfo_width() + shortfall
+            new_h = toplevel.winfo_height()
+            toplevel.geometry(f"{new_w}x{new_h}")
+            # A minsize narrower than this would let the window (or the
+            # next one opened this small) shrink right back below what
+            # this bar needs - raise the floor to match what was just
+            # discovered, not just this one time's geometry.
+            min_w, min_h = toplevel.minsize()
+            if new_w > min_w or new_h > min_h:
+                toplevel.minsize(max(new_w, min_w), max(new_h, min_h))
+            toplevel.update_idletasks()
+            tree_w = self.tree.winfo_width()
+
+        place_x = max(0, tree_w - bar_w - margin)
+        # Explicit height=h (the row's own height), not the bar's natural
+        # reqheight - paired with each button packed with fill="y" in
+        # build_fn, that's what makes the buttons match the row instead of
+        # being a smaller, oddly-padded blob centered on it.
+        self.bar.place(x=place_x, y=y, width=bar_w, height=h)
+        self.bar.lift()
+
+
+class _SortableTree:
+    """Makes a Treeview's column headings clickable to sort its top-level
+    rows (children, if any, move with their parent - a plain sibling
+    reorder). Click again to reverse; the active column's heading shows a
+    ▲/▼ arrow. The tree is rebuilt from scratch on every refresh (see
+    _populate_shares_list/UserManagementWindow.refresh), which would
+    otherwise silently drop whatever sort was active - call reapply() right
+    after repopulating to restore it instead of resetting to insertion
+    order every time."""
+    def __init__(self, tree, columns, key_fn):
+        # columns: [(column_id, heading_label), ...] - column_id "#0" is
+        # the tree's own hierarchy column. key_fn(item_id, column_id) -> str
+        self.tree = tree
+        self.columns = columns
+        self.key_fn = key_fn
+        self.sort_col = None
+        self.reverse = False
+        for col_id, label in columns:
+            tree.heading(col_id, text=label, command=lambda c=col_id: self.sort(c))
+
+    def sort(self, col, toggle=True):
+        if toggle:
+            self.reverse = (self.sort_col == col) and not self.reverse
+        self.sort_col = col
+        items = [(self.key_fn(k, col), k) for k in self.tree.get_children("")]
+        items.sort(key=lambda t: t[0].lower(), reverse=self.reverse)
+        for index, (_, k) in enumerate(items):
+            self.tree.move(k, "", index)
+        for col_id, label in self.columns:
+            arrow = ""
+            if col_id == self.sort_col:
+                arrow = " ▼" if self.reverse else " ▲"
+            self.tree.heading(col_id, text=label + arrow, command=lambda c=col_id: self.sort(c))
+
+    def reapply(self):
+        if self.sort_col is not None:
+            self.sort(self.sort_col, toggle=False)
+
+
 class AddUserDialog(tk.Toplevel):
-    def __init__(self, parent, existing_usernames=(), show_access_level=True):
+    """mode="create": a typed username that must NOT already exist -
+    creating a brand-new account. mode="attach": pick an EXISTING username
+    only, no typing - granting an already-existing account access. These
+    used to be the same combobox (type a new name or pick an old one) -
+    splitting them is the whole point: "type a name" and "pick a name" are
+    different intents, and conflating them made it easy to accidentally
+    reset an existing account's password when you meant to create a new
+    one, or vice versa."""
+    def __init__(self, parent, mode, existing_usernames=(), show_access_level=True, app=None, has_credentials=()):
         super().__init__(parent)
-        self.title("Add User")
+        self.mode = mode
+        self.existing_usernames = set(existing_usernames)
+        # attach mode only: usernames that already have valid Samba/SMB
+        # credentials from some OTHER share - Samba (and, worse, macOS)
+        # store one password per account, not one per share, so an
+        # account already attached anywhere else doesn't need a new one
+        # just to attach it here too. See core._add_user_to_share_linux's
+        # comment for the full reasoning.
+        self.has_credentials = set(has_credentials)
+        self._app = app
+        self.title("New User" if mode == "create" else "Attach User")
         self.resizable(False, False)
         self.transient(parent)
         self.result = None
 
-        # Editable combobox, not a plain Entry: existing usernames are one
-        # click away (no risk of a typo against a name that already
-        # exists), but typing a name that isn't in the list still works -
-        # this can create a brand-new user, unlike group membership which
-        # requires an existing one.
         ttk.Label(self, text="Username:").grid(row=0, column=0, sticky="e", padx=8, pady=6)
         self.username_var = tk.StringVar()
-        self.username_entry = ttk.Combobox(self, textvariable=self.username_var, values=list(existing_usernames))
+        if mode == "attach":
+            self.username_entry = ttk.Combobox(
+                self, textvariable=self.username_var, values=sorted(self.existing_usernames), state="readonly",
+            )
+            self.username_entry.bind("<<ComboboxSelected>>", self._update_password_visibility)
+        else:
+            username_vcmd = (self.register(self._validate_username_input), "%P")
+            self.username_entry = ttk.Entry(
+                self, textvariable=self.username_var, validate="key", validatecommand=username_vcmd,
+            )
         self.username_entry.grid(row=0, column=1, padx=8, pady=6)
 
-        ttk.Label(self, text="Password:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
-        self.password_entry = ttk.Entry(self, show="*")
-        self.password_entry.grid(row=1, column=1, padx=8, pady=6)
+        # One grid cell (row 1) toggles between the password fields and a
+        # note explaining why they're not needed - see
+        # _update_password_visibility - rather than the fields just
+        # disappearing and leaving a gap, or the layout renumbering rows
+        # underneath them.
+        self.password_frame = ttk.Frame(self)
+        ttk.Label(self.password_frame, text="Password:").grid(row=0, column=0, sticky="e", padx=8, pady=6)
+        self.password_entry = ttk.Entry(self.password_frame, show="*")
+        self.password_entry.grid(row=0, column=1, padx=8, pady=6)
+        ttk.Label(self.password_frame, text="Confirm Password:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
+        self.confirm_entry = ttk.Entry(self.password_frame, show="*")
+        self.confirm_entry.grid(row=1, column=1, padx=8, pady=6)
 
-        ttk.Label(self, text="Confirm Password:").grid(row=2, column=0, sticky="e", padx=8, pady=6)
-        self.confirm_entry = ttk.Entry(self, show="*")
-        self.confirm_entry.grid(row=2, column=1, padx=8, pady=6)
+        self.credentials_note = ttk.Label(
+            self,
+            text="This account already has file-sharing access set up elsewhere - no new "
+                 "password needed.",
+            wraplength=260, justify="left",
+        )
 
         # Only relevant when this user is being granted access to a share -
         # not shown for standalone user creation, which has no share (and
         # so no access level) to set at all.
         self.show_access_level = show_access_level
         self.read_only_var = tk.BooleanVar(value=False)
-        next_row = 3
+        next_row = 2
         if show_access_level:
             ttk.Checkbutton(
                 self, text="Read-only access", variable=self.read_only_var
-            ).grid(row=3, column=0, columnspan=2, pady=(0, 6))
-            next_row = 4
+            ).grid(row=2, column=0, columnspan=2, pady=(0, 6))
+            next_row = 3
 
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=next_row, column=0, columnspan=2, pady=10)
-        ttk.Button(btn_frame, text="OK", command=self._on_ok).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✔", "OK", self._on_ok).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✖", "Cancel", self.destroy).pack(side="left", padx=4)
 
+        self._update_password_visibility()
         self.username_entry.focus_set()
         _center_over_parent(self, parent)
+        _bring_window_to_front(self)
+        if self._app is not None:
+            event = "user_dialog_opened" if mode == "create" else "attach_dialog_opened"
+            self._app._notify_tour(event, window=self)
         self.grab_set()
         self.wait_window(self)
 
+    def _validate_username_input(self, proposed):
+        # Blocks disallowed characters at the keystroke - see
+        # core.check_username's docstring for why usernames are restricted
+        # (they're written unescaped into smb.conf). Empty string must stay
+        # allowed or backspacing to clear the field would be blocked too.
+        if proposed == "":
+            return True
+        return len(proposed) <= USERNAME_MAX_LEN and bool(USERNAME_RE.match(proposed))
+
+    def _needs_password(self):
+        username = self.username_var.get().strip()
+        return not (self.mode == "attach" and username in self.has_credentials)
+
+    def _update_password_visibility(self, event=None):
+        if self._needs_password():
+            self.credentials_note.grid_remove()
+            self.password_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        else:
+            self.password_frame.grid_remove()
+            self.credentials_note.grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=6)
+
     def _on_ok(self):
-        username = self.username_entry.get().strip()
-        password = self.password_entry.get()
-        confirm = self.confirm_entry.get()
+        username = self.username_var.get().strip()
+        needs_password = self._needs_password()
+        password = self.password_entry.get() if needs_password else None
+        confirm = self.confirm_entry.get() if needs_password else None
 
         if not username:
-            messagebox.showerror("Invalid input", "Username cannot be empty.", parent=self)
+            messagebox.showerror(
+                "Invalid input",
+                "Select a username." if self.mode == "attach" else "Username cannot be empty.",
+                parent=self,
+            )
             return
-        if not password:
-            messagebox.showerror("Invalid input", "Password cannot be empty.", parent=self)
-            return
-        if password != confirm:
-            messagebox.showerror("Invalid input", "Passwords do not match.", parent=self)
-            return
+
+        if self.mode == "create":
+            username_ok, username_message = SMBWizard.check_username(username)
+            if not username_ok:
+                messagebox.showerror("Invalid input", username_message, parent=self)
+                return
+            if username in self.existing_usernames:
+                messagebox.showerror(
+                    "Already exists",
+                    f"'{username}' already exists - use Attach User to grant an existing account "
+                    "access instead.",
+                    parent=self,
+                )
+                return
+        else:  # attach
+            if username not in self.existing_usernames:
+                messagebox.showerror("Invalid input", "Select an existing username.", parent=self)
+                return
+
+        if needs_password:
+            if not password:
+                messagebox.showerror("Invalid input", "Password cannot be empty.", parent=self)
+                return
+            if password != confirm:
+                messagebox.showerror("Invalid input", "Passwords do not match.", parent=self)
+                return
 
         self.result = {"username": username, "password": password}
         if self.show_access_level:
@@ -92,8 +405,9 @@ class AddUserDialog(tk.Toplevel):
 
 
 class ChoiceDialog(tk.Toplevel):
-    """Generic pick-one-from-a-list dialog, reused for revoke share access,
-    assign to group, and remove from group."""
+    """Generic pick-one-from-a-list dialog, reused wherever an action needs
+    the user to pick one share/user from a short list (e.g. choose which
+    share to change a password on)."""
     def __init__(self, parent, title, prompt, choices, ok_label="OK"):
         super().__init__(parent)
         self.title(title)
@@ -108,10 +422,11 @@ class ChoiceDialog(tk.Toplevel):
 
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
-        ttk.Button(btn_frame, text=ok_label, command=self._on_ok).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✔", ok_label, self._on_ok).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✖", "Cancel", self.destroy).pack(side="left", padx=4)
 
         _center_over_parent(self, parent)
+        _bring_window_to_front(self)
         self.grab_set()
         self.wait_window(self)
 
@@ -120,154 +435,12 @@ class ChoiceDialog(tk.Toplevel):
         self.destroy()
 
 
-class ExistingUserDialog(tk.Toplevel):
-    """Shown from 'New User' instead of silently resetting a password when
-    the typed name already exists - lays out what that account already has
-    (shares/groups) and offers the specific actions someone in that
-    situation actually wants, rather than a bare 'already exists' error.
-
-    Its button set depends on user_info["managed"]: a NASsie-managed
-    account (one NASsie itself created for sharing) can be freely
-    deleted/reset - that's what it's for. An unmanaged account is a real
-    person's pre-existing sign-in that NASsie was merely handed to grant
-    access to; Delete/Reset Password are never offered for one of those,
-    since either would touch a real login NASsie has no business touching."""
-    def __init__(self, parent, gui, user_info, password):
-        super().__init__(parent)
-        self.gui = gui
-        self.username = user_info["username"]
-        self.password = password
-        self.managed = user_info.get("managed", False)
-        self.title("User Already Exists")
-        self.resizable(False, False)
-        self.transient(parent)
-
-        if self.managed:
-            headline = f"'{self.username}' already exists."
-        else:
-            headline = f"'{self.username}' is an existing computer account, not one NASsie created."
-        ttk.Label(
-            self, text=headline, font=("TkDefaultFont", 11, "bold"), padding=(12, 12, 12, 4), wraplength=360,
-        ).pack(anchor="w")
-        if not self.managed:
-            ttk.Label(
-                self,
-                text="NASsie won't delete this account or change its password - only manage its "
-                     "share/group access.",
-                padding=(12, 0, 12, 4), wraplength=360,
-            ).pack(anchor="w")
-
-        info = ttk.Frame(self, padding=(12, 0, 12, 8))
-        info.pack(fill="both", expand=True)
-        shares = user_info.get("shares") or []
-        groups = user_info.get("groups") or []
-        ttk.Label(info, text="Shares: " + (", ".join(shares) if shares else "(none)")).pack(anchor="w")
-        ttk.Label(info, text="Groups: " + (", ".join(groups) if groups else "(none)")).pack(anchor="w")
-
-        btn_frame = ttk.Frame(self, padding=(12, 0, 12, 12))
-        btn_frame.pack(fill="x")
-        num_buttons = 5 if self.managed else 3
-        for col in range(num_buttons):
-            btn_frame.columnconfigure(col, weight=1, uniform="existing_user_btn")
-
-        col = 0
-        if self.managed:
-            ttk.Button(btn_frame, text="Delete User", command=self._delete).grid(
-                row=0, column=col, sticky="ew", padx=2
-            )
-            col += 1
-            ttk.Button(btn_frame, text="Reset Password", command=self._reset_password).grid(
-                row=0, column=col, sticky="ew", padx=2
-            )
-            col += 1
-        ttk.Button(btn_frame, text="Add to Group", command=self._add_group).grid(
-            row=0, column=col, sticky="ew", padx=2
-        )
-        col += 1
-        ttk.Button(btn_frame, text="Add to Share", command=self._add_share).grid(
-            row=0, column=col, sticky="ew", padx=2
-        )
-        col += 1
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).grid(row=0, column=col, sticky="ew", padx=2)
-
-        _center_over_parent(self, parent)
-        self.grab_set()
-
-    def _delete(self):
-        if not messagebox.askyesno(
-            "Delete user",
-            f"Delete user '{self.username}' entirely? This removes their account everywhere, not just one share.",
-            parent=self,
-        ):
-            return
-        threading.Thread(target=self.gui._delete_user_worker, args=(self.username,), daemon=True).start()
-        self.destroy()
-
-    def _reset_password(self):
-        if not messagebox.askokcancel(
-            "Reset Password",
-            "This sets a new password for '" + self.username + "' right now - the old one (and anything "
-            "still using it) will stop working until it's reconnected with the new one.",
-            parent=self,
-        ):
-            return
-        threading.Thread(
-            target=self.gui._create_user_worker, args=(self.username, self.password), daemon=True
-        ).start()
-        self.destroy()
-
-    def _add_group(self):
-        groups = self.gui.wizard.list_groups()
-        if not groups:
-            messagebox.showinfo("Add to group", "No groups exist to assign to.", parent=self)
-            return
-        choice = ChoiceDialog(
-            self, "Add to Group", f"Assign '{self.username}' to:",
-            [g["name"] for g in groups], ok_label="Assign",
-        )
-        if not choice.result:
-            return
-        threading.Thread(
-            target=self.gui._assign_group_worker, args=(self.username, choice.result), daemon=True
-        ).start()
-        self.destroy()
-
-    def _add_share(self):
-        shares = self.gui.wizard.list_shares()
-        if not shares:
-            messagebox.showinfo("Add to share", "No shares exist yet.", parent=self)
-            return
-        if not self.managed and not messagebox.askyesno(
-            "Existing computer account", self.gui.existing_account_grant_message(self.username), parent=self,
-        ):
-            return
-        share_choice = ChoiceDialog(
-            self, "Choose share", f"Grant '{self.username}' access to which share?",
-            [s["name"] for s in shares], ok_label="Next",
-        )
-        if not share_choice.result:
-            return
-        level_choice = ChoiceDialog(
-            self, "Access level", f"Grant '{self.username}':", ["Read-write", "Read-only"], ok_label="Grant",
-        )
-        if not level_choice.result:
-            return
-        read_only = level_choice.result == "Read-only"
-        # Never touch Windows' real login password for an unmanaged account - see
-        # GUIWizard.existing_account_grant_message()/_add_user_to_share_windows.
-        password = None if (not self.managed and self.gui.wizard.system == "Windows") else self.password
-        threading.Thread(
-            target=self.gui._grant_access_worker,
-            args=(share_choice.result, self.username, password, read_only), daemon=True,
-        ).start()
-        self.destroy()
-
-
 class QrCodeDialog(tk.Toplevel):
     """Shows a LockNAS bridge QR code for one just-created (or just-granted)
     user. Only ever constructible with a payload already in hand - NASsie
     doesn't persist plaintext passwords, so this can't be regenerated later
-    for an existing user from a "Manage Shares" style screen."""
+    for an existing user without changing their password again first (see
+    QR_PASSWORD_RESET_NOTE)."""
     def __init__(self, parent, share_name, username, payload):
         super().__init__(parent)
         self.title(f"QR Code - {username}")
@@ -312,17 +485,469 @@ class QrCodeDialog(tk.Toplevel):
                  "on screen or let anyone photograph it who shouldn't have access.",
             foreground="#b00000", justify="center", padding=8,
         ).pack()
-        ttk.Button(self, text="Close", command=self.destroy).pack(pady=(0, 10))
+        _icon_button(self, "✖", "Close", self.destroy).pack(pady=(0, 10))
 
         _center_over_parent(self, parent)
+        _bring_window_to_front(self)
         self.grab_set()
         self.wait_window(self)
+
+
+class CreateShareDialog(tk.Toplevel):
+    """Reached via the toolbar's "New Share" button (or automatically once,
+    during first-run onboarding) - a second share is uncommon enough that
+    this doesn't need permanent space in the main window. Users are added
+    afterward, from the shares list itself (New/Attach User) - not here;
+    there's no reason share creation and granting access need to be the
+    same step."""
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.wizard = app.wizard
+        self._working = False
+        self.title("Create Share")
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Two pages, shown one at a time - a name, THEN (only if the
+        # suggested default isn't fine as-is) a folder - rather than both
+        # fields at once. Keeps each screen short/focused, and means
+        # "where should this live on disk" only comes up once the share
+        # already has a name to suggest a default from.
+        self._build_name_page()
+        self._build_path_page()
+        self._show_name_page()
+
+        self.name_entry.focus_set()
+        _center_over_parent(self, app.root)
+        _bring_window_to_front(self)
+        app._notify_tour("share_dialog_opened", window=self)
+        self.grab_set()
+        self.wait_window(self)
+
+    def _build_name_page(self):
+        self.name_page = ttk.Frame(self)
+
+        form = ttk.Frame(self.name_page)
+        form.pack(fill="x", padx=8, pady=8)
+        ttk.Label(form, text="Share Name:").grid(row=0, column=0, sticky="e", pady=4)
+        name_vcmd = (self.register(self._validate_name_input), "%P")
+        self.name_entry = ttk.Entry(form, width=40, validate="key", validatecommand=name_vcmd)
+        self.name_entry.grid(row=0, column=1, sticky="w", pady=4)
+        self.name_entry.bind("<Return>", lambda e: self._confirm_name())
+
+        action_frame = ttk.Frame(self.name_page)
+        action_frame.pack(fill="x", padx=8, pady=(4, 8))
+        _icon_button(action_frame, "✔", "Next", self._confirm_name).pack(side="left")
+        _icon_button(action_frame, "✖", "Close", self._on_close).pack(side="right")
+
+    def _build_path_page(self):
+        self.path_page = ttk.Frame(self)
+
+        form = ttk.Frame(self.path_page)
+        form.pack(fill="x", padx=8, pady=8)
+        ttk.Label(form, text="Folder Path:").grid(row=0, column=0, sticky="e", pady=4)
+        # Read-only: the only way to set this is Browse below, never typed
+        # text - a picked path is always a real directory, closing off
+        # malformed/adversarial path strings entirely rather than just
+        # filtering characters (see SHARE_PATH_RE) after the fact.
+        # Pre-filled with a suggested default (computed from the name once
+        # page 1 is confirmed - see _confirm_name) for anyone happy to
+        # just accept it - Create Share makes that folder itself if it
+        # doesn't exist yet, same as it always has.
+        self.path_entry = ttk.Entry(form, width=32, state="readonly")
+        self.path_entry.grid(row=0, column=1, sticky="w", pady=4)
+        _icon_button(form, "📂", "Browse", self._browse_path).grid(row=0, column=2, padx=4)
+
+        action_frame = ttk.Frame(self.path_page)
+        action_frame.pack(fill="x", padx=8, pady=(4, 8))
+        _icon_button(action_frame, "◀", "Back", self._show_name_page).pack(side="left")
+        self.create_button = _icon_button(action_frame, "✔", "Create Share", self._on_create_share)
+        self.create_button.pack(side="left", padx=(4, 0))
+        _icon_button(action_frame, "✖", "Close", self._on_close).pack(side="right")
+
+    def _show_name_page(self):
+        self.path_page.pack_forget()
+        self.name_page.pack(fill="both", expand=True)
+        # The window auto-sizes to whichever page is currently packed -
+        # re-center now that it just changed size, once Tk has actually
+        # recomputed it (immediately after pack() is too early).
+        self.after_idle(lambda: _center_over_parent(self, self.app.root))
+        self.name_entry.focus_set()
+
+    def _confirm_name(self):
+        name = self.name_entry.get().strip()
+        name_ok, name_message = self.wizard.check_share_name(name)
+        if not name_ok:
+            messagebox.showerror("Invalid name", name_message, parent=self)
+            return
+        self._set_path(self.wizard.default_share_path(name))
+        self.name_page.pack_forget()
+        self.path_page.pack(fill="both", expand=True)
+        self.after_idle(lambda: _center_over_parent(self, self.app.root))
+
+    def _validate_name_input(self, proposed):
+        # Blocks disallowed characters at the keystroke - see
+        # core.check_share_name's docstring for why (share names are
+        # written unescaped as a "[name]" smb.conf section header). Empty
+        # string must stay allowed or backspacing to clear would be blocked.
+        if proposed == "":
+            return True
+        return len(proposed) <= SHARE_NAME_MAX_LEN and bool(SHARE_NAME_RE.match(proposed))
+
+    def _on_close(self):
+        # Ignored while a create is in flight (button disabled during that
+        # window too) - the background thread still holds a reference to
+        # this dialog's widgets via _apply_done's closure.
+        if self._working:
+            return
+        self.destroy()
+
+    def _set_path(self, value):
+        # path_entry is state="readonly", which (like a normal ttk widget's
+        # disabled state) blocks .insert()/.delete() the same way it blocks
+        # typing - not just keyboard input specifically - so setting it
+        # programmatically means briefly lifting that restriction.
+        self.path_entry.configure(state="normal")
+        self.path_entry.delete(0, tk.END)
+        self.path_entry.insert(0, value)
+        self.path_entry.configure(state="readonly")
+
+    def _browse_path(self):
+        # Prefers a genuinely native picker (zenity/kdialog on Linux) over
+        # Tkinter's own askdirectory() - see pick_directory_native's
+        # docstring for why: on Linux specifically, Tkinter's bundled
+        # fallback chooser is missing a working "New Folder" button and
+        # has a click-to-collapse quirk in its tree view, whereas the
+        # real native picker (what this already amounts to on Windows/
+        # macOS) has proper folder creation built in - no separate
+        # NASsie-side "New Folder" flow needed alongside it.
+        handled, selected = pick_directory_native("Select Folder to Share")
+        if not handled:
+            selected = filedialog.askdirectory(parent=self, title="Select Folder to Share")
+        if selected:
+            # Tkinter's directory picker always returns "/"-separated
+            # paths, even on Windows - normalize to the native separator
+            # here (see core.select_directory()'s comment for why this
+            # isn't just cosmetic).
+            self._set_path(os.path.normpath(selected))
+
+    def _on_create_share(self):
+        name = self.name_entry.get().strip()
+        path = self.path_entry.get().strip() or self.wizard.default_share_path()
+
+        name_ok, name_message = self.wizard.check_share_name(name)
+        if not name_ok:
+            messagebox.showerror("Invalid name", name_message, parent=self)
+            return
+        path_ok, path_message = self.wizard.check_share_path(path)
+        if not path_ok:
+            messagebox.showerror("Invalid path", path_message, parent=self)
+            return
+
+        self.wizard.share_name = name
+        self.wizard.share_path = path
+        self.wizard.users = []
+
+        self._working = True
+        self.create_button.configure(state="disabled")
+
+        threading.Thread(target=self._apply_worker, daemon=True).start()
+
+    def _apply_worker(self):
+        self.app._busy_start()
+        share_name = self.wizard.share_name
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                if self.wizard.has_admin_privileges():
+                    self.wizard.dispatch_execution()
+                else:
+                    print("Not running with elevated privileges — requesting elevation via the OS's native prompt.")
+                    self.wizard.elevate_and_apply({
+                        "name": self.wizard.share_name,
+                        "path": self.wizard.share_path,
+                        "users": self.wizard.users
+                    })
+        except Exception as e:
+            buffer.write(f"\nUnexpected error: {e}\n")
+
+        # Checked against live share state, not the elevated step's own
+        # return value or captured output. When elevation is needed, the
+        # actual work runs in a SEPARATE relaunched process
+        # (pkexec/UAC/osascript) - its own print() output (including a
+        # "Success." marker) lands on that process's stdout, which is not
+        # something contextlib.redirect_stdout here can ever see, and on
+        # Windows specifically there's no way to stream it back at all
+        # (Start-Process -Verb RunAs can't be combined with output
+        # redirection across the UAC boundary). Re-querying whether the
+        # share now actually exists sidesteps all of that - same technique
+        # cli.py's start() already uses after "Create New Share".
+        success = any(s["name"] == share_name for s in self.wizard.list_shares())
+        self.app.root.after(0, lambda: self._apply_done(buffer.getvalue(), success))
+
+    def _apply_done(self, log_output, success):
+        self._working = False
+        self.app._busy_stop()
+        if log_output.strip():
+            self.app._append_log(log_output)
+        self.app._refresh_all_lists()
+        if success:
+            # Release this dialog's modal grab before the follow-on
+            # messagebox rather than nesting a new grab underneath it.
+            self.destroy()
+            self.app._notify_tour("share_created")
+            messagebox.showinfo(
+                "Done",
+                "Configuration attempt finished — see the log for details.\n\n"
+                "Add users from the shares list (New User / Attach User) whenever you're ready.",
+            )
+        else:
+            self.create_button.configure(state="normal")
+            messagebox.showerror(
+                "Failed", "Configuration attempt failed — see the log for details.", parent=self
+            )
+
+
+class LogWindow(tk.Toplevel):
+    """Raw stdout output from every action (share/user create, delete,
+    grant/revoke access, ...) collects here - a separate, non-modal window
+    (opened via the header's log button) rather than a permanently visible
+    panel, since most people only need to check it occasionally. Closing
+    it (the window's own X button) just hides it instead of destroying it,
+    so the accumulated log survives across show/hide."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("NASsie Log")
+        self.geometry("640x320")
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+        self.log_text = ScrolledText(self, state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Hidden until explicitly opened - not shown at startup, since an
+        # empty log window in front of the main one on first launch would
+        # just be in the way.
+        self.withdraw()
+
+    def append(self, text):
+        self.log_text.configure(state="normal")
+        self.log_text.insert(tk.END, text)
+        self.log_text.see(tk.END)
+        self.log_text.configure(state="disabled")
+
+    def show(self):
+        _bring_window_to_front(self)
+
+
+class UserManagementWindow(tk.Toplevel):
+    """Account-level user management, decoupled from any specific share -
+    Create User, Change Password, Delete User. A separate, non-modal
+    window (opened via the main toolbar's Users button) rather than a
+    second page, same reasoning as LogWindow: most of what people do day
+    to day is share-scoped (attach/unattach), so this doesn't need to
+    compete with the shares list for space. Hidden, not destroyed, on
+    close - state survives across show/hide, same as LogWindow."""
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.wizard = app.wizard
+        self.title("User Management")
+        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill="x", padx=8, pady=(8, 0))
+        self._new_user_toolbar_btn = _icon_button(toolbar, "+👤", "New User", self._create_new_user)
+        self._new_user_toolbar_btn.pack(side="left")
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(fill="both", expand=True)
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self.users_list = ttk.Treeview(tree_frame, show="tree headings", height=14)
+        self._sort = _SortableTree(
+            self.users_list, [("#0", "Username")], key_fn=lambda k, c: self.users_list.item(k, "text"),
+        )
+        self.users_list.column("#0", width=260, stretch=True)
+        self.users_list.grid(row=0, column=0, sticky="nsew")
+        vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.users_list.yview)
+        vscroll.grid(row=0, column=1, sticky="ns")
+        self.users_list.configure(yscrollcommand=vscroll.set)
+
+        # Floating, row-anchored action buttons instead of a fixed side
+        # panel - see _RowActionBar's docstring.
+        self._action_bar = _RowActionBar(self.users_list, vscroll, self._build_action_bar)
+
+        # Measured, not guessed - see GUIWizard's sizing block (same
+        # reasoning: nothing is selected yet, so the action bar doesn't
+        # exist for winfo_reqwidth() to have accounted for on its own).
+        self.update_idletasks()
+        bar_w = self.app._measure_action_bar_width(("🔑", "📱", "🗑"))
+        name_col_w = self.users_list.column("#0", "width")
+        width = max(name_col_w + 20 + bar_w + 40, self.winfo_reqwidth())
+        height = max(380, self.winfo_reqheight())
+        self.geometry(f"{width}x{height}")
+        self.minsize(width, height)
+
+        # Hidden until explicitly opened - see LogWindow's identical reasoning.
+        self.withdraw()
+
+    def _build_action_bar(self, container, item):
+        _icon_button(container, "🔑", "Change Password", self._change_password).pack(
+            side="left", fill="y", padx=1
+        )
+        _icon_button(container, "📱", "Show QR Code", self._show_qr).pack(side="left", fill="y", padx=1)
+        _icon_button(container, "🗑", "Delete User", self._delete_user).pack(side="left", fill="y", padx=1)
+        return True
+
+    def show(self):
+        self.refresh()
+        _bring_window_to_front(self)
+        self.app._notify_tour("user_mgmt_opened", window=self)
+
+    def refresh(self):
+        selected = self._selected_username()
+        users = self.wizard.list_users()
+        for item in self.users_list.get_children():
+            self.users_list.delete(item)
+        for u in users:
+            # list_users() returns every OS-level account on the machine
+            # (it has to, so "Attach User" pickers can offer an existing
+            # person) - but showing all of those here, unlabeled, means
+            # someone's own Windows sign-in or a family member's account
+            # shows up in a sharing tool with no explanation of what it is.
+            # Show an account NASsie either created itself, or that already
+            # has share access through NASsie - not every account on the box.
+            if not (u.get("managed") or u["shares"]):
+                continue
+            item_id = self.users_list.insert("", tk.END, text=u["username"])
+            if u["username"] == selected:
+                self.users_list.selection_set(item_id)
+        self._sort.reapply()
+        self._action_bar.update()
+
+    def _selected_username(self):
+        selection = self.users_list.selection()
+        return self.users_list.item(selection[0], "text") if selection else None
+
+    def _create_new_user(self):
+        existing = {u["username"] for u in self.wizard.list_users()}
+        dialog = AddUserDialog(
+            self, mode="create", existing_usernames=existing, show_access_level=False, app=self.app
+        )
+        if not dialog.result:
+            return
+        username = dialog.result["username"]
+        password = dialog.result["password"]
+        threading.Thread(target=self.app._create_user_worker, args=(username, password), daemon=True).start()
+
+    def _change_password(self):
+        self._change_password_flow(confirm_qr=True)
+
+    def _show_qr(self):
+        # Same underlying operation as Change Password (see its comment
+        # for why a password change is the only honest way to do this) -
+        # confirm_qr=False just skips the separate "want to see it?" ask
+        # afterward, since clicking a dedicated Show QR button already is
+        # that confirmation.
+        self._change_password_flow(confirm_qr=False)
+
+    def _change_password_flow(self, confirm_qr):
+        # Passwords are stored as hashes everywhere (Samba, Windows, macOS)
+        # - there's no way to retrieve an existing user's current password.
+        # Changing it (and encoding the new one) is the only honest way to
+        # show a QR code for an already-existing user - see
+        # QR_PASSWORD_RESET_NOTE. Reuses _grant_access_worker, the same
+        # underlying operation attaching a user to a share uses.
+        username = self._selected_username()
+        if not username:
+            messagebox.showinfo("Change Password", "Select a user first.")
+            return
+        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
+        shares = user.get("shares", []) if user else []
+        if not shares:
+            messagebox.showinfo("Change Password", f"'{username}' doesn't have access to any share yet.")
+            return
+
+        # On Windows this would reset the account's real sign-in password
+        # (no separate SMB password store there - see
+        # _add_user_to_share_windows) - never do that to an account NASsie
+        # didn't create. Linux is unaffected: Samba's password is already
+        # independent of the real login password.
+        if not user.get("managed", False) and self.wizard.system == "Windows":
+            messagebox.showinfo(
+                "Change Password",
+                f"'{username}' is an existing Windows account, not one NASsie created - changing its "
+                "password here would also change what they sign in with, so NASsie won't do that. "
+                "Change their password from Windows' own account settings instead.",
+            )
+            return
+
+        if not messagebox.askokcancel("Change Password", QR_PASSWORD_RESET_NOTE, parent=self):
+            return
+
+        if len(shares) == 1:
+            share_name = shares[0]
+        else:
+            dialog = ChoiceDialog(
+                self, "Choose share", "Change password (and show a QR code) for which share?",
+                shares, ok_label="Next",
+            )
+            if not dialog.result:
+                return
+            share_name = dialog.result
+
+        password = simpledialog.askstring(
+            "New password", f"New password for '{username}' (replaces their current one):",
+            show="*", parent=self,
+        )
+        if not password:
+            return
+
+        # Preserve the user's current access level on this share - a
+        # password change shouldn't silently flip them back to read-write.
+        share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
+        share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
+        read_only = share_user.get("read_only", False) if share_user else False
+
+        threading.Thread(
+            target=self.app._grant_access_worker,
+            args=(share_name, username, password, read_only, confirm_qr), daemon=True,
+        ).start()
+
+    def _delete_user(self):
+        username = self._selected_username()
+        if not username:
+            messagebox.showinfo("Delete User", "Select a user first.")
+            return
+        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
+        if not (user and user.get("managed", False)):
+            # Never delete an account NASsie didn't create - that's a real
+            # person's computer account, not an SMB-only one NASsie can
+            # freely remove. Unattaching from shares is still fine;
+            # deleting the account itself is not NASsie's call to make.
+            messagebox.showinfo(
+                "Delete User",
+                f"'{username}' is an existing computer account, not one NASsie created - NASsie won't "
+                "delete it. Unattach it from its shares instead, or delete the account itself from "
+                "your computer's own account settings.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Delete User",
+            f"Delete user '{username}' entirely? This removes their account everywhere, not just one share.",
+        ):
+            return
+        threading.Thread(target=self.app._delete_user_worker, args=(username,), daemon=True).start()
 
 
 class GUIWizard:
     def __init__(self):
         self.wizard = SMBWizard()
-        self.pending_users = []
 
         # className sets WM_CLASS, which is what taskbars/docks/app-switchers
         # use to match this running window back to nassie.desktop (and thus
@@ -331,27 +956,32 @@ class GUIWizard:
         # icon (set below) looks right.
         self.root = tk.Tk(className="NASsie")
         self.root.title("NASsie")
+        # Styles are per-interpreter, not per-window - defining these once
+        # here covers every icon button/Treeview in the app, including
+        # ones on Toplevels (dialogs, LogWindow, UserManagementWindow)
+        # created later. Treeview's default rowheight was too short to
+        # render a full emoji glyph without vertically clipping it - a
+        # clipped person emoji's rounded "head" read as a stray blue arc,
+        # not recognizable as part of an icon at all. The taller row (see
+        # _RowActionBar, which places each button at height=<row height>)
+        # fixes that; the icon font can go back down to a size that
+        # actually fits its button's own padding now that it isn't also
+        # being sized up to dodge clipping.
+        ttk.Style(self.root).configure("Icon.TButton", font=("TkDefaultFont", 11))
+        ttk.Style(self.root).configure("Treeview", rowheight=32)
         # Tk has no built-in "center on screen" - left alone, the window
         # manager decides placement, which is commonly the top-left corner
         # rather than anywhere near the middle of the display.
         self._load_icon_image()
         self._set_window_icon()
         self._build_header()
+        self._build_shares_page()
 
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        # Both non-modal, hidden until opened - see their own docstrings
+        # for why these are separate windows rather than tabs/panels.
+        self._log_window = LogWindow(self.root)
+        self._user_mgmt_window = UserManagementWindow(self)
 
-        self.create_tab = ttk.Frame(self.notebook)
-        self.manage_tab = ttk.Frame(self.notebook)
-        self.users_groups_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.create_tab, text="Create Share")
-        self.notebook.add(self.manage_tab, text="Manage Shares")
-        self.notebook.add(self.users_groups_tab, text="Users & Groups")
-        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self._refresh_all_lists())
-
-        self._build_create_tab()
-        self._build_manage_tab()
-        self._build_users_groups_tab()
         self._refresh_all_lists()
 
         # Tk has no built-in "center on screen" - left alone, the window
@@ -361,24 +991,35 @@ class GUIWizard:
         # The floor is measured from the widgets themselves (via
         # winfo_reqwidth/reqheight, after update_idletasks lays everything
         # out) rather than a hardcoded guess - a fixed constant here doesn't
-        # track content, so when the Users & Groups tab's button grid needed
-        # more room than the guess, shrinking to "minimum" still hid those
-        # buttons below the window edge instead of just clipping/scrolling.
-        # ttk.Notebook sizes itself to its largest pane, so this also covers
-        # the Groups and Users button grids even while another tab is shown.
+        # track content, so when the list+contextual-actions layout needed
+        # more room than the guess, shrinking to "minimum" still hid part
+        # of it below the window edge instead of just clipping/scrolling.
+        # That alone isn't enough for the row-action bar specifically,
+        # though: nothing is selected at startup, so it doesn't exist yet
+        # for winfo_reqwidth() to have measured at all. A guessed pixel
+        # constant here previously stood in for it and kept being wrong
+        # (icon glyph rendering varies enough by font/theme) - actually
+        # building the widest possible bar off-screen and measuring it
+        # (see _measure_action_bar_width) is the only way to get this
+        # right regardless of that.
         self.root.update_idletasks()
-        width = max(560, self.root.winfo_reqwidth())
+        share_bar_w = self._measure_action_bar_width(("+👤", "🔗", "➖👤", "🔒", "🗑"))
+        name_col_w = self.shares_list.column("#0", "width")
+        # name column + vertical scrollbar (~20px) + a floor for the Path
+        # column so it isn't squeezed to nothing + the action bar itself +
+        # outer padding/margins.
+        width = max(700, name_col_w + 20 + 150 + share_bar_w + 60, self.root.winfo_reqwidth())
         height = max(600, self.root.winfo_reqheight())
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        # Without a floor, shrinking the window below what the button grids
-        # (Groups, Users & Groups) actually need squishes them into an
-        # overlapping, unreadable mess instead of just clipping/scrolling -
-        # the window is otherwise freely resizable (no resizable(False)
-        # call), so this is the only thing stopping that.
+        # Without a floor, shrinking the window below what the list+actions
+        # layout actually needs squishes it into an overlapping, unreadable
+        # mess instead of just clipping/scrolling - the window is otherwise
+        # freely resizable (no resizable(False) call), so this is the only
+        # thing stopping that.
         self.root.minsize(width, height)
         self._bring_to_front()
 
@@ -391,20 +1032,27 @@ class GUIWizard:
             # measures widget positions.
             self.root.after(400, self._start_tour)
 
+    def _measure_action_bar_width(self, icons):
+        # Builds the given icons as real buttons (same style/font as
+        # production) in a throwaway, never-packed frame just to read
+        # their combined natural width, then discards it - see the sizing
+        # block's comment for why a measurement beats a guessed constant.
+        probe = ttk.Frame(self.root)
+        for icon in icons:
+            ttk.Button(probe, text=icon, width=3, style="Icon.TButton").pack(side="left", fill="y", padx=1)
+        probe.update_idletasks()
+        width = probe.winfo_reqwidth()
+        probe.destroy()
+        return width
+
     def _bring_to_front(self):
         # When NASsie is launched by the "Launch NASsie" checkbox
         # (WixShellExec, run from the installer's own process, not the
         # user's foreground one), Windows' foreground-lock restrictions
         # silently ignore a plain lift()/focus_force() from a background
-        # process, leaving the window open but buried behind others.
-        # Toggling -topmost forces a z-order change instead, which isn't
-        # subject to that restriction, and reliably drags the window to
-        # front as a side effect.
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-        self.root.after(200, lambda: self.root.attributes("-topmost", False))
-        self.root.focus_force()
+        # process, leaving the window open but buried behind others - the
+        # same issue _bring_window_to_front() works around for every popup.
+        _bring_window_to_front(self.root)
 
     def run(self):
         self.root.mainloop()
@@ -442,12 +1090,35 @@ class GUIWizard:
             ttk.Label(header, image=self._header_icon_image).pack(side="left", padx=(0, 10))
 
         ttk.Label(header, text="NASsie", font=("TkDefaultFont", 18, "bold")).pack(side="left")
-        ttk.Button(header, text="Take a Tour", command=self._start_tour).pack(side="right")
+        _icon_button(header, "📋", "View Log", lambda: self._log_window.show()).pack(side="right")
+        # Indeterminate progress bar doubling as a busy spinner - packed
+        # only while at least one background action is running (see
+        # _busy_start/_busy_stop), not a fixed part of the layout, so it
+        # doesn't take up space or draw the eye when nothing is happening.
+        self._busy_bar = ttk.Progressbar(header, mode="indeterminate", length=100)
+        self._busy_count = 0
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=8, pady=(10, 0))
 
-    def notebook_select(self, tab_index):
-        self.notebook.select(tab_index)
+    def _busy_start(self):
+        self._busy_count += 1
+        if self._busy_count == 1:
+            self._busy_bar.pack(side="right", padx=(0, 10))
+            self._busy_bar.start(12)
+
+    def _busy_stop(self):
+        self._busy_count = max(0, self._busy_count - 1)
+        if self._busy_count == 0:
+            self._busy_bar.stop()
+            self._busy_bar.pack_forget()
+
+    def _notify_tour(self, event, window=None):
+        # The active GuiTour (if any) advances itself on real actions
+        # happening rather than a "Next" button, and follows the user into
+        # whichever dialog just opened - see GuiTour.on_event().
+        tour = getattr(self, "_tour", None)
+        if tour:
+            tour.on_event(event, window=window)
 
     def _start_tour(self):
         # Rebuilt each time rather than cached - a stale GuiTour with a
@@ -456,71 +1127,47 @@ class GUIWizard:
         self._tour = GuiTour(self)
         self._tour.start()
 
-    def _build_create_tab(self):
-        frame = self.create_tab
+    def _open_create_share_dialog(self):
+        CreateShareDialog(self)
 
-        form = ttk.Frame(frame)
-        form.pack(fill="x", padx=8, pady=8)
+    def _build_shares_page(self):
+        # The only page - see the shares/users restructuring discussion:
+        # shares as expandable parent rows, each attached user nested
+        # underneath as a child row. Most of the old "which share?" picker
+        # dialogs (change access level, change password, ...) disappear
+        # entirely this way, since the share is already known from
+        # whichever row is selected.
+        toolbar = ttk.Frame(self.root)
+        toolbar.pack(fill="x", padx=8, pady=(8, 0))
+        self._new_share_btn = _icon_button(toolbar, "➕", "New Share", self._open_create_share_dialog)
+        self._new_share_btn.pack(side="left")
+        self._manage_users_btn = _icon_button(
+            toolbar, "👤", "Manage Users", lambda: self._user_mgmt_window.show()
+        )
+        self._manage_users_btn.pack(side="left", padx=(6, 0))
 
-        ttk.Label(form, text="Share Name:").grid(row=0, column=0, sticky="e", pady=4)
-        self.name_entry = ttk.Entry(form, width=40)
-        self.name_entry.grid(row=0, column=1, columnspan=2, sticky="w", pady=4)
-        self.name_entry.bind("<KeyRelease>", self._on_name_changed)
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True, padx=8, pady=8)
 
-        ttk.Label(form, text="Folder Path:").grid(row=1, column=0, sticky="e", pady=4)
-        self.path_entry = ttk.Entry(form, width=32)
-        self.path_entry.grid(row=1, column=1, sticky="w", pady=4)
-        self._last_suggested_path = self.wizard.default_share_path()
-        self.path_entry.insert(0, self._last_suggested_path)
-        ttk.Button(form, text="Browse", command=self._browse_path).grid(row=1, column=2, padx=4)
-
-        users_label_frame = ttk.LabelFrame(frame, text="Users")
-        users_label_frame.pack(fill="both", expand=False, padx=8, pady=8)
-
-        self.users_list = ttk.Treeview(users_label_frame, columns=("username",), show="headings", height=5)
-        self.users_list.heading("username", text="Username")
-        self.users_list.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=4)
-
-        users_list_scroll = ttk.Scrollbar(users_label_frame, orient="vertical", command=self.users_list.yview)
-        self.users_list.configure(yscrollcommand=users_list_scroll.set)
-        users_list_scroll.pack(side="left", fill="y", pady=4)
-
-        users_btn_frame = ttk.Frame(users_label_frame)
-        users_btn_frame.pack(side="left", fill="y", padx=4, pady=4)
-        ttk.Button(users_btn_frame, text="Add User", command=self._add_user).pack(fill="x", pady=2)
-        ttk.Button(users_btn_frame, text="Remove Selected", command=self._remove_user).pack(fill="x", pady=2)
-
-        action_frame = ttk.Frame(frame)
-        action_frame.pack(fill="x", padx=8, pady=4)
-        self.create_button = ttk.Button(action_frame, text="Create Share", command=self._on_create_share)
-        self.create_button.pack(side="left")
-        self.status_label = ttk.Label(action_frame, text="Idle")
-        self.status_label.pack(side="left", padx=10)
-
-        ttk.Label(frame, text="Log:").pack(anchor="w", padx=8)
-        self.log_text = ScrolledText(frame, height=10, state="disabled")
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-    def _build_manage_tab(self):
-        frame = self.manage_tab
-
-        tree_frame = ttk.Frame(frame)
-        tree_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(fill="both", expand=True)
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
 
-        self.shares_list = ttk.Treeview(tree_frame, columns=("name", "path", "users"), show="headings")
-        self.shares_list.heading("name", text="Share Name")
-        self.shares_list.heading("path", text="Path")
-        self.shares_list.heading("users", text="Users")
-        # stretch=False so a long path or SID (e.g. an unresolvable ACE's
-        # raw "*S-1-5-21-..." form) can push the row past the visible
-        # width and actually reach the horizontal scrollbar below, rather
-        # than Treeview silently squeezing columns to fit and truncating
-        # the text with no way to see the rest.
-        self.shares_list.column("name", width=110, stretch=False)
-        self.shares_list.column("path", width=220, stretch=False)
-        self.shares_list.column("users", width=320, stretch=False)
+        # "username" is a hidden data column (see displaycolumns) - not
+        # visible; just how the raw username survives on a child row
+        # independent of that row's DISPLAY text (which carries "(read-only)"/
+        # override annotations that would otherwise have to be parsed back
+        # out of the label).
+        self.shares_list = ttk.Treeview(
+            tree_frame, columns=("path", "username"), displaycolumns=("path",), show="tree headings",
+        )
+        self._shares_sort = _SortableTree(
+            self.shares_list, [("#0", "Share Name"), ("path", "Path")],
+            key_fn=lambda k, c: self.shares_list.item(k, "text") if c == "#0" else self.shares_list.set(k, c),
+        )
+        self.shares_list.column("#0", width=220, stretch=False)
+        self.shares_list.column("path", width=320, stretch=True)
         self.shares_list.grid(row=0, column=0, sticky="nsew")
 
         shares_vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.shares_list.yview)
@@ -529,224 +1176,74 @@ class GUIWizard:
         shares_hscroll.grid(row=1, column=0, sticky="ew")
         self.shares_list.configure(yscrollcommand=shares_vscroll.set, xscrollcommand=shares_hscroll.set)
 
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(btn_frame, text="Refresh", command=self._refresh_manage_list).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Add User", command=self._add_user_to_selected_share).pack(side="left", padx=4)
-        ttk.Button(btn_frame, text="Delete Selected", command=self._delete_selected_share).pack(side="left", padx=4)
+        # Floating, row-anchored action buttons instead of a fixed side
+        # panel - see _RowActionBar's docstring.
+        self._share_action_bar = _RowActionBar(self.shares_list, shares_vscroll, self._build_share_action_bar)
+        self.shares_list.bind("<<TreeviewSelect>>", lambda e: self._notify_tour("share_selected"), add="+")
 
-    def _build_users_groups_tab(self):
-        frame = self.users_groups_tab
-
-        # Both trees are hierarchical: a top-level row per group/user, with
-        # its members/shares (or groups/shares) nested as child rows -
-        # "show='tree'" uses just the indent/expand column, since the
-        # hierarchy itself conveys the relationship.
-        groups_frame = ttk.LabelFrame(frame, text="Groups")
-        groups_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        groups_frame.rowconfigure(0, weight=1)
-        groups_frame.columnconfigure(0, weight=1)
-        self.groups_list = ttk.Treeview(groups_frame, show="tree", height=6)
-        # A long nested line (e.g. "share: <name> (read-only)" next to a
-        # raw SID entry) can exceed this without ever showing past the
-        # window edge otherwise - stretch=False plus the horizontal
-        # scrollbar below is what actually makes the rest reachable.
-        self.groups_list.column("#0", width=400, stretch=False)
-        self.groups_list.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
-
-        groups_vscroll = ttk.Scrollbar(groups_frame, orient="vertical", command=self.groups_list.yview)
-        groups_vscroll.grid(row=0, column=1, sticky="ns", pady=4)
-        groups_hscroll = ttk.Scrollbar(groups_frame, orient="horizontal", command=self.groups_list.xview)
-        groups_hscroll.grid(row=1, column=0, sticky="ew", padx=(4, 0))
-        self.groups_list.configure(yscrollcommand=groups_vscroll.set, xscrollcommand=groups_hscroll.set)
-
-        # A grid of equal-width columns instead of left-packed rows of
-        # varying button widths - packed rows left every row a different
-        # total width (jagged/uneven), since each button only takes the
-        # width its own label needs. Grouped by what the actions do:
-        # group lifecycle, membership, then share access.
-        groups_btn_frame = ttk.Frame(frame)
-        groups_btn_frame.pack(fill="x", padx=8, pady=(0, 4))
-        for col in range(3):
-            groups_btn_frame.columnconfigure(col, weight=1, uniform="groups_btn")
-
-        def group_button(text, command, row, col):
-            ttk.Button(groups_btn_frame, text=text, command=command).grid(
-                row=row, column=col, sticky="ew", padx=4, pady=2
-            )
-
-        group_button("New Group", self._create_new_group, 0, 0)
-        group_button("Delete Group", self._delete_selected_group, 0, 1)
-        group_button("Add Member", self._add_group_member, 1, 0)
-        group_button("Remove Member", self._remove_group_member, 1, 1)
-        group_button("Assign to Share", self._assign_group_to_share, 2, 0)
-        group_button("Remove from Share", self._unassign_group_from_share, 2, 1)
-        group_button("Set Access Level", self._set_access_level_for_group, 2, 2)
-
-        users_frame = ttk.LabelFrame(frame, text="Users")
-        users_frame.pack(fill="both", expand=True, padx=8, pady=(4, 4))
-        users_frame.rowconfigure(0, weight=1)
-        users_frame.columnconfigure(0, weight=1)
-        self.system_users_list = ttk.Treeview(users_frame, show="tree", height=6)
-        self.system_users_list.column("#0", width=400, stretch=False)
-        self.system_users_list.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
-
-        system_users_vscroll = ttk.Scrollbar(
-            users_frame, orient="vertical", command=self.system_users_list.yview
+    def _build_share_action_bar(self, container, item):
+        parent = self.shares_list.parent(item)
+        if parent:
+            username = self.shares_list.set(item, "username") or None
+        else:
+            username = None
+        _icon_button(container, "+👤", "New User", self._new_user_for_selected_share).pack(
+            side="left", fill="y", padx=1
         )
-        system_users_vscroll.grid(row=0, column=1, sticky="ns", pady=4)
-        system_users_hscroll = ttk.Scrollbar(
-            users_frame, orient="horizontal", command=self.system_users_list.xview
+        _icon_button(
+            container, "🔗", "Attach User", self._attach_user_to_selected_share
+        ).pack(side="left", fill="y", padx=1)
+        if username:
+            _icon_button(
+                container, "➖👤", "Unattach User", self._unattach_selected_user
+            ).pack(side="left", fill="y", padx=1)
+            _icon_button(
+                container, "🔒", "Change Access Level", self._change_access_level_for_selection
+            ).pack(side="left", fill="y", padx=1)
+        _icon_button(container, "🗑", "Delete Share", self._delete_selected_share).pack(
+            side="left", fill="y", padx=1
         )
-        system_users_hscroll.grid(row=1, column=0, sticky="ew", padx=(4, 0))
-        self.system_users_list.configure(
-            yscrollcommand=system_users_vscroll.set, xscrollcommand=system_users_hscroll.set
-        )
+        return True
 
-        # A grid of equal-width columns instead of left-packed rows of
-        # varying button widths - same fix as the Groups buttons above,
-        # for the same reason (packed rows of differently-sized labels
-        # left every row a different total width). Grouped the same way
-        # too: user lifecycle, group membership, then share access.
-        users_btn_frame = ttk.Frame(frame)
-        users_btn_frame.pack(fill="x", padx=8, pady=(0, 4))
-        for col in range(3):
-            users_btn_frame.columnconfigure(col, weight=1, uniform="users_btn")
-
-        def user_button(text, command, row, col):
-            ttk.Button(users_btn_frame, text=text, command=command).grid(
-                row=row, column=col, sticky="ew", padx=4, pady=2
-            )
-
-        user_button("New User", self._create_new_user, 0, 0)
-        user_button("Delete User", self._delete_selected_user, 0, 1)
-        user_button("Assign to Group", self._assign_selected_user_to_group, 1, 0)
-        user_button("Remove from Group", self._remove_selected_user_from_group, 1, 1)
-        user_button("Revoke Access", self._revoke_selected_user_access, 2, 0)
-        user_button("Change Access Level", self._change_access_level_for_selected_user, 2, 1)
-        user_button("Reset Password & Show QR", self._reset_password_for_selected_user, 2, 2)
-
-        ttk.Button(frame, text="Refresh", command=self._refresh_users_groups).pack(
-            padx=8, pady=(0, 8), anchor="w"
-        )
-
-    def _populate_users_groups(self, groups, users, access_lookup, overrides, shares):
-        # (group_name, share_name) -> read_only, for the access level shown
-        # next to each of a group's assigned shares below.
-        group_share_access = {
-            (s["access_group"], s["name"]): s.get("access_group_read_only", False)
-            for s in shares if s.get("access_group")
-        }
-
-        for item in self.groups_list.get_children():
-            self.groups_list.delete(item)
-        for g in groups:
-            gid = self.groups_list.insert("", tk.END, text=g["name"], open=True)
-            for m in g["members"]:
-                self.groups_list.insert(gid, tk.END, text=f"user: {m}")
-            for s in g["shares"]:
-                level = "read-only" if group_share_access.get((g["name"], s)) else "full access"
-                self.groups_list.insert(gid, tk.END, text=f"share: {s} ({level})")
-
-        for item in self.system_users_list.get_children():
-            self.system_users_list.delete(item)
-        for u in users:
-            # list_users() returns every OS-level account on the machine
-            # (it has to, so "Add User"/"Add Member" pickers can offer an
-            # existing person) - but showing all of those here, unlabeled,
-            # means someone's own Windows sign-in or a family member's
-            # account shows up in a sharing tool with no explanation of
-            # what it is. Only show accounts NASsie actually has a hand in.
-            if not u["shares"] and not u["groups"]:
-                continue
-            uid = self.system_users_list.insert("", tk.END, text=u["username"], open=True)
-            for g in u["groups"]:
-                self.system_users_list.insert(uid, tk.END, text=f"group: {g}")
-            for s in u["shares"]:
-                suffix = " (read-only)" if access_lookup.get((s, u["username"])) else ""
-                override = overrides.get((s, u["username"]))
-                if override:
-                    # This user's own read-only setting above is masked by
-                    # a group grant - Windows/Samba/macOS all resolve
-                    # group access without regard to it, so it's misleading
-                    # to show just "(read-only)" with nothing else to
-                    # explain why they can actually still write.
-                    suffix += f" [overridden by group '{override[0]}': full access]"
-                self.system_users_list.insert(uid, tk.END, text=f"share: {s}{suffix}")
-
-    def _refresh_users_groups(self):
-        shares = self.wizard.list_shares()
-        groups = self.wizard.list_groups()
-        self._populate_users_groups(
-            groups, self.wizard.list_users(), self.wizard.build_access_lookup(shares),
-            self.wizard.effective_share_access(shares, groups), shares
-        )
+    def _selected_share_and_user(self):
+        # Returns (share_name, username) - username is None when the
+        # selected row is the share itself rather than one of its nested
+        # users. Returns (None, None) when nothing is selected.
+        selection = self.shares_list.selection()
+        if not selection:
+            return None, None
+        item = selection[0]
+        parent = self.shares_list.parent(item)
+        if parent:
+            return self.shares_list.item(parent, "text"), self.shares_list.set(item, "username") or None
+        return self.shares_list.item(item, "text"), None
 
     def _refresh_all_lists(self):
-        # Bound to <<NotebookTabChanged>> - fires on every tab click.
-        # list_shares/list_groups/list_users each shell out (PowerShell on
-        # Windows especially, one process per call even after batching),
-        # so running them synchronously here made every tab switch
-        # visibly stall the whole window. Fetch in the background and
-        # apply to the Treeviews on the main thread once ready.
+        # Called after every mutating action, so nothing ever needs a
+        # manual refresh. list_shares/list_groups each shell out
+        # (PowerShell on Windows especially, one process per call even
+        # after batching), so running them synchronously here visibly
+        # stalled the window. Fetch in the background and apply to the
+        # Treeviews on the main thread once ready.
         threading.Thread(target=self._refresh_all_lists_worker, daemon=True).start()
 
     def _refresh_all_lists_worker(self):
         shares = self.wizard.list_shares()
+        # Group management has no UI of its own anymore, but a group could
+        # still exist (created by an older NASsie version, or directly via
+        # the OS) and grant access that overrides a user's own per-share
+        # setting - still worth reflecting accurately here.
         groups = self.wizard.list_groups()
-        users = self.wizard.list_users()
-
-        access_lookup = self.wizard.build_access_lookup(shares)
         overrides = self.wizard.effective_share_access(shares, groups)
 
         def apply():
             self._populate_shares_list(shares, overrides)
-            self._populate_users_groups(groups, users, access_lookup, overrides, shares)
+            self._user_mgmt_window.refresh()
 
         self.root.after(0, apply)
 
-    def _selected_top_level_text(self, tree):
-        # Action buttons work whether you selected the top-level row
-        # (group/user) or one of its nested children - walk up to the
-        # top-level ancestor and return its label either way.
-        selection = tree.selection()
-        if not selection:
-            return None
-        item = selection[0]
-        while tree.parent(item):
-            item = tree.parent(item)
-        return tree.item(item, "text")
-
-    def _browse_path(self):
-        selected = filedialog.askdirectory(parent=self.root, title="Select Folder to Share")
-        if selected:
-            self.path_entry.delete(0, tk.END)
-            self.path_entry.insert(0, selected)
-
-    def _on_name_changed(self, event=None):
-        # Keep the suggested path in sync with the share name, but only
-        # while the user hasn't typed/browsed a path of their own.
-        if self.path_entry.get() != self._last_suggested_path:
-            return
-        name = self.name_entry.get().strip()
-        suggested = self.wizard.default_share_path(name) if name else self.wizard.default_share_path()
-        self.path_entry.delete(0, tk.END)
-        self.path_entry.insert(0, suggested)
-        self._last_suggested_path = suggested
-
-    def _add_user(self):
-        existing = [u["username"] for u in self.wizard.list_users()]
-        dialog = AddUserDialog(self.root, existing_usernames=existing)
-        if dialog.result:
-            self.pending_users.append(dialog.result)
-            self.users_list.insert("", tk.END, values=(dialog.result["username"],))
-
-    def _remove_user(self):
-        selection = self.users_list.selection()
-        for item in selection:
-            index = self.users_list.index(item)
-            del self.pending_users[index]
-            self.users_list.delete(item)
+    def _append_log(self, text):
+        self._log_window.append(text)
 
     def _populate_shares_list(self, shares, overrides=None):
         # list_shares() only reflects live share config (Get-SmbShare /
@@ -756,42 +1253,86 @@ class GUIWizard:
         # so an orphaned share (folder deleted outside NASsie) is visibly
         # different from a normal one rather than silently looking fine.
         overrides = overrides or {}
+        # Remember which share (by name) was expanded/selected so a
+        # refresh mid-session doesn't collapse everything the user had
+        # open or lose their place.
+        open_shares = {
+            self.shares_list.item(k, "text")
+            for k in self.shares_list.get_children("")
+            if self.shares_list.item(k, "open")
+        }
+        selected_share, selected_user = self._selected_share_and_user()
+
         for item in self.shares_list.get_children():
             self.shares_list.delete(item)
+
         for share in shares:
-            user_labels = []
-            for u in share.get("users", []):
-                label = u["username"] + (" (read-only)" if u.get("read_only") else "")
-                override = overrides.get((share.get("name"), u["username"]))
-                if override:
-                    # Their own read-only setting above is masked by a
-                    # group grant - see effective_share_access().
-                    label += f" [overridden by group '{override[0]}']"
-                user_labels.append(label)
-            users = ", ".join(user_labels) or "(none)"
-            if share.get("access_group"):
-                level = "read-only" if share.get("access_group_read_only") else "full access"
-                users += f"; group '{share['access_group']}' ({level})"
+            name = share.get("name", "?")
             path = share.get("path") or "Unknown"
             if path != "Unknown" and not os.path.isdir(path):
                 path = f"{path}  (folder missing!)"
-            self.shares_list.insert(
-                "", tk.END, values=(share.get("name", "?"), path, users)
+            share_id = self.shares_list.insert(
+                "", tk.END, text=name, values=(path, ""), open=(name in open_shares) or name == selected_share,
             )
+            for u in share.get("users", []):
+                label = u["username"] + (" (read-only)" if u.get("read_only") else "")
+                override = overrides.get((name, u["username"]))
+                if override:
+                    # Their own read-only setting above is masked by a
+                    # group grant made outside NASsie's UI - see
+                    # effective_share_access().
+                    label += " [overridden by a group]"
+                user_id = self.shares_list.insert(share_id, tk.END, text=label, values=("", u["username"]))
+                if name == selected_share and u["username"] == selected_user:
+                    self.shares_list.selection_set(user_id)
+            if share.get("access_group"):
+                # Informational only - a group override isn't a
+                # NASsie-managed "user" row to act on, just context that
+                # full/read-only access is coming from somewhere else too.
+                level = "read-only" if share.get("access_group_read_only") else "full access"
+                self.shares_list.insert(share_id, tk.END, text=f"(also granted via a group: {level})", values=("", ""))
+            if name == selected_share and selected_user is None:
+                self.shares_list.selection_set(share_id)
 
-    def _refresh_manage_list(self):
-        shares = self.wizard.list_shares()
-        overrides = self.wizard.effective_share_access(shares, self.wizard.list_groups())
-        self._populate_shares_list(shares, overrides)
+        self._shares_sort.reapply()
+        self._share_action_bar.update()
 
-    def _add_user_to_selected_share(self):
-        selection = self.shares_list.selection()
-        if not selection:
-            messagebox.showinfo("Add user", "Select a share first.")
+    def _new_user_for_selected_share(self):
+        share_name, _ = self._selected_share_and_user()
+        if not share_name:
+            messagebox.showinfo("New User", "Select a share first.")
             return
-        share_name = self.shares_list.item(selection[0], "values")[0]
+        existing = {u["username"] for u in self.wizard.list_users()}
+        dialog = AddUserDialog(self.root, mode="create", existing_usernames=existing, app=self)
+        if not dialog.result:
+            return
+        username = dialog.result["username"]
+        password = dialog.result["password"]
+        read_only = dialog.result.get("read_only", False)
+        threading.Thread(
+            target=self._grant_access_worker, args=(share_name, username, password, read_only), daemon=True
+        ).start()
+
+    def _attach_user_to_selected_share(self):
+        share_name, _ = self._selected_share_and_user()
+        if not share_name:
+            messagebox.showinfo("Attach User", "Select a share first.")
+            return
+        share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
+        already = {u["username"] for u in (share or {}).get("users", [])}
         all_users = self.wizard.list_users()
-        dialog = AddUserDialog(self.root, existing_usernames=[u["username"] for u in all_users])
+        candidates = [u for u in all_users if u["username"] not in already]
+        if not candidates:
+            messagebox.showinfo("Attach User", "Every existing user already has access to this share.")
+            return
+        # Already attached to at least one OTHER share means already has
+        # valid Samba/SMB credentials - see AddUserDialog's has_credentials
+        # comment for why that means no new password is needed here.
+        has_credentials = {u["username"] for u in candidates if u.get("shares")}
+        dialog = AddUserDialog(
+            self.root, mode="attach", existing_usernames=[u["username"] for u in candidates],
+            has_credentials=has_credentials, app=self,
+        )
         if not dialog.result:
             return
         username = dialog.result["username"]
@@ -802,7 +1343,7 @@ class GUIWizard:
         # NASsie created) needs a heads-up before granting it access, and
         # on Windows must never actually use the typed password - see
         # existing_account_grant_message()/_add_user_to_share_windows.
-        existing_user = next((u for u in all_users if u["username"] == username), None)
+        existing_user = next((u for u in candidates if u["username"] == username), None)
         if existing_user and not existing_user.get("managed", False):
             if not messagebox.askyesno(
                 "Existing computer account", self.existing_account_grant_message(username)
@@ -813,6 +1354,19 @@ class GUIWizard:
 
         threading.Thread(
             target=self._grant_access_worker, args=(share_name, username, password, read_only), daemon=True
+        ).start()
+
+    def _unattach_selected_user(self):
+        share_name, username = self._selected_share_and_user()
+        if not share_name or not username:
+            messagebox.showinfo("Unattach", "Select a user under a share first.")
+            return
+        if not messagebox.askyesno(
+            "Unattach", f"Remove '{username}''s access to '{share_name}'?"
+        ):
+            return
+        threading.Thread(
+            target=self._revoke_access_worker, args=(share_name, username), daemon=True
         ).start()
 
     def existing_account_grant_message(self, username):
@@ -833,93 +1387,11 @@ class GUIWizard:
             "Add them to this share? This sets the password used for sharing access."
         )
 
-    def _reset_password_for_selected_user(self):
-        # Passwords are stored as hashes everywhere (Samba, Windows, macOS)
-        # - there's no way to retrieve an existing user's current password
-        # to encode. The only honest way to show a QR for an
-        # already-existing user is to reset it and encode the new one -
-        # same underlying operation _add_user_to_selected_share uses, so
-        # this reuses the same worker/QR-offer path, just starting from the
-        # user's own screen instead of a share's.
-        username = self._selected_top_level_text(self.system_users_list)
-        if not username:
-            messagebox.showinfo("Reset Password & Show QR", "Select a user first.")
+    def _change_access_level_for_selection(self):
+        share_name, username = self._selected_share_and_user()
+        if not share_name or not username:
+            messagebox.showinfo("Change Access Level", "Select a user under a share first.")
             return
-        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
-        shares = user.get("shares", []) if user else []
-        if not shares:
-            messagebox.showinfo("Reset Password & Show QR", f"'{username}' doesn't have access to any share yet.")
-            return
-
-        # On Windows this would reset the account's real sign-in password
-        # (no separate SMB password store there - see
-        # _add_user_to_share_windows) - never do that to an account NASsie
-        # didn't create. Linux is unaffected: Samba's password is already
-        # independent of the real login password, so resetting it here
-        # can't lock anyone out of their actual account.
-        if not user.get("managed", False) and self.wizard.system == "Windows":
-            messagebox.showinfo(
-                "Reset Password & Show QR",
-                f"'{username}' is an existing Windows account, not one NASsie created - resetting its "
-                "password here would also change what they sign in with, so NASsie won't do that. "
-                "Reset their password from Windows' own account settings instead.",
-            )
-            return
-
-        if not messagebox.askokcancel("Reset Password & Show QR", QR_PASSWORD_RESET_NOTE):
-            return
-
-        if len(shares) == 1:
-            share_name = shares[0]
-        else:
-            dialog = ChoiceDialog(
-                self.root, "Choose share", "Reset password & show QR code for which share?",
-                shares, ok_label="Next"
-            )
-            if not dialog.result:
-                return
-            share_name = dialog.result
-
-        from tkinter import simpledialog
-        password = simpledialog.askstring(
-            "New password",
-            f"New password for '{username}' (replaces their current one):",
-            show="*", parent=self.root,
-        )
-        if not password:
-            return
-
-        # Preserve the user's current access level on this share - a
-        # password reset shouldn't silently flip them back to read-write.
-        share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
-        share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
-        read_only = share_user.get("read_only", False) if share_user else False
-
-        threading.Thread(
-            target=self._grant_access_worker, args=(share_name, username, password, read_only), daemon=True
-        ).start()
-
-    def _change_access_level_for_selected_user(self):
-        username = self._selected_top_level_text(self.system_users_list)
-        if not username:
-            messagebox.showinfo("Change Access Level", "Select a user first.")
-            return
-        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
-        shares = user.get("shares", []) if user else []
-        if not shares:
-            messagebox.showinfo("Change Access Level", f"'{username}' doesn't have access to any share yet.")
-            return
-
-        if len(shares) == 1:
-            share_name = shares[0]
-        else:
-            dialog = ChoiceDialog(
-                self.root, "Choose share", "Change access level for which share?", shares, ok_label="Next"
-            )
-            if not dialog.result:
-                return
-            share_name = dialog.result
-
         share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
         share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
         current_read_only = share_user.get("read_only", False) if share_user else False
@@ -930,12 +1402,12 @@ class GUIWizard:
             f"'{username}' is currently {current_label} on '{share_name}'.\n\nChange to {new_label}?",
         ):
             return
-
         threading.Thread(
             target=self._change_access_worker, args=(share_name, username, not current_read_only), daemon=True
         ).start()
 
     def _change_access_worker(self, share_name, username, read_only):
+        self._busy_start()
         buffer = io.StringIO()
         changed = False
         try:
@@ -946,6 +1418,7 @@ class GUIWizard:
         self.root.after(0, lambda: self._change_access_done(share_name, username, read_only, changed, buffer.getvalue()))
 
     def _change_access_done(self, share_name, username, read_only, changed, log_output):
+        self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
         if changed:
@@ -955,7 +1428,8 @@ class GUIWizard:
             messagebox.showerror("Failed", f"Could not change '{username}''s access level — see log.")
         self._refresh_all_lists()
 
-    def _grant_access_worker(self, share_name, username, password, read_only=False):
+    def _grant_access_worker(self, share_name, username, password, read_only=False, confirm_qr=True):
+        self._busy_start()
         buffer = io.StringIO()
         added = False
         try:
@@ -964,229 +1438,29 @@ class GUIWizard:
         except Exception as e:
             buffer.write(f"\nUnexpected error: {e}\n")
         self.root.after(
-            0, lambda: self._grant_access_done(share_name, username, password, added, buffer.getvalue())
+            0,
+            lambda: self._grant_access_done(share_name, username, password, added, buffer.getvalue(), confirm_qr),
         )
 
-    def _grant_access_done(self, share_name, username, password, added, log_output):
+    def _grant_access_done(self, share_name, username, password, added, log_output, confirm_qr=True):
+        self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
         if added:
+            self._notify_tour("user_attached")
             messagebox.showinfo("Added", f"Added '{username}' to share '{share_name}'.")
             # password is None for an existing, unmanaged Windows account
             # NASsie deliberately left untouched (see
             # _add_user_to_share_windows) - there's no password to encode,
             # and it must never be guessed at or invented for the QR code.
             if password is not None:
-                self._offer_qr_codes(share_name, [{"username": username, "password": password}])
+                self._offer_qr_codes(share_name, [{"username": username, "password": password}], confirm=confirm_qr)
         else:
             messagebox.showerror("Failed", f"Could not add '{username}' to share '{share_name}' — see log.")
         self._refresh_all_lists()
 
-    def _assign_selected_user_to_group(self):
-        username = self._selected_top_level_text(self.system_users_list)
-        if not username:
-            messagebox.showinfo("Assign to group", "Select a user first.")
-            return
-        groups = self.wizard.list_groups()
-        if not groups:
-            messagebox.showinfo("Assign to group", "No groups exist to assign to.")
-            return
-        dialog = ChoiceDialog(
-            self.root, "Assign to Group", f"Assign '{username}' to:",
-            [g["name"] for g in groups], ok_label="Assign"
-        )
-        if not dialog.result:
-            return
-        threading.Thread(
-            target=self._assign_group_worker, args=(username, dialog.result), daemon=True
-        ).start()
-
-    def _assign_group_worker(self, username, group_name):
-        buffer = io.StringIO()
-        ok = False
-        try:
-            with contextlib.redirect_stdout(buffer):
-                ok = self.wizard.assign_user_to_group(username, group_name)
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-        self.root.after(0, lambda: self._assign_group_done(username, group_name, ok, buffer.getvalue()))
-
-    def _assign_group_done(self, username, group_name, ok, log_output):
-        if log_output.strip():
-            self._append_log(log_output)
-        if ok:
-            messagebox.showinfo("Added", f"Added '{username}' to group '{group_name}'.")
-        else:
-            messagebox.showerror("Failed", f"Could not add '{username}' to group '{group_name}' — see log.")
-        self._refresh_all_lists()
-
-    def _remove_selected_user_from_group(self):
-        username = self._selected_top_level_text(self.system_users_list)
-        if not username:
-            messagebox.showinfo("Remove from group", "Select a user first.")
-            return
-        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
-        if not user or not user["groups"]:
-            messagebox.showinfo("Remove from group", f"'{username}' isn't in any group.")
-            return
-        dialog = ChoiceDialog(
-            self.root, "Remove from Group", f"Remove '{username}' from:",
-            user["groups"], ok_label="Remove"
-        )
-        if not dialog.result:
-            return
-        threading.Thread(
-            target=self._revoke_group_worker, args=(username, dialog.result), daemon=True
-        ).start()
-
-    def _add_group_member(self):
-        group_name = self._selected_top_level_text(self.groups_list)
-        if not group_name:
-            messagebox.showinfo("Add member", "Select a group first.")
-            return
-        # A dropdown of existing users, not free text: adding a member
-        # requires an already-existing account (unlike "Add User to Share",
-        # which can create one) - _add_user_to_group_linux validates and
-        # refuses otherwise, so free text here could only ever fail.
-        usernames = [u["username"] for u in self.wizard.list_users()]
-        if not usernames:
-            messagebox.showinfo("Add member", "No existing users to add. Create one via 'Add User to Share' first.")
-            return
-        dialog = ChoiceDialog(
-            self.root, "Add Member", f"Add which user to '{group_name}'?", usernames, ok_label="Add"
-        )
-        if not dialog.result:
-            return
-        threading.Thread(
-            target=self._assign_group_worker, args=(dialog.result, group_name), daemon=True
-        ).start()
-
-    def _remove_group_member(self):
-        group_name = self._selected_top_level_text(self.groups_list)
-        if not group_name:
-            messagebox.showinfo("Remove member", "Select a group first.")
-            return
-        group = next((g for g in self.wizard.list_groups() if g["name"] == group_name), None)
-        if not group or not group["members"]:
-            messagebox.showinfo("Remove member", f"'{group_name}' has no members.")
-            return
-        dialog = ChoiceDialog(
-            self.root, "Remove Member", f"Remove which member of '{group_name}'?",
-            group["members"], ok_label="Remove"
-        )
-        if not dialog.result:
-            return
-        threading.Thread(
-            target=self._revoke_group_worker, args=(dialog.result, group_name), daemon=True
-        ).start()
-
-    def _revoke_group_worker(self, username, group_name):
-        buffer = io.StringIO()
-        ok = False
-        try:
-            with contextlib.redirect_stdout(buffer):
-                ok = self.wizard.revoke_group_membership(username, group_name)
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-        self.root.after(0, lambda: self._revoke_group_done(username, group_name, ok, buffer.getvalue()))
-
-    def _revoke_group_done(self, username, group_name, ok, log_output):
-        if log_output.strip():
-            self._append_log(log_output)
-        if ok:
-            messagebox.showinfo("Removed", f"Removed '{username}' from group '{group_name}'.")
-        else:
-            messagebox.showerror("Failed", f"Could not remove '{username}' from group '{group_name}' — see log.")
-        self._refresh_all_lists()
-
-    def _set_access_level_for_group(self):
-        # Bulk-applies to every CURRENT member of the group, right now - not
-        # a persistent group-level grant. Someone added to the group later
-        # doesn't automatically inherit this.
-        group_name = self._selected_top_level_text(self.groups_list)
-        if not group_name:
-            messagebox.showinfo("Set Access Level", "Select a group first.")
-            return
-        group = next((g for g in self.wizard.list_groups() if g["name"] == group_name), None)
-        if not group or not group["members"]:
-            messagebox.showinfo("Set Access Level", f"'{group_name}' has no members yet.")
-            return
-        if not group["shares"]:
-            messagebox.showinfo("Set Access Level", f"'{group_name}' isn't attached to any share.")
-            return
-
-        if len(group["shares"]) == 1:
-            share_name = group["shares"][0]
-        else:
-            dialog = ChoiceDialog(
-                self.root, "Choose share", f"Set access level on which share for '{group_name}'?",
-                group["shares"], ok_label="Next"
-            )
-            if not dialog.result:
-                return
-            share_name = dialog.result
-
-        dialog = ChoiceDialog(
-            self.root, "Access level", f"Set every current member of '{group_name}' to:",
-            ["Read-write", "Read-only"], ok_label="Apply"
-        )
-        if not dialog.result:
-            return
-        read_only = dialog.result == "Read-only"
-
-        if not messagebox.askyesno(
-            "Set Access Level",
-            f"Apply {dialog.result.lower()} access to all {len(group['members'])} current member(s) "
-            f"of '{group_name}' on '{share_name}'?",
-        ):
-            return
-
-        threading.Thread(
-            target=self._set_group_access_worker, args=(group_name, share_name, read_only), daemon=True
-        ).start()
-
-    def _set_group_access_worker(self, group_name, share_name, read_only):
-        buffer = io.StringIO()
-        ok = False
-        try:
-            with contextlib.redirect_stdout(buffer):
-                ok = self.wizard.change_group_access(group_name, share_name, read_only)
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-        self.root.after(
-            0, lambda: self._set_group_access_done(group_name, share_name, read_only, ok, buffer.getvalue())
-        )
-
-    def _set_group_access_done(self, group_name, share_name, read_only, ok, log_output):
-        if log_output.strip():
-            self._append_log(log_output)
-        level = "read-only" if read_only else "read-write"
-        if ok:
-            messagebox.showinfo("Done", f"Set '{group_name}''s members to {level} on '{share_name}'.")
-        else:
-            messagebox.showerror("Failed", f"Could not change access level for '{group_name}' — see log.")
-        self._refresh_all_lists()
-
-    def _revoke_selected_user_access(self):
-        username = self._selected_top_level_text(self.system_users_list)
-        if not username:
-            messagebox.showinfo("Revoke access", "Select a user first.")
-            return
-        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
-        if not user or not user["shares"]:
-            messagebox.showinfo("Revoke access", f"'{username}' has no share access to revoke.")
-            return
-        dialog = ChoiceDialog(
-            self.root, "Revoke Access", f"Revoke '{username}' access to:", user["shares"], ok_label="Revoke"
-        )
-        if not dialog.result:
-            return
-        share_name = dialog.result
-        threading.Thread(
-            target=self._revoke_access_worker, args=(share_name, username), daemon=True
-        ).start()
-
     def _revoke_access_worker(self, share_name, username):
+        self._busy_start()
         buffer = io.StringIO()
         revoked = False
         try:
@@ -1197,39 +1471,17 @@ class GUIWizard:
         self.root.after(0, lambda: self._revoke_access_done(share_name, username, revoked, buffer.getvalue()))
 
     def _revoke_access_done(self, share_name, username, revoked, log_output):
+        self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
         if revoked:
-            messagebox.showinfo("Revoked", f"Revoked '{username}''s access to '{share_name}'.")
+            messagebox.showinfo("Unattached", f"Removed '{username}''s access to '{share_name}'.")
         else:
-            messagebox.showerror("Failed", f"Could not revoke access — see log.")
+            messagebox.showerror("Failed", f"Could not remove access — see log.")
         self._refresh_all_lists()
 
-    def _delete_selected_user(self):
-        username = self._selected_top_level_text(self.system_users_list)
-        if not username:
-            messagebox.showinfo("Delete user", "Select a user first.")
-            return
-        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
-        if not (user and user.get("managed", False)):
-            # Never delete an account NASsie didn't create - that's a real
-            # person's computer account, not an SMB-only one NASsie can
-            # freely remove. Revoking share/group access is still fine;
-            # deleting the account itself is not NASsie's call to make.
-            messagebox.showinfo(
-                "Delete user",
-                f"'{username}' is an existing computer account, not one NASsie created - NASsie won't "
-                "delete it. Remove it from this share/group instead, or delete the account itself from "
-                "your computer's own account settings.",
-            )
-            return
-        if not messagebox.askyesno(
-            "Delete user", f"Delete user '{username}' entirely? This removes their account everywhere, not just one share."
-        ):
-            return
-        threading.Thread(target=self._delete_user_worker, args=(username,), daemon=True).start()
-
     def _delete_user_worker(self, username):
+        self._busy_start()
         buffer = io.StringIO()
         deleted = False
         try:
@@ -1240,6 +1492,7 @@ class GUIWizard:
         self.root.after(0, lambda: self._delete_user_done(username, deleted, buffer.getvalue()))
 
     def _delete_user_done(self, username, deleted, log_output):
+        self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
         if deleted:
@@ -1248,34 +1501,8 @@ class GUIWizard:
             messagebox.showerror("Failed", f"Could not delete user '{username}' — see log.")
         self._refresh_all_lists()
 
-    def _create_new_user(self):
-        # A standalone account, not attached to any share or group - lets a
-        # user get set up ahead of deciding what to grant them access to,
-        # instead of forcing a throwaway share into existence just to get
-        # the account created.
-        all_users = self.wizard.list_users()
-        dialog = AddUserDialog(
-            self.root, existing_usernames=[u["username"] for u in all_users], show_access_level=False
-        )
-        if not dialog.result:
-            return
-        username = dialog.result["username"]
-        password = dialog.result["password"]
-
-        # add_user() silently resets the password of an account that's
-        # already there rather than failing - which is exactly the
-        # confusing-if-unlabeled behavior this dialog exists to surface
-        # instead: someone who typed an existing name (by mistake, or on
-        # purpose to manage that account) sees what it already has and
-        # picks the specific thing they actually meant to do.
-        existing_user = next((u for u in all_users if u["username"] == username), None)
-        if existing_user:
-            ExistingUserDialog(self.root, self, existing_user, password)
-            return
-
-        threading.Thread(target=self._create_user_worker, args=(username, password), daemon=True).start()
-
     def _create_user_worker(self, username, password):
+        self._busy_start()
         buffer = io.StringIO()
         created = False
         try:
@@ -1286,183 +1513,20 @@ class GUIWizard:
         self.root.after(0, lambda: self._create_user_done(username, created, buffer.getvalue()))
 
     def _create_user_done(self, username, created, log_output):
+        self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
         if created:
-            messagebox.showinfo("Done", f"'{username}' now has this password.")
+            self._notify_tour("user_created")
+            messagebox.showinfo("Done", f"'{username}' has been created.")
         else:
             messagebox.showerror("Failed", f"Could not set up user '{username}' — see log.")
         self._refresh_all_lists()
 
-    def _delete_selected_group(self):
-        group_name = self._selected_top_level_text(self.groups_list)
-        if not group_name:
-            messagebox.showinfo("Delete group", "Select a group first.")
-            return
-        if not messagebox.askyesno("Delete group", f"Delete group '{group_name}'?"):
-            return
-        threading.Thread(target=self._delete_group_worker, args=(group_name,), daemon=True).start()
-
-    def _delete_group_worker(self, group_name):
-        buffer = io.StringIO()
-        deleted = False
-        try:
-            with contextlib.redirect_stdout(buffer):
-                deleted = self.wizard.remove_group(group_name)
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-        self.root.after(0, lambda: self._delete_group_done(group_name, deleted, buffer.getvalue()))
-
-    def _delete_group_done(self, group_name, deleted, log_output):
-        if log_output.strip():
-            self._append_log(log_output)
-        if deleted:
-            messagebox.showinfo("Deleted", f"Deleted group '{group_name}'.")
-        else:
-            messagebox.showerror("Failed", f"Could not delete group '{group_name}' — see log.")
-        self._refresh_all_lists()
-
-    def _create_new_group(self):
-        # A standalone access-control group, not tied to any share until
-        # explicitly assigned via "Assign to Share" - unlike a share's
-        # own auto-created ownership group (filesystem-permission-only,
-        # never shown here), this one grants real, persistent SMB access
-        # to whatever it's assigned to.
-        name = simpledialog.askstring("New Group", "Group name:", parent=self.root)
-        if not name or not name.strip():
-            return
-        threading.Thread(target=self._create_group_worker, args=(name.strip(),), daemon=True).start()
-
-    def _create_group_worker(self, name):
-        buffer = io.StringIO()
-        system_name = None
-        try:
-            with contextlib.redirect_stdout(buffer):
-                system_name = self.wizard.add_group(name)
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-        self.root.after(0, lambda: self._create_group_done(name, system_name, buffer.getvalue()))
-
-    def _create_group_done(self, name, system_name, log_output):
-        if log_output.strip():
-            self._append_log(log_output)
-        if system_name:
-            messagebox.showinfo("Created", f"Created group '{system_name}'.")
-        else:
-            messagebox.showerror("Failed", f"Could not create group '{name}' — see log.")
-        self._refresh_all_lists()
-
-    def _assign_group_to_share(self):
-        group_name = self._selected_top_level_text(self.groups_list)
-        if not group_name:
-            messagebox.showinfo("Assign to Share", "Select a group first.")
-            return
-        shares = [s["name"] for s in self.wizard.list_shares()]
-        if not shares:
-            messagebox.showinfo("Assign to Share", "No shares exist yet.")
-            return
-        share_dialog = ChoiceDialog(
-            self.root, "Choose share", f"Grant '{group_name}' access to which share?", shares, ok_label="Next"
-        )
-        if not share_dialog.result:
-            return
-        share_name = share_dialog.result
-
-        level_dialog = ChoiceDialog(
-            self.root, "Access level", f"Grant '{group_name}' members:",
-            ["Read-write", "Read-only"], ok_label="Assign"
-        )
-        if not level_dialog.result:
-            return
-        read_only = level_dialog.result == "Read-only"
-
-        if not messagebox.askyesno(
-            "Assign to Share",
-            f"Grant '{group_name}' {level_dialog.result.lower()} access to '{share_name}'? "
-            f"Every current and future member gets this access - not a one-time snapshot.",
-        ):
-            return
-
-        threading.Thread(
-            target=self._assign_group_share_worker, args=(group_name, share_name, read_only), daemon=True
-        ).start()
-
-    def _assign_group_share_worker(self, group_name, share_name, read_only):
-        buffer = io.StringIO()
-        ok = False
-        try:
-            with contextlib.redirect_stdout(buffer):
-                ok = self.wizard.grant_group_share_access(group_name, share_name, read_only)
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-        self.root.after(
-            0, lambda: self._assign_group_share_done(group_name, share_name, ok, buffer.getvalue())
-        )
-
-    def _assign_group_share_done(self, group_name, share_name, ok, log_output):
-        if log_output.strip():
-            self._append_log(log_output)
-        if ok:
-            messagebox.showinfo("Assigned", f"Assigned '{group_name}' to '{share_name}'.")
-        else:
-            messagebox.showerror("Failed", f"Could not assign '{group_name}' to '{share_name}' — see log.")
-        self._refresh_all_lists()
-
-    def _unassign_group_from_share(self):
-        group_name = self._selected_top_level_text(self.groups_list)
-        if not group_name:
-            messagebox.showinfo("Remove from Share", "Select a group first.")
-            return
-        group = next((g for g in self.wizard.list_groups() if g["name"] == group_name), None)
-        if not group or not group["shares"]:
-            messagebox.showinfo("Remove from Share", f"'{group_name}' isn't assigned to any share.")
-            return
-        if len(group["shares"]) == 1:
-            share_name = group["shares"][0]
-        else:
-            dialog = ChoiceDialog(
-                self.root, "Choose share", f"Remove '{group_name}' from which share?",
-                group["shares"], ok_label="Next"
-            )
-            if not dialog.result:
-                return
-            share_name = dialog.result
-
-        if not messagebox.askyesno(
-            "Remove from Share", f"Remove '{group_name}''s access to '{share_name}'?"
-        ):
-            return
-
-        threading.Thread(
-            target=self._unassign_group_share_worker, args=(group_name, share_name), daemon=True
-        ).start()
-
-    def _unassign_group_share_worker(self, group_name, share_name):
-        buffer = io.StringIO()
-        ok = False
-        try:
-            with contextlib.redirect_stdout(buffer):
-                ok = self.wizard.revoke_group_share_access(group_name, share_name)
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-        self.root.after(
-            0, lambda: self._unassign_group_share_done(group_name, share_name, ok, buffer.getvalue())
-        )
-
-    def _unassign_group_share_done(self, group_name, share_name, ok, log_output):
-        if log_output.strip():
-            self._append_log(log_output)
-        if ok:
-            messagebox.showinfo("Removed", f"Removed '{group_name}''s access to '{share_name}'.")
-        else:
-            messagebox.showerror("Failed", f"Could not remove '{group_name}''s access to '{share_name}' — see log.")
-        self._refresh_all_lists()
-
     def _delete_selected_share(self):
-        selection = self.shares_list.selection()
-        if not selection:
+        name, _ = self._selected_share_and_user()
+        if not name:
             return
-        name = self.shares_list.item(selection[0], "values")[0]
         if not messagebox.askyesno(
             "Remove share", f"Remove share '{name}'? This updates the live share configuration."
         ):
@@ -1479,6 +1543,7 @@ class GUIWizard:
         threading.Thread(target=self._delete_worker, args=(name, delete_folder), daemon=True).start()
 
     def _delete_worker(self, name, delete_folder=False):
+        self._busy_start()
         buffer = io.StringIO()
         removed = False
         try:
@@ -1489,6 +1554,7 @@ class GUIWizard:
         self.root.after(0, lambda: self._delete_done(name, removed, delete_folder, buffer.getvalue()))
 
     def _delete_done(self, name, removed, delete_folder, log_output):
+        self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
         if removed:
@@ -1499,80 +1565,14 @@ class GUIWizard:
             messagebox.showerror("Failed", f"Could not remove share '{name}' — see log.")
         self._refresh_all_lists()
 
-    def _append_log(self, text):
-        self.log_text.configure(state="normal")
-        self.log_text.insert(tk.END, text)
-        self.log_text.see(tk.END)
-        self.log_text.configure(state="disabled")
-
-    def _on_create_share(self):
-        name = self.name_entry.get().strip()
-        path = self.path_entry.get().strip() or self.wizard.default_share_path()
-
-        if not name:
-            messagebox.showerror("Invalid input", "Share name cannot be empty.")
-            return
-        path_ok, path_message = self.wizard.check_share_path(path)
-        if not path_ok:
-            messagebox.showerror("Invalid path", path_message)
-            return
-
-        self.wizard.share_name = name
-        self.wizard.share_path = path
-        self.wizard.users = list(self.pending_users)
-
-        self.create_button.configure(state="disabled")
-        self.status_label.configure(text="Working...")
-        self._append_log(f"\n--- Creating share '{name}' ---\n")
-
-        threading.Thread(target=self._apply_worker, daemon=True).start()
-
-        self.name_entry.delete(0, tk.END)
-        self.path_entry.delete(0, tk.END)
-        self._last_suggested_path = self.wizard.default_share_path()
-        self.path_entry.insert(0, self._last_suggested_path)
-        self.pending_users = []
-        for item in self.users_list.get_children():
-            self.users_list.delete(item)
-
-    def _apply_worker(self):
-        # Captured up front, not re-read from self.wizard in _apply_done -
-        # the "Create Share" button is disabled for the duration, but this
-        # keeps the QR-offer step correct even if that ever changes.
-        share_name = self.wizard.share_name
-        users = list(self.wizard.users)
-        buffer = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buffer):
-                if self.wizard.has_admin_privileges():
-                    self.wizard.dispatch_execution()
-                else:
-                    print("Not running with elevated privileges — requesting elevation via the OS's native prompt.")
-                    self.wizard.elevate_and_apply({
-                        "name": self.wizard.share_name,
-                        "path": self.wizard.share_path,
-                        "users": self.wizard.users
-                    })
-        except Exception as e:
-            buffer.write(f"\nUnexpected error: {e}\n")
-
-        self.root.after(0, lambda: self._apply_done(buffer.getvalue(), share_name, users))
-
-    def _apply_done(self, log_output, share_name, users):
-        self._append_log(log_output)
-        self.create_button.configure(state="normal")
-        self.status_label.configure(text="Idle")
-        self._refresh_all_lists()
-        messagebox.showinfo("Done", "Configuration attempt finished — see the log for details.")
-        if "Success." in log_output and users:
-            self._offer_qr_codes(share_name, users)
-
-    def _offer_qr_codes(self, share_name, users):
+    def _offer_qr_codes(self, share_name, users, confirm=True):
         # users: [{"username": ..., "password": ...}, ...] - only ever
         # offered right when a password was just set (share creation / add
         # user), since NASsie never persists plaintext passwords and so has
-        # no way to regenerate this later for an existing user.
-        if not messagebox.askyesno(
+        # no way to regenerate this later for an existing user. confirm=False
+        # skips the "want to see it?" ask - for the dedicated Show QR
+        # button, where clicking it already is that confirmation.
+        if confirm and not messagebox.askyesno(
             "QR Code",
             "Show a QR code for easy external configuration of this share?\n\n"
             "The code contains this user's password in plain sight - only display it "

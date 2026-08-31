@@ -3,7 +3,7 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
   <Package Name="NASsie"
-           Manufacturer="Caden Lister"
+           Manufacturer="Lister Creative Enterprise LLC"
            Version="0.1.5.0"
            UpgradeCode="4c2e7f0a-9b1d-4e3a-8c6f-2a1b5d7e9f30"
            Compressed="yes">
@@ -88,6 +88,24 @@
                   ExeCommand="--uninstall-folder-prompt"
                   Return="ignore" />
 
+    <!-- "Add desktop shortcut" checkbox on the final install page (see the
+         overridden ExitDialog below). Plain ExeCommand rather than
+         WixShellExec (used for LaunchApplication below) because
+         WixShellExec has no way to pass an argument (like the
+         ExeCommand flag below) - it just ShellExecutes the target file
+         as-is. Impersonate="yes" (default Execute, immediate, same
+         interactive session as the rest of the UI) runs this as the
+         logged-in user, not the elevated installer - see
+         create_desktop_shortcut_windows()'s docstring for why that
+         matters (resolving the right Desktop folder). Return="ignore"
+         means a failure here (e.g. PowerShell/WScript.Shell unavailable)
+         can never block Finish from completing. -->
+    <CustomAction Id="NASsieCreateDesktopShortcut"
+                  FileRef="NASsieExe"
+                  ExeCommand="--create-desktop-shortcut"
+                  Impersonate="yes"
+                  Return="ignore" />
+
     <InstallExecuteSequence>
       <Custom Action="NASsiePromptUninstallFolders" Before="NASsieUninstallCleanup" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
       <Custom Action="NASsieUninstallCleanup" Before="RemoveFiles" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
@@ -118,9 +136,43 @@
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#NASsieExe]" />
     <CustomAction Id="LaunchApplication" BinaryRef="Wix4UtilCA_X64" DllEntry="WixShellExec" Impersonate="yes" />
+
+    <!-- The stock WixUI_InstallDir ExitDialog (from the UI extension
+         library) has room for exactly one opt-in checkbox
+         (WIXUI_EXITDIALOGOPTIONALCHECKBOX, used above for "Launch NASsie")
+         - getting a second, independent one ("Add desktop shortcut") means
+         replacing that whole dialog with our own copy. Overriding it is as
+         simple as redefining a Dialog with the same Id elsewhere in the
+         same UI sequence - WiX resolves same-Id dialogs by last one wins,
+         no separate "virtual"/Overridable declaration needed on this side.
+         Every control below except NASsieDesktopShortcutCheckBox, and
+         every coordinate, is copied verbatim from the library's own
+         ExitDialog.wxs so the rest of the dialog looks identical; only
+         OptionalCheckBox's Height shrank (40 to 18, it doesn't need to
+         wrap) to make room for the new checkbox directly beneath it,
+         still well clear of BottomLine at Y=234. -->
     <UI>
+      <Dialog Id="ExitDialog" Width="370" Height="270" Title="!(loc.ExitDialog_Title)">
+        <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIFinish)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUICancel)" />
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="!(loc.ExitDialogBitmap)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="373" Height="0" />
+        <Control Id="Description" Type="Text" X="135" Y="70" Width="220" Height="40" Transparent="yes" NoPrefix="yes" Text="!(loc.ExitDialogDescription)" />
+        <Control Id="Title" Type="Text" X="135" Y="20" Width="220" Height="60" Transparent="yes" NoPrefix="yes" Text="!(loc.ExitDialogTitle)" />
+        <Control Id="OptionalText" Type="Text" X="135" Y="110" Width="220" Height="80" Transparent="yes" NoPrefix="yes" Hidden="yes" Text="[WIXUI_EXITDIALOGOPTIONALTEXT]" ShowCondition="WIXUI_EXITDIALOGOPTIONALTEXT AND NOT Installed" />
+        <Control Id="OptionalCheckBox" Type="CheckBox" X="135" Y="190" Width="220" Height="18" Hidden="yes" Property="WIXUI_EXITDIALOGOPTIONALCHECKBOX" CheckBoxValue="1" Text="[WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT]" ShowCondition="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT AND NOT Installed" />
+        <!-- Unchecked by default (NASSIE_DESKTOP_SHORTCUT has no Property
+             element declaring a starting value, so it's unset/false until
+             ticked) - unlike launching the app you just installed, a
+             desktop icon is a personal-clutter preference, not something
+             to assume everyone wants. -->
+        <Control Id="NASsieDesktopShortcutCheckBox" Type="CheckBox" X="135" Y="210" Width="220" Height="18" Property="NASSIE_DESKTOP_SHORTCUT" CheckBoxValue="1" Text="Add a desktop shortcut" ShowCondition="NOT Installed" />
+      </Dialog>
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="NASsieCreateDesktopShortcut"
+               Condition="NASSIE_DESKTOP_SHORTCUT = 1 and NOT Installed" />
     </UI>
 
   </Package>

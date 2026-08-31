@@ -26,6 +26,39 @@ def _run(args, **kwargs):
     return subprocess.run(args, **kwargs)
 
 
+def pick_directory_native(title):
+    # Tkinter's own filedialog.askdirectory() IS the real native picker
+    # on Windows and macOS - but on Linux it falls back to a bundled
+    # Tcl/Tk directory chooser whenever the local Tk build wasn't linked
+    # against GTK, and that fallback is missing a working "New Folder"
+    # button and has a click-to-collapse quirk in its own tree view
+    # (found by testing on exactly this kind of setup). zenity (GNOME) or
+    # kdialog (KDE) shell out to the genuine native GTK/Qt folder picker
+    # instead - both already have proper folder creation built in, which
+    # is what let the separate NASsie-side "New Folder" flow go away
+    # entirely rather than staying as a workaround alongside this.
+    #
+    # Returns (handled, path). handled is False only when neither tool
+    # exists at all - the caller should fall back to askdirectory() in
+    # that case. path is None when a native tool ran but the user
+    # cancelled (handled is still True then - a real picker did run).
+    if platform.system() != "Linux":
+        return False, None
+    candidates = [
+        ("zenity", ["zenity", "--file-selection", "--directory", f"--title={title}"]),
+        ("kdialog", ["kdialog", "--getexistingdirectory", os.path.expanduser("~"), title]),
+    ]
+    for tool, cmd in candidates:
+        if not shutil.which(tool):
+            continue
+        try:
+            proc = _run(cmd, capture_output=True, text=True)
+        except Exception:
+            continue
+        return True, (proc.stdout.strip() or None)
+    return False, None
+
+
 # Shown by all three UIs before resetting an existing user's password to
 # generate a QR code for them - explains this is a structural limitation of
 # how SMB/Samba/Windows store passwords, not a NASsie shortcoming, and that
@@ -40,6 +73,39 @@ QR_PASSWORD_RESET_NOTE = (
     "setting a new password right now - the old one (and anything still "
     "using it) will stop working until it's reconnected with the new one."
 )
+
+# Share names end up written verbatim as a "[name]" section header in
+# /etc/samba/smb.conf (see _add_samba_share_config) and passed to
+# New-SmbShare on Windows - an unrestricted name (e.g. containing "]" and a
+# newline) can break out of its own config block and inject arbitrary smb.conf
+# directives. Deliberately tight (letters/digits/space/-/_ only, no "[", "]",
+# quotes, or control characters) rather than just blocking the handful of
+# characters known to be dangerous today.
+SHARE_NAME_MAX_LEN = 10
+SHARE_NAME_RE = re.compile(r'^[A-Za-z0-9 _-]+$')
+
+# Usernames are also written unescaped into smb.conf's "valid users"/"read
+# list" lines (space-joined), so the same reasoning applies; this also keeps
+# names within the traditional POSIX/Windows SAM username length.
+USERNAME_MAX_LEN = 20
+USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+# The path is also written unescaped as smb.conf's "path = ..." line. Real
+# filesystem paths need ":", "/", "\\", and spaces, so this can't be as tight
+# as the share name - it only blocks control characters (notably newlines,
+# which is what would let a path break out of its config line) and a few
+# characters with no legitimate use in a path that are common injection/shell
+# metacharacters ("[]{}<>|;&$`'\"*?").
+SHARE_PATH_MAX_LEN = 240
+SHARE_PATH_RE = re.compile(r'^[^\x00-\x1f\[\]{}<>|;&$`\'"*?]+$')
+
+
+def _validate_against(value, max_len, pattern, label):
+    if not value or len(value) > max_len:
+        return False, f"{label} must be 1-{max_len} characters."
+    if not pattern.match(value):
+        return False, f"{label} contains characters that aren't allowed."
+    return True, None
 
 
 class SMBWizard:
@@ -600,14 +666,26 @@ class SMBWizard:
         return True
 
     def select_directory(self):
-        if not TKINTER_AVAILABLE:
-            return None
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        directory = filedialog.askdirectory(title="Select Folder to Share")
-        root.destroy()
-        return directory
+        handled, directory = pick_directory_native("Select Folder to Share")
+        if not handled:
+            if not TKINTER_AVAILABLE:
+                return None
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            directory = filedialog.askdirectory(title="Select Folder to Share")
+            root.destroy()
+        # Tkinter's directory picker always returns "/"-separated paths,
+        # even on Windows (a long-standing Tk quirk - its internal path
+        # handling is Unix-style regardless of platform). Left as-is, a
+        # picked "C:/Users/.../Share" looks fine in the text field (Windows
+        # tools mostly tolerate "/") but silently mismatches every path
+        # comparison elsewhere that assumes native "\" separators (e.g.
+        # _unsafe_share_paths()'s os.path.abspath() comparison, or an exact
+        # string match against what's stored in an existing share's config)
+        # - normalizing right here is the one place that fixes it for every
+        # caller instead of every comparison needing to know to normalize.
+        return os.path.normpath(directory) if directory else directory
 
     def default_share_path(self, share_name=None):
         folder = self._sanitize_folder_name(share_name) if share_name else 'SMB_Share'
@@ -662,6 +740,9 @@ class SMBWizard:
         # a last-ditch guard inside dispatch_execution() - the earlier this
         # gets caught, the less chance of it looking like a silent failure.
         check_path = self.share_path if path is None else path
+        ok, message = _validate_against(check_path, SHARE_PATH_MAX_LEN, SHARE_PATH_RE, "Path")
+        if not ok:
+            return False, message
         resolved = os.path.abspath(os.path.expanduser(check_path))
         if resolved in self._unsafe_share_paths():
             return False, (
@@ -670,11 +751,37 @@ class SMBWizard:
             )
         return True, None
 
+    def check_share_name(self, name=None):
+        # Returns (ok, message), same calling convention as check_share_path.
+        # Kept tight (see SHARE_NAME_MAX_LEN/SHARE_NAME_RE above) because
+        # this value is written unescaped as a "[name]" section header into
+        # /etc/samba/smb.conf - an unrestricted name can inject arbitrary
+        # config directives.
+        check_name = self.share_name if name is None else name
+        return _validate_against(check_name, SHARE_NAME_MAX_LEN, SHARE_NAME_RE, "Share name")
+
+    @staticmethod
+    def check_username(username):
+        # Returns (ok, message). Same smb.conf-injection reasoning as
+        # check_share_name - usernames are written unescaped into
+        # "valid users"/"read list" lines. Static (doesn't touch instance
+        # state) so UI layers can validate a username without a wizard.
+        return _validate_against(username, USERNAME_MAX_LEN, USERNAME_RE, "Username")
+
     def dispatch_execution(self):
         ok, message = self.check_share_path()
         if not ok:
             print(message)
             return
+        ok, message = self.check_share_name()
+        if not ok:
+            print(message)
+            return
+        for u in self.users:
+            ok, message = self.check_username(u.get("username", ""))
+            if not ok:
+                print(message)
+                return
         if self.system == "Windows": self.run_windows()
         elif self.system == "Linux": self.run_linux()
         elif self.system == "Darwin": self.run_macos()
@@ -713,8 +820,36 @@ class SMBWizard:
         return tmp_path, relaunch_target, relaunch_args
 
     def _elevated_relaunch(self, arg_flag, payload):
+        # The elevated step (--apply, --create-user, ...) genuinely runs in
+        # a SEPARATE OS process (Start-Process/osascript/pkexec each launch
+        # a new one) - its print() output goes to whatever stdout THAT
+        # process inherited, which is not the same thing Python's
+        # contextlib.redirect_stdout intercepts back in the caller (that
+        # only catches print() calls made in-process). Left as plain
+        # inherited stdio, a caller capturing our stdout (every GUI action)
+        # would never see the elevated child's own "Success."/error output
+        # at all - including whether it actually succeeded, since success
+        # here is detected by string-matching that output. capture_output
+        # + printing it back through OUR OWN print() is what makes it show
+        # up in the caller's capture correctly. Safe to do for all three of
+        # these paths specifically because each already shows its own
+        # native auth UI (UAC/osascript/pkexec's polkit dialog) outside our
+        # process entirely - none of them need our stdin/stdout to be a
+        # real terminal. That's NOT true of the raw `sudo` fallback below
+        # (needs a real tty for its password prompt), which stays on
+        # inherited stdio - callers that could hit that path (no pkexec)
+        # must already be somewhere with a real terminal, per
+        # elevation_needs_terminal().
         print("Administrator/root privileges are required. Requesting elevation...")
         tmp_path, relaunch_target, relaunch_args = self._prepare_relaunch(arg_flag, payload)
+
+        def _run_capturing(args):
+            proc = _run(args, capture_output=True, text=True)
+            if proc.stdout:
+                print(proc.stdout, end="")
+            if proc.stderr:
+                print(proc.stderr, end="", file=sys.stderr)
+            return proc.returncode == 0
 
         try:
             if self.system == "Windows":
@@ -724,24 +859,25 @@ class SMBWizard:
                     f"-ArgumentList '{arg_str}' "
                     f"-Verb RunAs -Wait"
                 )
-                _run(["powershell", "-Command", cmd], check=True)
+                success = _run_capturing(["powershell", "-Command", cmd])
 
             elif self.system == "Darwin":
                 quoted_args = " ".join(f'"{a}"' for a in relaunch_args)
                 apply_cmd = f'{relaunch_target} {quoted_args}'
                 escaped = apply_cmd.replace('\\', '\\\\').replace('"', '\\"')
                 osa_cmd = f'do shell script "{escaped}" with administrator privileges'
-                _run(["osascript", "-e", osa_cmd], check=True)
+                success = _run_capturing(["osascript", "-e", osa_cmd])
 
             else:  # Linux
                 if shutil.which("pkexec"):
-                    _run(["pkexec", relaunch_target, *relaunch_args], check=True)
+                    success = _run_capturing(["pkexec", relaunch_target, *relaunch_args])
                 else:
                     print("No GUI privilege helper (pkexec) found; falling back to a terminal sudo prompt.")
                     _run(["sudo", relaunch_target, *relaunch_args], check=True)
+                    success = True
 
-            print("Elevated operation completed.")
-            return True
+            print("Elevated operation completed." if success else "Elevated operation failed - see output above.")
+            return success
         except subprocess.CalledProcessError:
             print("Elevation was cancelled or failed.")
             return False
@@ -1057,6 +1193,33 @@ class SMBWizard:
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
         wizard.unassign_group_from_share(data['group'], data['share'])
+
+    @staticmethod
+    def create_desktop_shortcut_windows():
+        # Run by the MSI's "Add desktop shortcut" checkbox on the final
+        # install screen (see nassie.wxs) - an immediate custom action with
+        # Impersonate="yes", so this runs as the logged-in user rather than
+        # the elevated installer, which is what makes
+        # [Environment]::GetFolderPath('Desktop') resolve to their actual
+        # Desktop instead of the SYSTEM profile's. WScript.Shell's
+        # CreateShortcut is the standard dependency-free way to create a
+        # .lnk from PowerShell - no pywin32/COM package needed.
+        wizard = SMBWizard()
+        exe_path = wizard._ps_quote(sys.executable)
+        cmd = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "$desktop = [Environment]::GetFolderPath('Desktop'); "
+            f"$s = $ws.CreateShortcut((Join-Path $desktop 'NASsie.lnk')); "
+            f"$s.TargetPath = '{exe_path}'; "
+            f"$s.WorkingDirectory = (Split-Path '{exe_path}'); "
+            f"$s.IconLocation = '{exe_path}'; "
+            "$s.Save()"
+        )
+        try:
+            _run(["powershell", "-Command", cmd], check=True, capture_output=True, text=True)
+            print("[Windows] Created desktop shortcut.")
+        except subprocess.CalledProcessError as e:
+            print(f"[Windows] Couldn't create desktop shortcut: {e.stderr}")
 
     _UNINSTALL_FOLDERS_RESULT_FILE = "nassie_uninstall_folders.json"
 
@@ -1908,6 +2071,14 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
 
     def _add_samba_share_config(self, share_name, share_path, users):
         # users: [{"username": ..., "read_only": bool}, ...]
+        # Guards this sink directly (not just dispatch_execution's earlier
+        # check) since share_name/share_path are written unescaped as this
+        # share's "[name]"/"path = ..." lines in smb.conf - see
+        # check_share_name's docstring.
+        for value, checker in ((share_name, self.check_share_name), (share_path, self.check_share_path)):
+            ok, message = checker(value)
+            if not ok:
+                raise ValueError(message)
         smb_conf = "/etc/samba/smb.conf"
         existing = ""
         if os.path.exists(smb_conf):
@@ -1948,6 +2119,13 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
     _LINUX_NOLOGIN_SHELL = "/usr/sbin/nologin"
 
     def _configure_linux_user(self, username, password):
+        # Guards every path that provisions a Linux account (initial share
+        # creation and adding a user to an existing share alike) since the
+        # username ends up written unescaped into smb.conf's "valid
+        # users"/"read list" lines - see check_username's docstring.
+        ok, message = self.check_username(username)
+        if not ok:
+            raise ValueError(message)
         exists = _run(["id", username], capture_output=True, text=True).returncode == 0
         if not exists:
             print(f"[Linux] Creating system user '{username}'...")
@@ -2360,7 +2538,19 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             print(f"[Linux] No such share: '{share_name}'")
             return False
 
-        self._configure_linux_user(username, password)
+        # password=None means "grant access without touching this
+        # account's Samba password" - Samba stores exactly one password
+        # per account (not one per share), so a user already attached to
+        # any other share already has valid credentials here; forcing a
+        # new password on every additional share they're granted access
+        # to was never actually necessary, just what happened by not
+        # checking. Only ever pass None for a username confirmed to
+        # already exist (the caller already knows this from list_users()).
+        if password is not None:
+            self._configure_linux_user(username, password)
+        elif _run(["id", username], capture_output=True, text=True).returncode != 0:
+            print(f"[Linux] '{username}' doesn't exist and no password was given to create it.")
+            return False
 
         group_name = share.get("group") or self._share_group_name(share_name)
         self._ensure_group(group_name)
@@ -2657,7 +2847,19 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             print(f"[macOS] No such share: '{share_name}'")
             return False
 
-        self._configure_macos_user(username, password)
+        # password=None means "grant access without touching this
+        # account's password" - see _add_user_to_share_linux's comment
+        # for the general reasoning (an account already attached to any
+        # other share already has valid credentials). Doubly true here:
+        # macOS has no separate SMB password store at all, so
+        # _configure_macos_user's dscl -passwd would reset this person's
+        # actual login password, not just their file-sharing one. Only
+        # ever pass None for a username confirmed to already exist.
+        if password is not None:
+            self._configure_macos_user(username, password)
+        elif _run(["dscl", ".", "-read", f"/Users/{username}"], capture_output=True, text=True).returncode != 0:
+            print(f"[macOS] '{username}' doesn't exist and no password was given to create it.")
+            return False
 
         group_name = share.get("group") or self._macos_group_name(share_name)
         self._ensure_macos_group(group_name)

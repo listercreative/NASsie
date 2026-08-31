@@ -12,8 +12,7 @@ class CLIWizard(SMBWizard):
     def _pick_or_type_username(self, prompt="   Username: "):
         # Existing usernames one selection away (no risk of a typo against a
         # name that already exists), but typing a new one still works -
-        # this can create a brand-new user, unlike group membership which
-        # requires an existing one.
+        # this can create a brand-new user.
         users = self.list_users()
         if not users:
             return console.input(prompt).strip()
@@ -53,8 +52,9 @@ class CLIWizard(SMBWizard):
         console.print(Panel("[bold blue]New SMB Share Creation[/bold blue]", expand=False))
 
         self.share_name = console.input("[bold]1. Enter the name for the share: [/bold]").strip()
-        if not self.share_name:
-            console.print("[red]Error: Name cannot be empty.[/red]")
+        name_ok, name_message = self.check_share_name(self.share_name)
+        if not name_ok:
+            console.print(f"[red]Error: {name_message}[/red]")
             return False
 
         default_path = self.default_share_path(self.share_name)
@@ -69,11 +69,20 @@ class CLIWizard(SMBWizard):
         else:
             self.share_path = default_path
 
+        path_ok, path_message = self.check_share_path(self.share_path)
+        if not path_ok:
+            console.print(f"[red]Error: {path_message}[/red]")
+            return False
+
         console.print("\n[bold]3. User Configuration (Enter username, then password. Empty username to finish)[/bold]")
         self.users = []
         while True:
             username = self._pick_or_type_username()
             if not username: break
+            username_ok, username_message = self.check_username(username)
+            if not username_ok:
+                console.print(f"[red]Error: {username_message}[/red]")
+                continue
             password = getpass.getpass(f"   Password for {username}: ")
             read_only = console.input(f"   Read-only access for {username}? [y/N] ").strip().lower() in ('y', 'yes')
             self.users.append({'username': username, 'password': password, 'read_only': read_only})
@@ -137,22 +146,6 @@ class CLIWizard(SMBWizard):
             else:
                 print("Failed to remove share (or elevation was cancelled).")
 
-    def manage_users_and_groups(self):
-        while True:
-            print("\n=== Users & Groups ===")
-            print("1. Users")
-            print("2. Groups")
-            print("3. Back")
-            choice = input("Select an option: ").strip()
-            if choice == '1':
-                self._manage_users_screen()
-            elif choice == '2':
-                self._manage_groups_screen()
-            elif choice == '3':
-                return
-            else:
-                print("Invalid option.")
-
     def _manage_users_screen(self):
         # Two-step picker throughout (pick the user by number, then a
         # numbered menu of just that user's actions) rather than the old
@@ -168,8 +161,6 @@ class CLIWizard(SMBWizard):
                 print("No users found.")
             for i, u in enumerate(users):
                 print(f"{i}. {u['username']}")
-                for g in u["groups"]:
-                    print(f"\tgroup: {g}")
                 for s in u["shares"]:
                     suffix = " (read-only)" if access_lookup.get((s, u["username"])) else ""
                     print(f"\tshare: {s}{suffix}")
@@ -203,9 +194,7 @@ class CLIWizard(SMBWizard):
                 continue
             user = users[int(choice)]
 
-            sub_options = ["Assign to group"]
-            if user["groups"]:
-                sub_options.append("Remove from group")
+            sub_options = []
             if user["shares"]:
                 sub_options.append("Revoke share access")
                 sub_options.append("Change Access Level")
@@ -224,36 +213,6 @@ class CLIWizard(SMBWizard):
 
             if action == "Back":
                 continue
-            elif action == "Assign to group":
-                groups = self.list_groups()
-                if not groups:
-                    print("No groups exist to assign to.")
-                    continue
-                print("Groups:")
-                for gi, g in enumerate(groups):
-                    print(f"  {gi}. {g['name']}")
-                gidx = input("Which group number? ").strip()
-                if not gidx.isdigit() or not (0 <= int(gidx) < len(groups)):
-                    print("Invalid group number.")
-                    continue
-                group_name = groups[int(gidx)]['name']
-                if self.assign_user_to_group(user['username'], group_name):
-                    print(f"Added '{user['username']}' to group '{group_name}'.")
-                else:
-                    print("Failed to assign group (or elevation was cancelled).")
-            elif action == "Remove from group":
-                print("Groups:")
-                for gi, gname in enumerate(user["groups"]):
-                    print(f"  {gi}. {gname}")
-                gidx = input("Which group number to remove from? ").strip()
-                if not gidx.isdigit() or not (0 <= int(gidx) < len(user["groups"])):
-                    print("Invalid group number.")
-                    continue
-                group_name = user["groups"][int(gidx)]
-                if self.revoke_group_membership(user['username'], group_name):
-                    print(f"Removed '{user['username']}' from group '{group_name}'.")
-                else:
-                    print("Failed to remove from group (or elevation was cancelled).")
             elif action == "Revoke share access":
                 print("Shares:")
                 for si, sname in enumerate(user["shares"]):
@@ -263,6 +222,9 @@ class CLIWizard(SMBWizard):
                     print("Invalid share number.")
                     continue
                 share_name = user["shares"][int(sidx)]
+                confirm = input(f"Revoke '{user['username']}''s access to '{share_name}'? [y/N] ").strip().lower()
+                if confirm not in ('y', 'yes'):
+                    continue
                 if self.revoke_share_access(share_name, user["username"]):
                     print(f"Revoked '{user['username']}''s access to '{share_name}'.")
                 else:
@@ -336,189 +298,9 @@ class CLIWizard(SMBWizard):
                 else:
                     print("Failed to delete user (or elevation was cancelled).")
 
-    def _manage_groups_screen(self):
-        # Same two-step picker as _manage_users_screen: pick the group by
-        # number, then a numbered menu of just that group's actions. Groups
-        # shown here are only the admin-created access-control kind (New
-        # Group) - a share's own auto-created ownership group is filesystem-
-        # permission-only and never shown, see core.py's _MANAGED_GROUP_PREFIX.
-        while True:
-            groups = self.list_groups()
-
-            console.print("\n[bold]--- Groups ---[/bold]")
-            if not groups:
-                print("No groups yet.")
-            for i, g in enumerate(groups):
-                print(f"{i}. {g['name']}")
-                for m in g["members"]:
-                    print(f"\tuser: {m}")
-                for s in g["shares"]:
-                    print(f"\tshare: {s}")
-
-            choice = input(
-                "\nEnter a group number to manage, 'n' for a new group, or press Enter to return: "
-            ).strip().lower()
-            if not choice:
-                return
-            if choice == 'n':
-                name = input("New group name: ").strip()
-                if not name:
-                    continue
-                system_name = self.add_group(name)
-                if system_name:
-                    print(f"Created group '{system_name}'.")
-                else:
-                    print("Failed to create group (or elevation was cancelled).")
-                continue
-            if not choice.isdigit() or not (0 <= int(choice) < len(groups)):
-                print("Invalid option.")
-                continue
-            group = groups[int(choice)]
-
-            sub_options = ["Add member"]
-            if group["members"]:
-                sub_options.append("Remove member")
-            if group["members"] and group["shares"]:
-                sub_options.append("Set Access Level")
-            sub_options.append("Assign to share")
-            if group["shares"]:
-                sub_options.append("Remove from share")
-            sub_options.append("Delete group")
-            sub_options.append("Back")
-
-            print(f"\n--- {group['name']} ---")
-            for si, label in enumerate(sub_options, start=1):
-                print(f"{si}. {label}")
-            sub = input("Select an option: ").strip()
-            if not sub.isdigit() or not (1 <= int(sub) <= len(sub_options)):
-                print("Invalid option.")
-                continue
-            action = sub_options[int(sub) - 1]
-
-            if action == "Back":
-                continue
-            elif action == "Add member":
-                # A pick-list of existing users, not free text: adding a
-                # member requires an already-existing account (unlike a
-                # share's "Add user", which can create one) - the underlying
-                # action validates and refuses otherwise, so free text here
-                # could only ever fail.
-                users = self.list_users()
-                if not users:
-                    print("No existing users to add. Create one via a share's 'Add user' first.")
-                    continue
-                print("Users:")
-                for ui, u in enumerate(users):
-                    print(f"  {ui}. {u['username']}")
-                uidx = input("Which user number to add? ").strip()
-                if not uidx.isdigit() or not (0 <= int(uidx) < len(users)):
-                    print("Invalid user number.")
-                    continue
-                username = users[int(uidx)]['username']
-                if self.assign_user_to_group(username, group['name']):
-                    print(f"Added '{username}' to group '{group['name']}'.")
-                else:
-                    print("Failed to add member (or elevation was cancelled).")
-            elif action == "Remove member":
-                print("Members:")
-                for mi, mname in enumerate(group["members"]):
-                    print(f"  {mi}. {mname}")
-                midx = input("Which member number to remove? ").strip()
-                if not midx.isdigit() or not (0 <= int(midx) < len(group["members"])):
-                    print("Invalid member number.")
-                    continue
-                member_name = group["members"][int(midx)]
-                if self.revoke_group_membership(member_name, group['name']):
-                    print(f"Removed '{member_name}' from group '{group['name']}'.")
-                else:
-                    print("Failed to remove member (or elevation was cancelled).")
-            elif action == "Set Access Level":
-                # Bulk-applies to every CURRENT member of the group, right
-                # now - not a persistent group-level grant. Someone added
-                # to the group later doesn't automatically inherit this.
-                if len(group["shares"]) == 1:
-                    share_name = group["shares"][0]
-                else:
-                    print("Shares:")
-                    for si, sname in enumerate(group["shares"]):
-                        print(f"  {si}. {sname}")
-                    sidx = input("Set access level on which share? ").strip()
-                    if not sidx.isdigit() or not (0 <= int(sidx) < len(group["shares"])):
-                        print("Invalid share number.")
-                        continue
-                    share_name = group["shares"][int(sidx)]
-                level = input("Set every current member to (r)ead-write or (o)nly read-only? [r/o] ").strip().lower()
-                if level not in ('r', 'o'):
-                    print("Invalid option.")
-                    continue
-                read_only = level == 'o'
-                confirm = input(
-                    f"Apply {'read-only' if read_only else 'read-write'} access to all "
-                    f"{len(group['members'])} current member(s) of '{group['name']}' on '{share_name}'? [y/N] "
-                ).strip().lower()
-                if confirm not in ('y', 'yes'):
-                    continue
-                if self.change_group_access(group['name'], share_name, read_only):
-                    print(f"Set '{group['name']}''s members to {'read-only' if read_only else 'read-write'} on '{share_name}'.")
-                else:
-                    print("Failed to change access level (or elevation was cancelled).")
-            elif action == "Assign to share":
-                # A real, persistent grant (unlike "Set Access Level" above)
-                # - any current or future member of the group gets this
-                # access, since Windows/Samba/macOS all resolve group
-                # membership live at connect time.
-                shares = self.list_shares()
-                if not shares:
-                    print("No shares exist yet.")
-                    continue
-                print("Shares:")
-                for si, s in enumerate(shares):
-                    print(f"  {si}. {s['name']}")
-                sidx = input("Grant access to which share? ").strip()
-                if not sidx.isdigit() or not (0 <= int(sidx) < len(shares)):
-                    print("Invalid share number.")
-                    continue
-                share_name = shares[int(sidx)]["name"]
-                level = input("Grant members (r)ead-write or (o)nly read-only? [r/o] ").strip().lower()
-                if level not in ('r', 'o'):
-                    print("Invalid option.")
-                    continue
-                read_only = level == 'o'
-                if self.grant_group_share_access(group['name'], share_name, read_only):
-                    print(f"Assigned '{group['name']}' to '{share_name}' ({'read-only' if read_only else 'read-write'}).")
-                else:
-                    print("Failed to assign group to share (or elevation was cancelled).")
-            elif action == "Remove from share":
-                if len(group["shares"]) == 1:
-                    share_name = group["shares"][0]
-                else:
-                    print("Shares:")
-                    for si, sname in enumerate(group["shares"]):
-                        print(f"  {si}. {sname}")
-                    sidx = input("Remove access from which share? ").strip()
-                    if not sidx.isdigit() or not (0 <= int(sidx) < len(group["shares"])):
-                        print("Invalid share number.")
-                        continue
-                    share_name = group["shares"][int(sidx)]
-                confirm = input(f"Remove '{group['name']}''s access to '{share_name}'? [y/N] ").strip().lower()
-                if confirm not in ('y', 'yes'):
-                    continue
-                if self.revoke_group_share_access(group['name'], share_name):
-                    print(f"Removed '{group['name']}''s access to '{share_name}'.")
-                else:
-                    print("Failed to remove group's access (or elevation was cancelled).")
-            else:
-                confirm = input(f"Delete group '{group['name']}'? [y/N] ").strip().lower()
-                if confirm not in ('y', 'yes'):
-                    continue
-                if self.remove_group(group["name"]):
-                    print(f"Deleted group '{group['name']}'.")
-                else:
-                    print("Failed to delete group (or elevation was cancelled).")
-
     def start(self):
         while True:
-            options = ["Create New Share", "Manage Existing Shares", "Manage Users & Groups"]
+            options = ["Create New Share", "Manage Existing Shares", "Manage Users"]
             if self.gui_available():
                 options.append("Launch Desktop UI")
             options.append("Exit")
@@ -553,8 +335,8 @@ class CLIWizard(SMBWizard):
                             self._offer_qr_code(self.share_name, user['username'], user['password'])
             elif selected == "Manage Existing Shares":
                 self.manage_shares()
-            elif selected == "Manage Users & Groups":
-                self.manage_users_and_groups()
+            elif selected == "Manage Users":
+                self._manage_users_screen()
             elif selected == "Launch Desktop UI":
                 try:
                     from gui import GUIWizard
