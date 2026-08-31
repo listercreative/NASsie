@@ -295,57 +295,12 @@ class TUIWizard:
                 print(f"'{action['username']}' is now {level} on '{action['share']}'.")
             else:
                 print("Failed to change access level (or elevation was cancelled).")
-        elif kind == "group_access":
-            level = "read-only" if action["read_only"] else "read-write"
-            print(f"\n--- Setting '{action['group']}''s members to {level} on '{action['share']}' ---")
-            if self.wizard.change_group_access(action["group"], action["share"], action["read_only"]):
-                print(f"'{action['group']}''s members are now {level} on '{action['share']}'.")
-            else:
-                print("Failed to change access level (or elevation was cancelled).")
         elif kind == "delete_user":
             print(f"\n--- Deleting user '{action['username']}' ---")
             if self.wizard.remove_user(action["username"]):
                 print(f"Deleted user '{action['username']}'.")
             else:
                 print("Failed to delete user (or elevation was cancelled).")
-        elif kind == "delete_group":
-            print(f"\n--- Deleting group '{action['name']}' ---")
-            if self.wizard.remove_group(action["name"]):
-                print(f"Deleted group '{action['name']}'.")
-            else:
-                print("Failed to delete group (or elevation was cancelled).")
-        elif kind == "assign_group":
-            print(f"\n--- Adding '{action['username']}' to group '{action['group']}' ---")
-            if self.wizard.assign_user_to_group(action["username"], action["group"]):
-                print(f"Added '{action['username']}' to group '{action['group']}'.")
-            else:
-                print("Failed to assign group (or elevation was cancelled).")
-        elif kind == "revoke_group":
-            print(f"\n--- Removing '{action['username']}' from group '{action['group']}' ---")
-            if self.wizard.revoke_group_membership(action["username"], action["group"]):
-                print(f"Removed '{action['username']}' from group '{action['group']}'.")
-            else:
-                print("Failed to remove from group (or elevation was cancelled).")
-        elif kind == "create_group":
-            print(f"\n--- Creating group '{action['name']}' ---")
-            system_name = self.wizard.add_group(action["name"])
-            if system_name:
-                print(f"Created group '{system_name}'.")
-            else:
-                print("Failed to create group (or elevation was cancelled).")
-        elif kind == "assign_group_share":
-            level = "read-only" if action["read_only"] else "read-write"
-            print(f"\n--- Assigning '{action['group']}' to '{action['share']}' ({level}) ---")
-            if self.wizard.grant_group_share_access(action["group"], action["share"], action["read_only"]):
-                print(f"Assigned '{action['group']}' to '{action['share']}'.")
-            else:
-                print("Failed to assign group to share (or elevation was cancelled).")
-        elif kind == "unassign_group_share":
-            print(f"\n--- Removing '{action['group']}''s access to '{action['share']}' ---")
-            if self.wizard.revoke_group_share_access(action["group"], action["share"]):
-                print(f"Removed '{action['group']}''s access to '{action['share']}'.")
-            else:
-                print("Failed to remove group's access (or elevation was cancelled).")
 
     def _launch_gui_outside_curses(self):
         try:
@@ -417,18 +372,6 @@ class TUIWizard:
                 )
                 print(output, end="")
             print(f"'{username}' is now {level} on '{share}'." if ok else "Failed to change access level.")
-        elif kind == "group_access":
-            group, share, read_only = action["group"], action["share"], action["read_only"]
-            level = "read-only" if read_only else "read-write"
-            print(f"--- Setting '{group}''s members to {level} on '{share}' ---")
-            if self.wizard.has_admin_privileges():
-                ok = self.wizard.set_group_access_level(group, share, read_only)
-            else:
-                ok, output = self.wizard._elevated_relaunch_capturing(
-                    "--change-group-access", {"group": group, "share": share, "read_only": read_only}
-                )
-                print(output, end="")
-            print(f"'{group}''s members are now {level} on '{share}'." if ok else "Failed to change access level.")
         elif kind == "revoke_access":
             share, username = action["share"], action["username"]
             print(f"--- Revoking '{username}''s access to '{share}' ---")
@@ -449,69 +392,6 @@ class TUIWizard:
                 ok, output = self.wizard._elevated_relaunch_capturing("--delete-user", {"username": username})
                 print(output, end="")
             print(f"Deleted user '{username}'." if ok else "Failed to delete user.")
-        elif kind == "delete_group":
-            name = action["name"]
-            print(f"--- Deleting group '{name}' ---")
-            if self.wizard.has_admin_privileges():
-                ok = self.wizard.delete_group(name)
-            else:
-                ok, output = self.wizard._elevated_relaunch_capturing("--delete-group", {"name": name})
-                print(output, end="")
-            print(f"Deleted group '{name}'." if ok else "Failed to delete group.")
-        elif kind == "assign_group":
-            username, group = action["username"], action["group"]
-            print(f"--- Adding '{username}' to group '{group}' ---")
-            if self.wizard.has_admin_privileges():
-                ok = self.wizard.add_user_to_group(username, group)
-            else:
-                ok, output = self.wizard._elevated_relaunch_capturing(
-                    "--assign-group", {"username": username, "group": group}
-                )
-                print(output, end="")
-            print(f"Added '{username}' to group '{group}'." if ok else "Failed to assign group.")
-        elif kind == "revoke_group":
-            username, group = action["username"], action["group"]
-            print(f"--- Removing '{username}' from group '{group}' ---")
-            if self.wizard.has_admin_privileges():
-                ok = self.wizard.remove_user_from_group(username, group)
-            else:
-                ok, output = self.wizard._elevated_relaunch_capturing(
-                    "--revoke-group", {"username": username, "group": group}
-                )
-                print(output, end="")
-            print(f"Removed '{username}' from group '{group}'." if ok else "Failed to remove from group.")
-        elif kind == "create_group":
-            name = action["name"]
-            print(f"--- Creating group '{name}' ---")
-            if self.wizard.has_admin_privileges():
-                ok = self.wizard.create_group(name)
-            else:
-                ok, output = self.wizard._elevated_relaunch_capturing("--create-group", {"name": name})
-                print(output, end="")
-            print(f"Created group '{name}'." if ok else "Failed to create group.")
-        elif kind == "assign_group_share":
-            group, share, read_only = action["group"], action["share"], action["read_only"]
-            level = "read-only" if read_only else "read-write"
-            print(f"--- Assigning '{group}' to '{share}' ({level}) ---")
-            if self.wizard.has_admin_privileges():
-                ok = self.wizard.assign_group_to_share(group, share, read_only)
-            else:
-                ok, output = self.wizard._elevated_relaunch_capturing(
-                    "--assign-group-share", {"group": group, "share": share, "read_only": read_only}
-                )
-                print(output, end="")
-            print(f"Assigned '{group}' to '{share}'." if ok else "Failed to assign group to share.")
-        elif kind == "unassign_group_share":
-            group, share = action["group"], action["share"]
-            print(f"--- Removing '{group}''s access to '{share}' ---")
-            if self.wizard.has_admin_privileges():
-                ok = self.wizard.unassign_group_from_share(group, share)
-            else:
-                ok, output = self.wizard._elevated_relaunch_capturing(
-                    "--unassign-group-share", {"group": group, "share": share}
-                )
-                print(output, end="")
-            print(f"Removed '{group}''s access to '{share}'." if ok else "Failed to remove group's access.")
 
     def _run_privileged_action(self, stdscr, busy_message, work_fn):
         # Runs work_fn() (which prints via stdout) in a background thread
@@ -557,7 +437,7 @@ class TUIWizard:
         curses.curs_set(0)
         self._init_colors()
         while True:
-            options = ["Create New Share", "Manage Existing Shares", "Manage Users & Groups"]
+            options = ["Create New Share", "Manage Existing Shares", "Manage Users"]
             if self.wizard.gui_available():
                 options.append("Launch Desktop UI")
             options.append("Exit")
@@ -600,12 +480,12 @@ class TUIWizard:
                     elif action["action"] == "add_user":
                         result["add_user"] = action
                     return
-            elif selected == "Manage Users & Groups":
-                # _users_groups_flow only returns non-None when the action
+            elif selected == "Manage Users":
+                # _users_screen_flow only returns non-None when the action
                 # genuinely needs the terminal - the fast in-curses path
                 # (via _apply_or_bubble) already applied and looped
                 # internally.
-                action = self._users_groups_flow(stdscr)
+                action = self._users_screen_flow(stdscr)
                 if action:
                     result["users_groups_action"] = action
                     return
@@ -727,8 +607,8 @@ class TUIWizard:
     def _tree_menu(self, stdscr, title, items, subtitle=None):
         # Like _menu, but each entry can carry its own non-selectable,
         # indented context lines shown directly beneath it (e.g. a user's
-        # groups/shares) - only the top-level entries are navigable, so
-        # there's no separate options list duplicating the same names.
+        # shares) - only the top-level entries are navigable, so there's
+        # no separate options list duplicating the same names.
         # items: list of (label, sublines). Esc/q cancels - no "Back" entry
         # needed since that's exactly what Esc already does.
         idx = 0
@@ -914,9 +794,8 @@ class TUIWizard:
     def _pick_or_type_username(self, stdscr, title="Username:"):
         # Existing usernames one click away (no risk of a typo against a
         # name that already exists), but typing a new one still works -
-        # this can create a brand-new user, unlike group membership which
-        # requires an existing one. Skips straight to free text if there's
-        # nothing to pick from yet.
+        # this can create a brand-new user. Skips straight to free text if
+        # there's nothing to pick from yet.
         existing = [u["username"] for u in self.wizard.list_users()]
         if existing:
             options = existing + ["+ New user..."]
@@ -941,6 +820,10 @@ class TUIWizard:
                 username = self._pick_or_type_username(stdscr)
                 if not username:
                     continue
+                username_ok, username_message = self.wizard.check_username(username)
+                if not username_ok:
+                    self._message(stdscr, username_message)
+                    continue
                 password = self._text_input(stdscr, f"Password for {username}:", password=True)
                 if not password:
                     continue
@@ -954,29 +837,41 @@ class TUIWizard:
                 del users[idx]
 
     def _create_share_flow(self, stdscr):
-        name = self._text_input(stdscr, "1. Share name:")
-        if not name:
-            return None
+        while True:
+            name = self._text_input(stdscr, "1. Share name:")
+            if not name:
+                return None
+            name_ok, name_message = self.wizard.check_share_name(name)
+            if not name_ok:
+                self._message(stdscr, name_message)
+                continue
+            break
 
         default_path = self.wizard.default_share_path(name)
-        choice = self._menu(stdscr, "2. Share path", [
-            f"Use default: {default_path}",
-            "Browse for a folder (cursor keys)",
-            "Type a path manually",
-        ])
-        if choice is None:
-            return None
-        if choice == 0:
-            path = default_path
-        elif choice == 1:
-            picked = self._directory_picker(stdscr, self.wizard._real_home())
-            if not picked:
+        while True:
+            choice = self._menu(stdscr, "2. Share path", [
+                f"Use default: {default_path}",
+                "Browse for a folder (cursor keys)",
+                "Type a path manually",
+            ])
+            if choice is None:
                 return None
-            path = picked
-        else:
-            path = self._text_input(stdscr, "3. Path:")
-            if not path:
-                return None
+            if choice == 0:
+                path = default_path
+            elif choice == 1:
+                picked = self._directory_picker(stdscr, self.wizard._real_home())
+                if not picked:
+                    return None
+                path = picked
+            else:
+                path = self._text_input(stdscr, "3. Path:")
+                if not path:
+                    return None
+            path_ok, path_message = self.wizard.check_share_path(path)
+            if not path_ok:
+                self._message(stdscr, path_message)
+                continue
+            break
 
         users = self._manage_users(stdscr)
 
@@ -1035,6 +930,10 @@ class TUIWizard:
                 username = self._pick_or_type_username(stdscr)
                 if not username:
                     continue
+                username_ok, username_message = self.wizard.check_username(username)
+                if not username_ok:
+                    self._message(stdscr, username_message)
+                    continue
                 password = self._text_input(stdscr, f"Password for {username}:", password=True)
                 if not password:
                     continue
@@ -1070,37 +969,22 @@ class TUIWizard:
                     )
             # loop back and show the (refreshed) share list again
 
-    def _users_groups_flow(self, stdscr):
-        # Returns an action dict to apply outside curses (revoke_access /
-        # delete_user / delete_group / assign_group / revoke_group /
-        # create_group / assign_group_share / unassign_group_share), or
-        # None once the user backs all the way out (Esc/q at any level -
-        # no separate "Back" entries needed). Users and Groups are
-        # deliberately separate screens - easier to look at one without the
-        # other in the way, rather than one merged list.
-        while True:
-            choice = self._menu(stdscr, "Users & Groups", ["Users", "Groups"])
-            if choice is None:
-                return None
-            action = self._users_screen_flow(stdscr) if choice == 0 else self._groups_screen_flow(stdscr)
-            if action:
-                return action
-            # otherwise the user backed out of that screen - show the chooser again
-
     def _users_screen_flow(self, stdscr):
+        # Returns an action dict to apply outside curses (revoke_access /
+        # delete_user), or None once the user backs all the way out (Esc/q
+        # at any level - no separate "Back" entry needed).
         while True:
             users = self.wizard.list_users()
             access_lookup = self.wizard.build_access_lookup(self.wizard.list_shares())
 
             # "+ New User" always available, even with no existing users -
-            # a standalone account not attached to any share or group, so a
-            # user doesn't have to create a throwaway share just to get an
+            # a standalone account not attached to any share, so a user
+            # doesn't have to create a throwaway share just to get an
             # account to exist.
             items = [("+ New User", [])] + [
                 (
                     u["username"],
-                    [f"group: {g}" for g in u["groups"]]
-                    + [
+                    [
                         f"share: {s}" + (" (read-only)" if access_lookup.get((s, u["username"])) else "")
                         for s in u["shares"]
                     ],
@@ -1130,45 +1014,12 @@ class TUIWizard:
                 return action
             # otherwise back out of the submenu - show this screen again
 
-    def _groups_screen_flow(self, stdscr):
-        while True:
-            groups = self.wizard.list_groups()
-
-            # "+ New Group" always available, even with no existing groups -
-            # a standalone access-control group, not tied to any share
-            # until explicitly assigned via "Assign to share". Unlike a
-            # share's own auto-created ownership group (filesystem-
-            # permission-only), this is never created automatically.
-            items = [("+ New Group", [])] + [
-                (g["name"], [f"user: {m}" for m in g["members"]] + [f"share: {s}" for s in g["shares"]])
-                for g in groups
-            ]
-            idx = self._tree_menu(stdscr, "Groups", items, subtitle="Select a group to manage")
-            if idx is None:
-                return None
-
-            if idx == 0:
-                name = self._text_input(stdscr, "Group name:")
-                if not name:
-                    continue
-                action = self._apply_or_bubble(stdscr, {"action": "create_group", "name": name})
-                if action:
-                    return action
-                continue
-
-            action = self._manage_group_flow(stdscr, groups[idx - 1])
-            if action:
-                return action
-            # otherwise back out of the submenu - show this screen again
-
     def _manage_user_flow(self, stdscr, user):
         # Returns an action dict only when it genuinely needs the terminal
         # (see elevation_needs_terminal()) - otherwise applies it right here
         # and returns None, same as backing out, so the caller's loop just
         # re-shows the (refreshed) list instead of bubbling to the main menu.
-        sub_options = ["Assign to group"]
-        if user["groups"]:
-            sub_options.append("Remove from group")
+        sub_options = []
         if user["shares"]:
             sub_options.append("Revoke share access")
             sub_options.append("Change Access Level")
@@ -1176,7 +1027,7 @@ class TUIWizard:
         sub_options.append("Delete user")
         sub_idx = self._menu(
             stdscr, user["username"], sub_options,
-            subtitle=f"groups: {', '.join(user['groups']) or '(none)'}  shares: {', '.join(user['shares']) or '(none)'}"
+            subtitle=f"shares: {', '.join(user['shares']) or '(none)'}"
         )
         if sub_idx is None:
             return None
@@ -1256,28 +1107,17 @@ class TUIWizard:
                 )
             return None
 
-        elif choice == "Assign to group":
-            groups = self.wizard.list_groups()
-            if not groups:
-                self._message(stdscr, "No groups exist to assign to.")
-                return None
-            group_options = [g["name"] for g in groups]
-            gidx = self._menu(stdscr, "Assign to which group?", group_options)
-            if gidx is None:
-                return None
-            action = {"action": "assign_group", "username": user["username"], "group": group_options[gidx]}
-
-        elif choice == "Remove from group":
-            gidx = self._menu(stdscr, "Remove from which group?", user["groups"])
-            if gidx is None:
-                return None
-            action = {"action": "revoke_group", "username": user["username"], "group": user["groups"][gidx]}
-
         elif choice == "Revoke share access":
             sidx = self._menu(stdscr, "Revoke access to which share?", user["shares"])
             if sidx is None:
                 return None
-            action = {"action": "revoke_access", "share": user["shares"][sidx], "username": user["username"]}
+            share_name = user["shares"][sidx]
+            confirm = self._menu(
+                stdscr, f"Revoke '{user['username']}''s access to '{share_name}'?", ["Yes, revoke", "Cancel"]
+            )
+            if confirm != 0:
+                return None
+            action = {"action": "revoke_access", "share": share_name, "username": user["username"]}
 
         else:
             confirm = self._menu(stdscr, f"Delete user '{user['username']}'?", ["Yes, delete", "Cancel"])
@@ -1287,131 +1127,12 @@ class TUIWizard:
 
         return self._apply_or_bubble(stdscr, action)
 
-    def _manage_group_flow(self, stdscr, group):
-        # Same contract as _manage_user_flow: only returns non-None when
-        # elevation genuinely needs the terminal.
-        sub_options = ["Add member"]
-        if group["members"]:
-            sub_options.append("Remove member")
-        if group["members"] and group["shares"]:
-            sub_options.append("Set Access Level")
-        sub_options.append("Assign to share")
-        if group["shares"]:
-            sub_options.append("Remove from share")
-        sub_options.append("Delete group")
-        sub_idx = self._menu(
-            stdscr, group["name"], sub_options,
-            subtitle=f"members: {', '.join(group['members']) or '(none)'}  shares: {', '.join(group['shares']) or '(none)'}"
-        )
-        if sub_idx is None:
-            return None
-        choice = sub_options[sub_idx]
-
-        if choice == "Set Access Level":
-            # Bulk-applies to every CURRENT member of the group, right now -
-            # not a persistent group-level grant. Someone added to the
-            # group later doesn't automatically inherit this.
-            if len(group["shares"]) == 1:
-                share_name = group["shares"][0]
-            else:
-                sidx = self._menu(stdscr, "Set access level on which share?", group["shares"])
-                if sidx is None:
-                    return None
-                share_name = group["shares"][sidx]
-            level_choice = self._menu(
-                stdscr, f"Set every current member of '{group['name']}' to:", ["Read-write", "Read-only"]
-            )
-            if level_choice is None:
-                return None
-            read_only = level_choice == 1
-            confirm = self._menu(
-                stdscr,
-                f"Apply {'read-only' if read_only else 'read-write'} to all "
-                f"{len(group['members'])} member(s) of '{group['name']}' on '{share_name}'?",
-                ["Yes, apply", "Cancel"],
-            )
-            if confirm != 0:
-                return None
-            action = {"action": "group_access", "group": group["name"], "share": share_name, "read_only": read_only}
-
-        elif choice == "Add member":
-            # A pick-list of existing users, not free text: adding a member
-            # requires an already-existing account (unlike a share's "Add
-            # user", which can create one) - the underlying action validates
-            # and refuses otherwise, so free text here could only ever fail.
-            usernames = [u["username"] for u in self.wizard.list_users()]
-            if not usernames:
-                self._message(stdscr, "No existing users to add. Create one via a share's 'Add user' first.")
-                return None
-            uidx = self._menu(stdscr, f"Add which user to '{group['name']}'?", usernames)
-            if uidx is None:
-                return None
-            action = {"action": "assign_group", "username": usernames[uidx], "group": group["name"]}
-
-        elif choice == "Remove member":
-            midx = self._menu(stdscr, "Remove which member?", group["members"])
-            if midx is None:
-                return None
-            action = {"action": "revoke_group", "username": group["members"][midx], "group": group["name"]}
-
-        elif choice == "Assign to share":
-            # A real, persistent grant (unlike "Set Access Level" above) -
-            # any current or future member of the group gets this access,
-            # since Windows/Samba/macOS all resolve group membership live
-            # at connect time.
-            shares = [s["name"] for s in self.wizard.list_shares()]
-            if not shares:
-                self._message(stdscr, "No shares exist yet.")
-                return None
-            sidx = self._menu(stdscr, f"Grant '{group['name']}' access to which share?", shares)
-            if sidx is None:
-                return None
-            share_name = shares[sidx]
-            level_choice = self._menu(stdscr, f"Grant '{group['name']}' members:", ["Read-write", "Read-only"])
-            if level_choice is None:
-                return None
-            read_only = level_choice == 1
-            confirm = self._menu(
-                stdscr,
-                f"Grant '{group['name']}' {'read-only' if read_only else 'read-write'} access to '{share_name}'? "
-                f"Every current and future member gets this access.",
-                ["Yes, assign", "Cancel"],
-            )
-            if confirm != 0:
-                return None
-            action = {
-                "action": "assign_group_share", "group": group["name"], "share": share_name, "read_only": read_only
-            }
-
-        elif choice == "Remove from share":
-            if len(group["shares"]) == 1:
-                share_name = group["shares"][0]
-            else:
-                sidx = self._menu(stdscr, f"Remove '{group['name']}' from which share?", group["shares"])
-                if sidx is None:
-                    return None
-                share_name = group["shares"][sidx]
-            confirm = self._menu(
-                stdscr, f"Remove '{group['name']}''s access to '{share_name}'?", ["Yes, remove", "Cancel"]
-            )
-            if confirm != 0:
-                return None
-            action = {"action": "unassign_group_share", "group": group["name"], "share": share_name}
-
-        else:
-            confirm = self._menu(stdscr, f"Delete group '{group['name']}'?", ["Yes, delete", "Cancel"])
-            if confirm != 0:
-                return None
-            action = {"action": "delete_group", "name": group["name"]}
-
-        return self._apply_or_bubble(stdscr, action)
-
     def _apply_or_bubble(self, stdscr, action):
-        # Shared by _manage_user_flow/_manage_group_flow: returns the action
-        # dict when elevation needs the terminal (the caller bubbles it up
-        # to run(), which applies it outside curses), otherwise applies it
-        # right here in-curses and returns None - same as backing out, so
-        # the caller's own loop just re-shows the refreshed list instead of
+        # Shared by _manage_user_flow: returns the action dict when
+        # elevation needs the terminal (the caller bubbles it up to run(),
+        # which applies it outside curses), otherwise applies it right here
+        # in-curses and returns None - same as backing out, so the
+        # caller's own loop just re-shows the refreshed list instead of
         # bubbling all the way to the main menu.
         if self.wizard.elevation_needs_terminal():
             return action
@@ -1419,13 +1140,6 @@ class TUIWizard:
             "create_user": f"Creating user '{action.get('username')}'...",
             "revoke_access": f"Revoking access to '{action.get('share')}'...",
             "delete_user": f"Deleting user '{action.get('username')}'...",
-            "delete_group": f"Deleting group '{action.get('name')}'...",
-            "assign_group": f"Adding '{action.get('username')}' to '{action.get('group')}'...",
-            "revoke_group": f"Removing '{action.get('username')}' from '{action.get('group')}'...",
-            "group_access": f"Setting access level for '{action.get('group')}' on '{action.get('share')}'...",
-            "create_group": f"Creating group '{action.get('name')}'...",
-            "assign_group_share": f"Assigning '{action.get('group')}' to '{action.get('share')}'...",
-            "unassign_group_share": f"Removing '{action.get('group')}''s access to '{action.get('share')}'...",
         }.get(action["action"], "Working...")
         self._run_privileged_action(stdscr, busy, lambda: self._users_groups_action_in_curses(action))
         return None

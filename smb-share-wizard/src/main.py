@@ -76,6 +76,12 @@ Usage:
             # unlike the elevation relaunch handlers below.
             from core import SMBWizard
             SMBWizard.uninstall_cleanup_windows()
+        elif len(sys.argv) >= 2 and sys.argv[1] == "--create-desktop-shortcut":
+            # Internal only - invoked by the MSI's "Add desktop shortcut"
+            # checkbox on the final install screen (see nassie.wxs). Not
+            # user-facing.
+            from core import SMBWizard
+            SMBWizard.create_desktop_shortcut_windows()
         elif len(sys.argv) >= 3 and sys.argv[1] in RELAUNCH_HANDLERS:
             from core import SMBWizard
             getattr(SMBWizard, RELAUNCH_HANDLERS[sys.argv[1]])(sys.argv[2])
