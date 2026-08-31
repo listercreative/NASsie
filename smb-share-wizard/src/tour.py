@@ -173,21 +173,26 @@ class _Callout(tk.Toplevel):
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
 
-        wx = widget.winfo_rootx()
-        wy = widget.winfo_rooty()
-        ww = widget.winfo_width()
-        wh = widget.winfo_height()
+        # Positioned below/above the widget's whole CONTAINING WINDOW, not
+        # just the widget itself - a compact dialog (the "Username and
+        # Password" step, for one) can have several fields stacked close
+        # together, and "below the highlighted field" alone often still
+        # landed on top of one of the OTHERS (e.g. right onto the
+        # password fields sitting just under the username one). Below/
+        # above the entire window it's actually in avoids that regardless
+        # of where inside it the highlighted widget sits - the highlight
+        # box (a separate, unaffected overlay) is still what points at
+        # the SPECIFIC field; this bubble just needs to stay clear of all
+        # of them, not sit right next to the one it's talking about.
+        container = widget.winfo_toplevel()
+        cx = container.winfo_rootx()
+        cy = container.winfo_rooty()
+        ch = container.winfo_reqheight()
 
         margin = 14
-        # Always below the widget, flipping above only if that genuinely
-        # doesn't fit on the SCREEN (not the small dialog this used to be
-        # clipped to - see the class docstring) - simpler and more
-        # predictable than picking whichever of four sides has the most
-        # room, which could land it to the left/right and read as
-        # unrelated to the field it's actually explaining.
-        below_y = wy + wh + margin
-        y = below_y if below_y + h <= screen_h else max(wy - margin - h, 0)
-        x = max(0, min(wx, screen_w - w))
+        below_y = cy + ch + margin
+        y = below_y if below_y + h <= screen_h else max(cy - margin - h, 0)
+        x = max(0, min(cx, screen_w - w))
         y = max(0, min(y, screen_h - h))
         self.geometry(f"+{x}+{y}")
         self.lift()
@@ -240,34 +245,37 @@ class GuiTour:
         # call) passes once this step's real action has actually happened;
         # see on_event().
         gui = self.gui
+        # Each title names the actual item being pointed at (its own
+        # button/field label or tooltip), not the action being asked for -
+        # e.g. "Username and Password", not "Name the user".
         return [
             (lambda: gui.root, lambda: gui._new_share_btn,
-             "Create your first share", "Click here to get started.",
+             "New Share", "Click here to get started.",
              "share_dialog_opened"),
             (lambda: self._active_window, lambda: self._active_window.name_entry,
-             "Name it",
+             "Share Name",
              "Give your share a name and continue - you'll get a chance to pick the folder "
              "next, or just accept the suggested one.",
              "share_created"),
 
             (lambda: gui.root, lambda: gui._manage_users_btn,
-             "Create a user", "Open this to manage user accounts.",
+             "Manage Users", "Open this to manage user accounts.",
              "user_mgmt_opened"),
             (lambda: self._active_window, lambda: self._active_window._new_user_toolbar_btn,
-             "Add a user", "Click here to create a standalone account.",
+             "New User", "Click here to create a standalone account.",
              "user_dialog_opened"),
             (lambda: self._active_window, lambda: self._active_window.username_entry,
-             "Name the user", "Type a username and password, then confirm.",
+             "Username and Password", "Type a username and password, then confirm.",
              "user_created"),
 
             (lambda: gui.root, lambda: gui.shares_list,
-             "Attach the user", "Select your share to reveal its actions.",
+             "Shares", "Select your share to reveal its actions.",
              "share_selected"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar,
-             "Attach", "Click the attach icon that appears here.",
+             "Attach User", "Click the attach icon that appears here.",
              "attach_dialog_opened"),
             (lambda: self._active_window, lambda: self._active_window.username_entry,
-             "Pick the user", "Choose the account to attach, then confirm.",
+             "Username", "Choose the account to attach, then confirm.",
              "user_attached"),
         ]
 
