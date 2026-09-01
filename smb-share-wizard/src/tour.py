@@ -304,57 +304,61 @@ class _Callout(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
         self.lift()
 
-    def place_below(self, other):
-        # Like place_near(), but anchored on another TOPLEVEL window
-        # (e.g. the real native tk_messageBox found by GuiTour.
-        # attach_callout_to_next_dialog()) rather than a widget within
-        # NASsie's own tree - no containing window to fall back to below/
-        # above if there's no room next to it, since `other` effectively
-        # IS that containing window here.
-        self.update_idletasks()
-        other.update_idletasks()
-        w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-
-        ox = other.winfo_rootx()
-        oy = other.winfo_rooty()
-        ow = other.winfo_width()
-        oh = other.winfo_height()
-
-        margin = 14
-        below_y = oy + oh + margin
-        y = below_y if below_y + h <= screen_h else max(oy - margin - h, 0)
-        x = ox + (ow - w) // 2
-        x = max(0, min(x, screen_w - w))
-        y = max(0, min(y, screen_h - h))
-        self.geometry(f"+{x}+{y}")
-        self.lift()
-
-    def place_center(self, container):
-        # Fallback for a step with nothing of NASsie's own to point at
-        # yet - e.g. the moment right before a native tk_messageBox
-        # confirming a share/user was created actually exists (see
-        # GuiTour.attach_callout_to_next_dialog(), which repositions to
-        # place_below() the real dialog once it's found - tk_messageBox
-        # centers over its OWN parent too, so simply centering here as
-        # well, as this used to do unconditionally, landed the callout
-        # ON TOP of the dialog instead of alongside it).
+    def place_outside_container(self, container):
+        # For a step with nothing of NASsie's own to point at - e.g. the
+        # native tk_messageBox confirming a share/user was created, which
+        # is a plain Tcl dialog with no Python widget handle to attach a
+        # highlight to.
+        #
+        # An earlier version of this tried to actually find that real
+        # dialog window (diffing container's children before/after
+        # opening it) and center below IT specifically - abandoned, not
+        # simplified away for its own sake: winfo_children() silently
+        # drops any child it has no Python-side wrapper for (see its own
+        # try/except KeyError), and a native tk_messageBox is exactly
+        # that - a real Tcl-level Toplevel the `tk_messageBox` command
+        # creates directly, never constructed through any Python
+        # Toplevel(...) call. Confirmed live: even the RAW Tcl `winfo
+        # children` call (bypassing Python's wrapper entirely) reported
+        # no children while a real messagebox was open, so there was no
+        # reliable way to locate it at all - the callout was silently
+        # stuck at its very first guess forever, which is what let it
+        # end up overlapping the real dialog in practice.
+        #
+        # This sidesteps needing to find it at all: tk_messageBox always
+        # centers over `container` (same as this callout would if simply
+        # centered) - so placing OUTSIDE container's own bounds instead
+        # (below its bottom edge, or above if that doesn't fit) can never
+        # overlap anything centered inside them, without needing to know
+        # the dialog's actual size or position.
         self.update_idletasks()
         w = self.winfo_reqwidth()
         h = self.winfo_reqheight()
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
 
-        container.update_idletasks()
+        # update(), not just update_idletasks() - idle tasks are only
+        # Tk's OWN queued work; the container's winfo_rootx/rooty in
+        # particular reflect wherever the X SERVER last told Tk it
+        # actually is; catching up on that needs a real round trip
+        # (update()), and right after another window it was just
+        # brought back in front of closed/withdrew (the exact moment
+        # this runs) is precisely when that hasn't landed yet -
+        # confirmed live, intermittently, as a callout jammed at (0, 0)
+        # with no later event to ever correct it.
+        container.update()
+        cw, ch = container.winfo_width(), container.winfo_height()
+        if cw <= 1 or ch <= 1:
+            self.after(20, lambda: self.place_outside_container(container))
+            return
         cx = container.winfo_rootx()
         cy = container.winfo_rooty()
-        cw = container.winfo_width()
-        ch = container.winfo_height()
+        cbottom = cy + ch
 
+        margin = 14
+        below_y = cbottom + margin
+        y = below_y if below_y + h <= screen_h else max(cy - margin - h, 0)
         x = cx + (cw - w) // 2
-        y = cy + (ch - h) // 2
         x = max(0, min(x, screen_w - w))
         y = max(0, min(y, screen_h - h))
         self.geometry(f"+{x}+{y}")
@@ -398,13 +402,6 @@ class GuiTour:
         # main window exists yet); updated by on_event()'s window= arg
         # whenever a step's wait_event hands one back.
         self._active_window = None
-        # The real native tk_messageBox a widget=None step's callout has
-        # been repositioned below, once attach_callout_to_next_dialog()
-        # finds it - None until then, and reset on every step change.
-        # reposition()/show_callout() in _track_container() check this so
-        # a container <Configure>/<FocusIn> firing AFTER that doesn't
-        # snap the callout back to place_center()'s guess.
-        self._native_dialog_ref = None
 
     def _newest_share_region(self):
         # The most recently created share (and its just-attached user, if
@@ -448,9 +445,9 @@ class GuiTour:
             # No widget (None) - the "Done" dialog that follows is a plain
             # tk_messageBox, not one of NASsie's own, so there's no Python
             # widget handle to attach a highlight to (see _Callout.
-            # place_center()). Container is gui.root, not _active_window -
-            # the CreateShareDialog that opened it is already destroyed by
-            # this point (same as every step after it).
+            # place_outside_container()). Container is gui.root, not
+            # _active_window - the CreateShareDialog that opened it is
+            # already destroyed by this point (same as every step after it).
             (lambda: gui.root, None,
              "Confirmation", "Click OK to confirm.",
              "share_apply_confirmed"),
@@ -462,7 +459,7 @@ class GuiTour:
              "New User", "Click here to create a new share user.",
              "user_dialog_opened"),
             (lambda: self._active_window, lambda: self._active_window.username_entry,
-             "Username and Password", "Type a username and password, then confirm.",
+             "Username and Password", "Type a username and password, then click OK.",
              "user_created"),
             (lambda: gui.root, None,
              "Confirmation", "Click OK to confirm.",
@@ -510,8 +507,8 @@ class GuiTour:
         # native "Done" confirmation dialog after a share/user is created,
         # which is a plain Tcl tk_messageBox with no Python widget handle
         # to attach a highlight to) skips the highlight box entirely and
-        # centers the callout over the container instead - see
-        # _Callout.place_center().
+        # places the callout outside the container's own bounds instead -
+        # see _Callout.place_outside_container().
         widget = widget_fn() if widget_fn is not None else None
 
         if widget is not None:
@@ -524,7 +521,27 @@ class GuiTour:
         if widget is not None:
             self._callout.place_near(widget)
         else:
-            self._callout.place_center(container)
+            self._callout.place_outside_container(container)
+            # One extra self-correction shortly after, specifically for
+            # this widget=None case - confirmed live (intermittently,
+            # timing-dependent - a race, not a one-off) landing at a
+            # stale (0, 0) with no later event to ever fix it, right
+            # after a step transition that both destroys a dialog AND
+            # withdraws that dialog's own OWNER window in the same beat
+            # (e.g. AddUserDialog closing while UserManagementWindow
+            # withdraws right under it) - evidently sometimes enough WM
+            # churn that even container.update()'s round trip inside
+            # place_outside_container() itself isn't a hard guarantee.
+            # This costs nothing when the first placement was already
+            # right - it just recomputes the same answer.
+            index_at_schedule = self.index
+            def _self_correct(step_index=index_at_schedule):
+                if self._callout is not None and self.index == step_index:
+                    try:
+                        self._callout.place_outside_container(container)
+                    except tk.TclError:
+                        pass
+            container.after(120, _self_correct)
         self._wait_event = wait_event
         self._track_container(container, widget)
 
@@ -550,18 +567,12 @@ class GuiTour:
         # heuristic - it's simply not drawn - so this holds regardless of
         # compositor.
         def place_callout():
-            # Shared by reposition() and show_callout() - and consulting
-            # _native_dialog_ref, not just widget, is what keeps a step
-            # already reattached to a real native dialog (see
-            # attach_callout_to_next_dialog()) from snapping back to
-            # place_center()'s guess the next time either fires.
+            # Shared by reposition() and show_callout().
             if widget is not None:
                 self._highlight.place_around(widget)
                 self._callout.place_near(widget)
-            elif self._native_dialog_ref is not None and self._native_dialog_ref.winfo_exists():
-                self._callout.place_below(self._native_dialog_ref)
             else:
-                self._callout.place_center(container)
+                self._callout.place_outside_container(container)
 
         def reposition(event=None):
             if self._callout is None:
@@ -581,11 +592,47 @@ class GuiTour:
                     pass
 
         def hide_callout(event=None):
-            if self._callout is not None:
+            if self._callout is None:
+                return
+            # Deferred, and re-checked once focus has actually settled -
+            # a container's own <FocusOut> fires just as readily when
+            # focus moves to one of NASSIE'S OWN child windows (a native
+            # messagebox.showinfo() this step's own container just
+            # opened, in particular - confirmed live: the "Share Creation
+            # Succeeded" dialog's own appearance was hiding this exact
+            # step's callout the instant it showed up) as when it moves
+            # to an unrelated external app, and there's nothing in the
+            # event itself to tell those apart. Tk's focus_get() DOES:
+            # it returns the focused widget only while focus is
+            # somewhere within THIS application, and None once it's
+            # moved to a different one entirely - checking that instead
+            # of hiding unconditionally is what keeps this step's own
+            # dialogs from hiding its own explanation of them.
+            def _maybe_hide():
+                if self._callout is None:
+                    return
+                try:
+                    # focus_get() resolves Tk's raw focus path back to a
+                    # Python widget object - and can itself raise
+                    # KeyError, not just TclError, when that path is an
+                    # internal ttk implementation widget with no such
+                    # object (confirmed live: a ttk.Combobox's own
+                    # dropdown listbox, right as a selection commits from
+                    # it). Treated the same as "still focused somewhere
+                    # in this app" (don't hide) rather than as a reason
+                    # to hide - failing toward "stays visible" is the
+                    # safe direction here, the same as the bug this whole
+                    # check exists to fix.
+                    focused = container.focus_get()
+                except (tk.TclError, KeyError):
+                    return
+                if focused is not None:
+                    return
                 try:
                     self._callout.withdraw()
                 except tk.TclError:
                     pass
+            container.after(50, _maybe_hide)
 
         self._tracking = [
             (container, "<Configure>", container.bind("<Configure>", reposition, add="+")),
@@ -640,44 +687,12 @@ class GuiTour:
         self._wait_event = None
         self._track_container(self.root, widget)
 
-    def attach_callout_to_next_dialog(self, parent):
-        # Call right after showing a widget=None step (a native
-        # tk_messageBox is about to appear, centered over `parent` the
-        # same way place_center() guessed) and right BEFORE invoking the
-        # blocking messagebox.showX() call that creates it - repositions
-        # the already-showing callout below the REAL dialog once it
-        # exists, rather than trying to precompute where "below" will
-        # land from its (unknown in advance, message- and theme-
-        # dependent) size. tk_messageBox has no Python widget handle of
-        # its own, so this finds it the only way available: diffing
-        # `parent`'s children before/after. Safe to call even if the
-        # tour isn't running or this step isn't a widget=None one -
-        # simply finds nothing and does nothing.
-        if self._callout is None:
-            return
-        before = set(parent.winfo_children())
-
-        def find_and_attach(attempts_left=15):
-            if self._callout is None:
-                return
-            new = [w for w in parent.winfo_children() if w not in before and isinstance(w, tk.Toplevel)]
-            if new:
-                self._native_dialog_ref = new[0]
-                try:
-                    self._callout.place_below(new[0])
-                except tk.TclError:
-                    pass
-            elif attempts_left > 0:
-                parent.after(20, lambda: find_and_attach(attempts_left - 1))
-
-        parent.after(20, find_and_attach)
-
     def stop(self):
         self._teardown_current()
 
     def _teardown_current(self):
         self._untrack_container()
-        self._native_dialog_ref = None
+        highlight_root = self._highlight.root if self._highlight else None
         if self._highlight:
             self._highlight.destroy()
             self._highlight = None
@@ -689,3 +704,15 @@ class GuiTour:
                 # may have already closed out from under the tour.
                 pass
             self._callout = None
+        if highlight_root is not None:
+            try:
+                # Destroying a place()'d overlay Frame doesn't always get
+                # its old screen region repainted immediately under every
+                # compositor - forcing one here (idle tasks first, so the
+                # geometry manager has actually noticed the removal) is
+                # cheap insurance against a stale visual frame of the
+                # highlight box outliving the widget it belonged to.
+                highlight_root.update_idletasks()
+                highlight_root.update()
+            except tk.TclError:
+                pass
