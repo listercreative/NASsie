@@ -29,15 +29,23 @@ def _patch_messagebox_front(messagebox_module, simpledialog_module):
     def _wrap(fn):
         def wrapper(*args, **kwargs):
             parent = kwargs.get("parent") or tk._default_root
+            # Restored to whatever it was BEFORE this call, not
+            # unconditionally forced off - every NASsie window is
+            # permanently "-topmost" now (see _bring_window_to_front()),
+            # so blindly turning it off here would silently undo that the
+            # moment any messagebox/askstring call involving that window
+            # returns.
+            was_topmost = False
             if parent is not None:
                 try:
+                    was_topmost = bool(parent.attributes("-topmost"))
                     parent.attributes("-topmost", True)
                 except tk.TclError:
                     parent = None
             try:
                 return fn(*args, **kwargs)
             finally:
-                if parent is not None:
+                if parent is not None and not was_topmost:
                     try:
                         parent.attributes("-topmost", False)
                     except tk.TclError:
@@ -71,10 +79,34 @@ def _bring_window_to_front(win):
     # isn't subject to that restriction, and reliably drags the window to
     # front as a side effect. Used by every popup (dialogs, and
     # LogWindow/UserManagementWindow's show()), not just the main window.
+    #
+    # Ends up "-topmost" TRUE, permanently - not toggled back off (a
+    # prior version reset it to False here, matching Toplevel's normal
+    # one-off "come to front" behavior). Explicitly reverted: every
+    # NASsie window needs to stay above other applications on the
+    # desktop the whole time it's open, not just flash to the front the
+    # instant it's created/shown, or switching away to a different app
+    # even briefly buries it - the SAME reason the tour callout itself
+    # is permanently topmost (see _Callout's own comment in tour.py).
+    # The initial False->True->False->True sequence (not just setting
+    # True once) is still needed for the RAISE itself: toggling forces
+    # a z-order change some window managers (seen here under GNOME/
+    # Wayland via Xwayland) don't reliably apply for a plain lift() on
+    # a window that wasn't just freshly mapped by the WM itself - a
+    # background process raising its own already-open window gets
+    # silently ignored by focus-stealing prevention otherwise. update()
+    # between the toggles is a synchronous round trip, not a deferred
+    # win.after() (a still-earlier version used that, and two DIFFERENT
+    # windows raised this way in quick succession - confirmed live:
+    # _create_user_done()'s own call on root, immediately followed by
+    # the tour's next step raising UserManagementWindow - raced each
+    # other, since whichever deferred reset hadn't fired yet stayed on
+    # top even though the OTHER window was raised more recently).
     win.deiconify()
     win.lift()
+    win.attributes("-topmost", False)
+    win.update()
     win.attributes("-topmost", True)
-    win.after(200, lambda: win.attributes("-topmost", False))
     win.focus_force()
 
 
@@ -461,8 +493,6 @@ class QrCodeDialog(tk.Toplevel):
                  "on screen or let anyone photograph it who shouldn't have access.",
             foreground="#b00000", justify="center", padding=8,
         ).pack()
-        _icon_button(self, "✖", "Close", self.destroy).pack(pady=(0, 10))
-
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
         self.grab_set()
@@ -517,11 +547,11 @@ class CreateShareDialog(tk.Toplevel):
         # see _build_path_page's identical layout for why these used to
         # be spread to opposite edges of the dialog instead, which read
         # as two unrelated buttons rather than one pair) - packed right-
-        # to-left, so Next (the primary/default action) ends up
-        # rightmost with Cancel just to its left.
+        # to-left, so OK (the primary/default action) ends up rightmost
+        # with Cancel just to its left.
         action_frame = ttk.Frame(self.name_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "✔", "Next", self._confirm_name).pack(side="right")
+        _icon_button(action_frame, "✔", "OK", self._confirm_name).pack(side="right")
         _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right", padx=(0, 4))
 
     def _build_path_page(self):
@@ -549,7 +579,7 @@ class CreateShareDialog(tk.Toplevel):
         action_frame = ttk.Frame(self.path_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
         _icon_button(action_frame, "◀", "Back", self._show_name_page).pack(side="left")
-        self.create_button = _icon_button(action_frame, "✔", "Create Share", self._on_create_share)
+        self.create_button = _icon_button(action_frame, "✔", "OK", self._on_create_share)
         self.create_button.pack(side="right")
         _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right", padx=(0, 4))
 
@@ -725,6 +755,10 @@ class LogWindow(tk.Toplevel):
     so the accumulated log survives across show/hide."""
     def __init__(self, parent):
         super().__init__(parent)
+        # See UserManagementWindow's identical comment - same gap, same
+        # fix: this never had the WM hint that keeps it reliably above
+        # its parent, unlike every one of NASsie's other dialogs.
+        self.transient(parent)
         self.title("NASsie Log")
         self.geometry("640x320")
         self.protocol("WM_DELETE_WINDOW", self.withdraw)
@@ -757,6 +791,16 @@ class UserManagementWindow(tk.Toplevel):
     close - state survives across show/hide, same as LogWindow."""
     def __init__(self, app):
         super().__init__(app.root)
+        # Every OTHER dialog in this file (CreateShareDialog,
+        # AddUserDialog, ChoiceDialog, QrCodeDialog) sets this - this one
+        # never did, and it's the one window that reliably drifted behind
+        # root instead of staying raised, unlike all of those. transient()
+        # doesn't make it modal (that's grab_set(), which this still never
+        # calls - it stays fully independent/non-modal, same as always) -
+        # it's purely the WM hint "this belongs above that window", a much
+        # older and more reliably-honored mechanism (confirmed live) than
+        # "-topmost" on this session's window manager.
+        self.transient(app.root)
         self.app = app
         self.wizard = app.wizard
         self.title("User Management")
@@ -967,7 +1011,8 @@ class UserManagementWindow(tk.Toplevel):
 
         threading.Thread(
             target=self.app._grant_access_worker,
-            args=(share_name, username, password, read_only, confirm_qr), daemon=True,
+            args=(share_name, username, password, read_only, confirm_qr),
+            kwargs={"parent_window": self}, daemon=True,
         ).start()
 
     def _delete_user(self):
@@ -1006,6 +1051,7 @@ class GUIWizard:
         self._attaching_share = None
         self._attaching_candidates = []
         self._attaching_candidate_users = {}
+        self._attaching_labels = {}
 
         # className sets WM_CLASS, which is what taskbars/docks/app-switchers
         # use to match this running window back to nassie.desktop (and thus
@@ -1061,7 +1107,7 @@ class GUIWizard:
         # (see _measure_action_bar_width) is the only way to get this
         # right regardless of that.
         self.root.update_idletasks()
-        share_bar_w = self._measure_action_bar_width(("+👤", "🔗", "➖👤", "🔒", "🗑"))
+        share_bar_w = self._measure_action_bar_width(("+👤", "🔗", "⛓️‍💥", "👁", "🗑"))
         name_col_w = self.shares_list.column("#0", "width")
         # name column + vertical scrollbar (~20px) + a floor for the Path
         # column so it isn't squeezed to nothing + the action bar itself +
@@ -1283,36 +1329,44 @@ class GUIWizard:
             username = self.shares_list.set(item, "username") or None
         else:
             username = None
-        _icon_button(container, "+👤", "New User", self._new_user_for_selected_share).pack(
-            side="left", fill="y", padx=1
-        )
-        _icon_button(
-            container, "🔗", "Attach User", self._attach_user_to_selected_share
-        ).pack(side="left", fill="y", padx=1)
         if username:
+            # A user row's own actions are scoped to that user's access to
+            # this share, not the share itself - New User/Attach
+            # User/Delete Share belong to the share row (see below), not
+            # here.
             _icon_button(
-                container, "➖👤", "Unattach User", self._unattach_selected_user
+                container, "⛓️‍💥", "Unattach User", self._unattach_selected_user
             ).pack(side="left", fill="y", padx=1)
-            # The icon itself doubles as the access-level badge (padlock
-            # closed = read-only, open = read-write) as well as the
-            # toggle control - clicking it flips the level immediately,
-            # no confirmation dialog (see _change_access_level_for_
-            # selection()). The row's own label (see
-            # _populate_shares_list()) carries the same information for
-            # when this bar isn't showing at all (nothing selected).
+            # The icon itself doubles as the access-level badge (eye =
+            # read-only, pencil = read-write) as well as the toggle
+            # control - clicking it flips the level immediately, no
+            # confirmation dialog (see _change_access_level_for_
+            # selection()). Lock/unlock icons read as ambiguous at a
+            # glance (which state is "locked"?) - eye/pencil map directly
+            # to "view only" vs "can edit", no padlock-state guessing
+            # needed. The row's own label (see _populate_shares_list())
+            # carries the same information for when this bar isn't
+            # showing at all (nothing selected).
             share_name, _ = self._selected_share_and_user()
             share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
             share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
             read_only = bool(share_user and share_user.get("read_only"))
-            icon, tip = ("🔒", "Read-only - click to make read-write") if read_only else (
-                "🔓", "Read-write - click to make read-only"
+            icon, tip = ("👁", "Read-only - click to make read-write") if read_only else (
+                "✏️", "Read-write - click to make read-only"
             )
             _icon_button(
                 container, icon, tip, self._change_access_level_for_selection
             ).pack(side="left", fill="y", padx=1)
-        _icon_button(container, "🗑", "Delete Share", self._delete_selected_share).pack(
-            side="left", fill="y", padx=1
-        )
+        else:
+            _icon_button(container, "+👤", "New User", self._new_user_for_selected_share).pack(
+                side="left", fill="y", padx=1
+            )
+            _icon_button(
+                container, "🔗", "Attach User", self._attach_user_to_selected_share
+            ).pack(side="left", fill="y", padx=1)
+            _icon_button(container, "🗑", "Delete Share", self._delete_selected_share).pack(
+                side="left", fill="y", padx=1
+            )
         return True
 
     def _build_inline_attach(self, container, item):
@@ -1321,11 +1375,14 @@ class GUIWizard:
         # for how attach mode is entered and _commit_inline_attach() for
         # what happens on selection.
         var = tk.StringVar()
-        combo = ttk.Combobox(
-            container, textvariable=var, values=self._attaching_candidates, state="readonly",
-        )
+        labels = [self._attaching_labels.get(u, u) for u in self._attaching_candidates]
+        label_to_username = {self._attaching_labels.get(u, u): u for u in self._attaching_candidates}
+        combo = ttk.Combobox(container, textvariable=var, values=labels, state="readonly")
         combo.pack(side="left", fill="both", expand=True, padx=1)
-        combo.bind("<<ComboboxSelected>>", lambda e: self._commit_inline_attach(var.get()))
+        combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._commit_inline_attach(label_to_username.get(var.get(), var.get())),
+        )
         _icon_button(container, "✖", "Cancel", self._cancel_inline_attach).pack(side="left", fill="y", padx=1)
         # Opens the dropdown right away - the whole point of "contextual
         # dropdown" is picking a user in one motion, not a second click
@@ -1347,6 +1404,7 @@ class GUIWizard:
         self._attaching_share = None
         self._attaching_candidates = []
         self._attaching_candidate_users = {}
+        self._attaching_labels = {}
         self._share_action_bar.update()
 
     def _selected_share_and_user(self):
@@ -1485,6 +1543,18 @@ class GUIWizard:
         self._attaching_share = share_name
         self._attaching_candidates = [u["username"] for u in candidates]
         self._attaching_candidate_users = {u["username"]: u for u in candidates}
+        # UserManagementWindow.refresh() hides any account NASsie didn't
+        # create and that has no share access yet, so as not to clutter
+        # sharing-focused UI with unrelated logins on the machine - but
+        # this picker still needs to offer them (attaching a genuine
+        # pre-existing account is a supported, deliberate case - see
+        # existing_account_grant_message()), so label instead of hiding:
+        # otherwise they showed up here identically to a NASsie-created
+        # user with no way to tell them apart.
+        self._attaching_labels = {
+            u["username"]: u["username"] if u.get("managed") else f'{u["username"]} (existing account)'
+            for u in candidates
+        }
         self._share_action_bar.update()
 
     def _commit_inline_attach(self, username):
@@ -1494,19 +1564,30 @@ class GUIWizard:
         self._attaching_share = None
         self._attaching_candidates = []
         self._attaching_candidate_users = {}
+        self._attaching_labels = {}
         if not username:
             self._share_action_bar.update()
             return
 
-        # Already attached to at least one OTHER share means already has
-        # valid Samba/SMB credentials - Samba (and, worse, macOS) store
-        # one password per account, not one per share, so an account
-        # already attached elsewhere doesn't need a new one just to
-        # attach it here too. See core._add_user_to_share_linux's comment
-        # for the full reasoning.
+        # A password already exists for this account if either: it's
+        # attached to at least one OTHER share already (Samba, and worse
+        # macOS, store one password per account, not one per share - see
+        # core._add_user_to_share_linux's comment for the full reasoning)
+        # OR it's a NASsie-managed account, since create_user()/add_user()
+        # (the "New User" account-only flow, with no share attached yet)
+        # sets the account's real Samba password at creation time, not
+        # attach time - "not attached to any share yet" is not the same
+        # as "has no password yet" for a managed account. Only a genuine
+        # pre-existing, unmanaged computer account NASsie never touched
+        # before has no known credentials at all, and only then is a new
+        # password actually required here.
         existing_user = candidate_users.get(username)
+        already_has_password = bool(existing_user) and (
+            existing_user.get("managed", False) or existing_user.get("shares")
+        )
         password = None
-        if not (existing_user and existing_user.get("shares")):
+        if not already_has_password:
+            self._notify_tour("attach_password_needed")
             password = simpledialog.askstring(
                 "Password", f"Set a password for '{username}' on this share:", show="*", parent=self.root,
             )
@@ -1568,7 +1649,7 @@ class GUIWizard:
 
     def _change_access_level_for_selection(self):
         # No confirmation dialog - the button itself already shows the
-        # CURRENT level (padlock closed/open, see _build_share_action_bar)
+        # CURRENT level (eye/pencil icon, see _build_share_action_bar)
         # and doing this is a one-click toggle back if it was wrong,
         # unlike deleting a share or a user.
         share_name, username = self._selected_share_and_user()
@@ -1606,7 +1687,7 @@ class GUIWizard:
             messagebox.showerror("Failed", f"Could not change '{username}''s access level — see log.")
         self._refresh_all_lists()
 
-    def _grant_access_worker(self, share_name, username, password, read_only=False, confirm_qr=True):
+    def _grant_access_worker(self, share_name, username, password, read_only=False, confirm_qr=True, parent_window=None):
         self._busy_start()
         buffer = io.StringIO()
         added = False
@@ -1617,20 +1698,32 @@ class GUIWizard:
             buffer.write(f"\nUnexpected error: {e}\n")
         self.root.after(
             0,
-            lambda: self._grant_access_done(share_name, username, password, added, buffer.getvalue(), confirm_qr),
+            lambda: self._grant_access_done(
+                share_name, username, password, added, buffer.getvalue(), confirm_qr, parent_window
+            ),
         )
 
-    def _grant_access_done(self, share_name, username, password, added, log_output, confirm_qr=True):
+    def _grant_access_done(self, share_name, username, password, added, log_output, confirm_qr=True, parent_window=None):
         self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
+        # Shared by the main share tree's Attach User flow (root context)
+        # AND UserManagementWindow's Change Password flow (see
+        # _change_password_flow, which passes parent_window=self) - the
+        # caller says which window it actually happened in, so the
+        # confirmation lands (and re-raises) against that one instead of
+        # always root, which previously popped the confirmation up behind
+        # UserManagementWindow whenever this ran from there (both windows
+        # are permanently "-topmost" - see _bring_window_to_front - so
+        # whichever one this targets is the one left on top).
+        target = parent_window or self.root
         if added:
             self._notify_tour("user_attached")
-            messagebox.showinfo("Added", f"Added '{username}' to share '{share_name}'.")
+            messagebox.showinfo("Added", f"Added '{username}' to share '{share_name}'.", parent=target)
             # See _apply_done's identical call for why this is needed
             # right here, not left to the next tour step's own
             # _bring_to_front().
-            _bring_window_to_front(self.root)
+            _bring_window_to_front(target)
             self._notify_tour("attach_apply_confirmed")
             # password is None for an existing, unmanaged Windows account
             # NASsie deliberately left untouched (see
@@ -1639,7 +1732,9 @@ class GUIWizard:
             if password is not None:
                 self._offer_qr_codes(share_name, [{"username": username, "password": password}], confirm=confirm_qr)
         else:
-            messagebox.showerror("Failed", f"Could not add '{username}' to share '{share_name}' — see log.")
+            messagebox.showerror(
+                "Failed", f"Could not add '{username}' to share '{share_name}' — see log.", parent=target
+            )
         self._refresh_all_lists()
 
     def _revoke_access_worker(self, share_name, username):
@@ -1679,9 +1774,13 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if deleted:
-            messagebox.showinfo("Deleted", f"Deleted user '{username}'.")
+            # Only reachable via UserManagementWindow's own "Delete User"
+            # button - see _create_user_done's identical parenting note.
+            messagebox.showinfo("Deleted", f"Deleted user '{username}'.", parent=self._user_mgmt_window)
         else:
-            messagebox.showerror("Failed", f"Could not delete user '{username}' — see log.")
+            messagebox.showerror(
+                "Failed", f"Could not delete user '{username}' — see log.", parent=self._user_mgmt_window
+            )
         self._refresh_all_lists()
 
     def _create_user_worker(self, username, password):
@@ -1701,14 +1800,23 @@ class GUIWizard:
             self._append_log(log_output)
         if created:
             self._notify_tour("user_created")
-            messagebox.showinfo("User Created", f"'{username}' has been created.")
+            # This is only ever reached via UserManagementWindow's own
+            # "New User" button (_create_new_user) - parented and
+            # re-raised against IT, not root, so the confirmation doesn't
+            # pop up behind the window the user is actually looking at
+            # (root and UserManagementWindow are both permanently
+            # "-topmost" - see _bring_window_to_front - so whichever one
+            # this targets is the one that ends up on top).
+            messagebox.showinfo("User Created", f"'{username}' has been created.", parent=self._user_mgmt_window)
             # See _apply_done's identical call for why this is needed
             # right here, not left to the next tour step's own
             # _bring_to_front().
-            _bring_window_to_front(self.root)
+            _bring_window_to_front(self._user_mgmt_window)
             self._notify_tour("user_apply_confirmed")
         else:
-            messagebox.showerror("Failed", f"Could not set up user '{username}' — see log.")
+            messagebox.showerror(
+                "Failed", f"Could not set up user '{username}' — see log.", parent=self._user_mgmt_window
+            )
         self._refresh_all_lists()
 
     def _delete_selected_share(self):
