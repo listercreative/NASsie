@@ -13,7 +13,7 @@ from core import (
     SHARE_NAME_MAX_LEN, SHARE_NAME_RE,
     USERNAME_MAX_LEN, USERNAME_RE,
 )
-from tour import GuiTour, has_seen_tour, mark_tour_seen
+from tour import GuiTour, tour_state, mark_tour_completed
 
 
 def _patch_messagebox_front(messagebox_module, simpledialog_module):
@@ -318,10 +318,13 @@ class AddUserDialog(tk.Toplevel):
             ).grid(row=3, column=0, columnspan=2, pady=(0, 6))
             next_row = 4
 
+        # Cancel first (ends up on the left), OK second (ends up on the
+        # right, as the primary/default action) - see CreateShareDialog's
+        # _build_name_page for the same convention and why.
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=next_row, column=0, columnspan=2, pady=10)
-        _icon_button(btn_frame, "✔", "OK", self._on_ok).pack(side="left", padx=4)
         _icon_button(btn_frame, "✖", "Cancel", self.destroy).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✔", "OK", self._on_ok).pack(side="left", padx=4)
 
         self.username_entry.focus_set()
         _center_over_parent(self, parent)
@@ -391,10 +394,12 @@ class ChoiceDialog(tk.Toplevel):
         combo = ttk.Combobox(self, textvariable=self.choice_var, values=choices, state="readonly")
         combo.grid(row=1, column=0, columnspan=2, padx=8, pady=6)
 
+        # Cancel first (left), primary action second (right) - see
+        # AddUserDialog's identical btn_frame for the same convention.
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
-        _icon_button(btn_frame, "✔", ok_label, self._on_ok).pack(side="left", padx=4)
         _icon_button(btn_frame, "✖", "Cancel", self.destroy).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✔", ok_label, self._on_ok).pack(side="left", padx=4)
 
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
@@ -508,10 +513,16 @@ class CreateShareDialog(tk.Toplevel):
         self.name_entry.grid(row=0, column=1, sticky="w", pady=4)
         self.name_entry.bind("<Return>", lambda e: self._confirm_name())
 
+        # Grouped together on the right (standard OK/Cancel placement -
+        # see _build_path_page's identical layout for why these used to
+        # be spread to opposite edges of the dialog instead, which read
+        # as two unrelated buttons rather than one pair) - packed right-
+        # to-left, so Next (the primary/default action) ends up
+        # rightmost with Cancel just to its left.
         action_frame = ttk.Frame(self.name_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "✔", "Next", self._confirm_name).pack(side="left")
-        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right")
+        _icon_button(action_frame, "✔", "Next", self._confirm_name).pack(side="right")
+        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right", padx=(0, 4))
 
     def _build_path_page(self):
         self.path_page = ttk.Frame(self)
@@ -531,12 +542,16 @@ class CreateShareDialog(tk.Toplevel):
         self.path_entry.grid(row=0, column=1, sticky="w", pady=4)
         _icon_button(form, "📂", "Browse", self._browse_path).grid(row=0, column=2, padx=4)
 
+        # Back stays isolated on the left (a navigation action, not part
+        # of the confirm/cancel decision) - Cancel and Create Share
+        # (the primary/default action) are grouped together on the
+        # right, same reasoning and pack order as _build_name_page's.
         action_frame = ttk.Frame(self.path_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
         _icon_button(action_frame, "◀", "Back", self._show_name_page).pack(side="left")
         self.create_button = _icon_button(action_frame, "✔", "Create Share", self._on_create_share)
-        self.create_button.pack(side="left", padx=(4, 0))
-        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right")
+        self.create_button.pack(side="right")
+        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right", padx=(0, 4))
 
     def _show_name_page(self):
         self.path_page.pack_forget()
@@ -551,6 +566,7 @@ class CreateShareDialog(tk.Toplevel):
         name = self.name_entry.get().strip()
         name_ok, name_message = self.wizard.check_share_name(name)
         if not name_ok:
+            self.app._tour_flash_name_error(name_message)
             messagebox.showerror("Invalid name", name_message, parent=self)
             return
         self._set_path(self.wizard.default_share_path(name))
@@ -750,14 +766,6 @@ class UserManagementWindow(tk.Toplevel):
         toolbar.pack(fill="x", padx=8, pady=(8, 0))
         self._new_user_toolbar_btn = _icon_button(toolbar, "+👤", "New User", self._create_new_user)
         self._new_user_toolbar_btn.pack(side="left")
-        # An in-content Close button, not just the WM titlebar's own "X" -
-        # the tour's highlight box is a real child widget drawn inside
-        # NASsie's own window content (see _HighlightBox's docstring), so
-        # it physically can't be drawn over a window-manager-rendered
-        # decoration outside that content area. Without this, its "Close"
-        # step had nothing of NASsie's own left to point at.
-        self._close_toolbar_btn = _icon_button(toolbar, "✖", "Close", self._on_close)
-        self._close_toolbar_btn.pack(side="right")
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1073,14 +1081,23 @@ class GUIWizard:
         self.root.minsize(width, height)
         self._bring_to_front()
 
-        if not has_seen_tour():
-            mark_tour_seen()
-            # Marked seen up front, not after the tour finishes - a crash
-            # or force-quit mid-tour shouldn't leave it re-triggering on
-            # every subsequent launch. Deferred via after() so the window
-            # is fully mapped (real winfo_rootx/rooty) before the tour
-            # measures widget positions.
+        # Deferred via after() either way, so the window is fully mapped
+        # (real winfo_rootx/rooty) before the tour measures widget
+        # positions.
+        state = tour_state()
+        if state == "new":
             self.root.after(400, self._start_tour)
+        elif state == "interrupted":
+            # Closing NASsie mid-tour (a crash, force-quit, or just its
+            # own window close button) used to permanently lose the tour
+            # - the marker was written the instant it STARTED, before the
+            # user had actually done anything with it. Now it's only
+            # written on genuine completion or an explicit Skip (see
+            # tour.py's tour_state()/mark_tour_completed()), so this is
+            # reachable - offer to pick it back up rather than either
+            # silently never showing it again or restarting it
+            # unconditionally on every launch until someone finishes it.
+            self.root.after(400, self._offer_tour_resume)
 
     def _measure_action_bar_width(self, icons):
         # Builds the given icons as real buttons (same style/font as
@@ -1169,6 +1186,26 @@ class GUIWizard:
         tour = getattr(self, "_tour", None)
         if tour:
             tour.on_event(event, window=window)
+
+    def _tour_flash_name_error(self, message):
+        tour = getattr(self, "_tour", None)
+        if tour:
+            tour.show_name_error(message)
+
+    def _offer_tour_resume(self):
+        # Restarts from step one, not literally mid-step - there's no
+        # meaningful way to resume mid-action-driven-flow across a
+        # process restart anyway (the exact dialog/step state it
+        # interrupted on is gone with the old process), so "continue"
+        # and "redo" are the same operation here: run the tour again.
+        if messagebox.askyesno(
+            "Resume Tour",
+            "It looks like the guided tour didn't finish last time.\n\n"
+            "Continue it now?",
+        ):
+            self._start_tour()
+        else:
+            mark_tour_completed()
 
     def _start_tour(self):
         # Rebuilt each time rather than cached - a stale GuiTour with a

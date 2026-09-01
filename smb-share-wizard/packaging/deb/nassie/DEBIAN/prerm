@@ -113,7 +113,7 @@ for name in sorted(all_groups):
 # nassie, or root's/the real sudo user's equivalent - see
 # _first_run_marker_path()) - apt has no idea it exists either, so
 # nothing else would ever clear it. Without this, a genuine uninstall
-# followed by a fresh reinstall still skips the tour: has_seen_tour()
+# followed by a fresh reinstall still skips the tour: tour_state()
 # only ever checks for this one file, and it survives right through
 # both the removal and the reinstall untouched.
 marker = _first_run_marker_path()
