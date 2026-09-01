@@ -360,10 +360,28 @@ class _Callout(tk.Toplevel):
     def set_text(self, text):
         self.text_label.configure(text=text)
 
-    def place_near(self, widget):
+    def _measure(self):
+        # TWO idle-task passes, not one: a ttk.Label with wraplength set
+        # (self.text_label above) can need a second pass to actually
+        # settle - the first one, confirmed live, can still report the
+        # width/height it would need laid out on ONE unwrapped line,
+        # before the wrap this callout's own wraplength=260 forces is
+        # accounted for. That's exactly the "one large frame before
+        # sizing itself down" flash this class's withdraw()-until-placed
+        # scheme (see __init__) was built to prevent - it stops the
+        # WINDOW from showing before placement, but placement itself
+        # still has to be reading the real final size, or revealing it
+        # afterward just shows that same wrong size instead of hiding it
+        # for a frame. Only actually surfaced on longer, more-wrapped
+        # text (the "Close" and finish-step bodies) - short text happens
+        # to settle in one pass, which is why this went unnoticed until
+        # those got longer.
         self.update_idletasks()
-        w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
+        self.update_idletasks()
+        return self.winfo_reqwidth(), self.winfo_reqheight()
+
+    def place_near(self, widget):
+        w, h = self._measure()
 
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -438,9 +456,7 @@ class _Callout(tk.Toplevel):
         # fallback) at least puts it as close to those controls as Tk's
         # own coordinate space allows, rather than ~a full window-height
         # away from what it's actually talking about.
-        self.update_idletasks()
-        w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
+        w, h = self._measure()
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         container.update_idletasks()
@@ -482,9 +498,7 @@ class _Callout(tk.Toplevel):
         # (below its bottom edge, or above if that doesn't fit) can never
         # overlap anything centered inside them, without needing to know
         # the dialog's actual size or position.
-        self.update_idletasks()
-        w = self.winfo_reqwidth()
-        h = self.winfo_reqheight()
+        w, h = self._measure()
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
 
@@ -651,7 +665,7 @@ class GuiTour:
              "Shares", "Select your share to reveal its actions.",
              "share_selected"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar,
-             "Share Settings",
+             "Delete Share",
              "Create a new user (+\U0001F464), Attach User (\U0001F517), delete share (\U0001F5D1). "
              "Press Attach User then pick the user that you just created to assign it to this share.",
              "user_attached"),

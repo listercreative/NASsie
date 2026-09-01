@@ -127,14 +127,24 @@ class _Tooltip:
     def _show(self, event=None):
         if self.tip or not self.text:
             return
-        x = self.widget.winfo_rootx() + 8
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
         self.tip = tk.Toplevel(self.widget)
+        # Withdrawn immediately, before the label below is even packed -
+        # same fix, same reasoning as tour.py's _Callout: Tk maps a
+        # Toplevel the instant it exists, at whatever size it has BEFORE
+        # its content is packed and measured, so left visible this showed
+        # up as one real, flashed frame of an empty/wrong-sized box before
+        # snapping to the correct size around the label's actual text.
+        # Only shown (deiconify(), below) once real placement is applied.
+        self.tip.withdraw()
         self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
         ttk.Label(
             self.tip, text=self.text, background="#ffffe0", relief="solid", borderwidth=1, padding=(4, 2),
         ).pack()
+        self.tip.update_idletasks()
+        x = self.widget.winfo_rootx() + 8
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip.wm_geometry(f"+{x}+{y}")
+        self.tip.deiconify()
         self.tip.lift()
         # No "-topmost" - same fix as GuiTour's _Callout (see tour.py):
         # it pins the tooltip above EVERY window on the desktop, not just
@@ -1107,7 +1117,7 @@ class GUIWizard:
         # (see _measure_action_bar_width) is the only way to get this
         # right regardless of that.
         self.root.update_idletasks()
-        share_bar_w = self._measure_action_bar_width(("+👤", "🔗", "⛓️‍💥", "👁", "🗑"))
+        share_bar_w = self._measure_action_bar_width(("✂️", "🔍", "📱", "+👤", "🔗", "🗑"))
         name_col_w = self.shares_list.column("#0", "width")
         # name column + vertical scrollbar (~20px) + a floor for the Path
         # column so it isn't squeezed to nothing + the action bar itself +
@@ -1335,28 +1345,28 @@ class GUIWizard:
             # User/Delete Share belong to the share row (see below), not
             # here.
             _icon_button(
-                container, "⛓️‍💥", "Unattach User", self._unattach_selected_user
+                container, "✂️", "Unattach User", self._unattach_selected_user
             ).pack(side="left", fill="y", padx=1)
-            # The icon itself doubles as the access-level badge (eye =
-            # read-only, pencil = read-write) as well as the toggle
-            # control - clicking it flips the level immediately, no
-            # confirmation dialog (see _change_access_level_for_
-            # selection()). Lock/unlock icons read as ambiguous at a
-            # glance (which state is "locked"?) - eye/pencil map directly
-            # to "view only" vs "can edit", no padlock-state guessing
-            # needed. The row's own label (see _populate_shares_list())
-            # carries the same information for when this bar isn't
-            # showing at all (nothing selected).
+            # The icon itself doubles as the access-level badge (magnifying
+            # glass = read-only "inspect only", feather pen = read-write)
+            # as well as the toggle control - clicking it flips the level
+            # immediately, no confirmation dialog (see
+            # _change_access_level_for_selection()). The row's own label
+            # (see _populate_shares_list()) carries the same information
+            # for when this bar isn't showing at all (nothing selected).
             share_name, _ = self._selected_share_and_user()
             share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
             share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
             read_only = bool(share_user and share_user.get("read_only"))
-            icon, tip = ("👁", "Read-only - click to make read-write") if read_only else (
-                "✏️", "Read-write - click to make read-only"
+            icon, tip = ("🔍", "Read-only - click to make read-write") if read_only else (
+                "🖋️", "Read-write - click to make read-only"
             )
             _icon_button(
                 container, icon, tip, self._change_access_level_for_selection
             ).pack(side="left", fill="y", padx=1)
+            _icon_button(container, "📱", "Show QR Code", self._show_qr_for_selection).pack(
+                side="left", fill="y", padx=1
+            )
         else:
             _icon_button(container, "+👤", "New User", self._new_user_for_selected_share).pack(
                 side="left", fill="y", padx=1
@@ -1629,6 +1639,71 @@ class GUIWizard:
             target=self._revoke_access_worker, args=(share_name, username), daemon=True
         ).start()
 
+    def _show_qr_for_selection(self):
+        # Same flow as UserManagementWindow._show_qr() - asks for the
+        # CURRENT password and verifies it live (see
+        # SMBWizard.verify_password()) rather than resetting it, so
+        # showing a QR code again doesn't invalidate whatever other
+        # devices already connected with the old one - but simpler here:
+        # this row already IS a specific share+user, so there's no
+        # multi-share ChoiceDialog step to worry about.
+        share_name, username = self._selected_share_and_user()
+        if not share_name or not username:
+            messagebox.showinfo("Show QR Code", "Select a user under a share first.")
+            return
+        password = simpledialog.askstring(
+            "Show QR Code", f"Enter '{username}'s current password to show their QR code:",
+            show="*", parent=self.root,
+        )
+        if not password:
+            return
+        if not self.wizard.verify_password(username, password, share_name):
+            if messagebox.askyesno(
+                "Incorrect password",
+                "That doesn't match this account's current password.\n\n"
+                "Forgot it? Reset the password instead to generate a new QR code.",
+            ):
+                self._reset_password_for_selection(share_name, username)
+            return
+        self._offer_qr_codes(share_name, [{"username": username, "password": password}], confirm=False)
+
+    def _reset_password_for_selection(self, share_name, username):
+        # Same guard and reasoning as UserManagementWindow.
+        # _change_password_flow() - never reset a real Windows account's
+        # actual sign-in password just because NASsie was handed access
+        # to grant. Reuses _grant_access_worker (root context - this row
+        # is already inside GUIWizard's own share tree, not
+        # UserManagementWindow), same as every other "set/replace this
+        # share's password" action.
+        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
+        if not (user and user.get("managed", False)) and self.wizard.system == "Windows":
+            messagebox.showinfo(
+                "Change Password",
+                f"'{username}' is an existing Windows account, not one NASsie created - changing its "
+                "password here would also change what they sign in with, so NASsie won't do that. "
+                "Change their password from Windows' own account settings instead.",
+            )
+            return
+        if not messagebox.askokcancel("Change Password", QR_PASSWORD_RESET_NOTE, parent=self.root):
+            return
+        password = simpledialog.askstring(
+            "New password", f"New password for '{username}' (replaces their current one):",
+            show="*", parent=self.root,
+        )
+        if not password:
+            return
+        share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
+        share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
+        read_only = share_user.get("read_only", False) if share_user else False
+        # confirm_qr=False - reached only from the "forgot it, reset
+        # instead" fallback inside _show_qr_for_selection(), so clicking
+        # Show QR Code already was the confirmation; see
+        # _offer_qr_codes()'s own reasoning for the identical case there.
+        threading.Thread(
+            target=self._grant_access_worker,
+            args=(share_name, username, password, read_only, False), daemon=True,
+        ).start()
+
     def existing_account_grant_message(self, username):
         if self.wizard.system == "Windows":
             return (
@@ -1649,7 +1724,8 @@ class GUIWizard:
 
     def _change_access_level_for_selection(self):
         # No confirmation dialog - the button itself already shows the
-        # CURRENT level (eye/pencil icon, see _build_share_action_bar)
+        # CURRENT level (magnifying-glass/feather-pen icon, see
+        # _build_share_action_bar)
         # and doing this is a one-click toggle back if it was wrong,
         # unlike deleting a share or a user.
         share_name, username = self._selected_share_and_user()

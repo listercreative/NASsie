@@ -116,9 +116,31 @@ for name in sorted(all_groups):
 # followed by a fresh reinstall still skips the tour: tour_state()
 # only ever checks for this one file, and it survives right through
 # both the removal and the reinstall untouched.
-marker = _first_run_marker_path()
-if os.path.exists(marker):
-    os.remove(marker)
+#
+# _first_run_marker_path()'s own single path relies on SUDO_USER being
+# set correctly in THIS process - true for install.sh's own `sudo
+# apt-get remove`, but not guaranteed for every way someone might
+# actually run an uninstall (a GUI package manager's polkit-authenticated
+# root helper, `sudo -i` into a root shell first, `sudo dpkg -r`, etc. -
+# none of those are guaranteed to carry it through to this script the
+# same way). Reported live: the tour stayed skipped after a single
+# uninstall/reinstall, only actually clearing on a second cycle - i.e.
+# exactly the symptom of this only sometimes finding the right file.
+# Glob every real local user's home instead of trusting one resolved
+# path - this always runs as root regardless of how it was invoked, so
+# it can read across all of them, and removing NASsie's own tiny
+# first-run marker for every local user on an uninstall is harmless even
+# for ones who never touched NASsie (there's nothing to remove for them).
+import glob
+markers = set(glob.glob('/home/*/.config/nassie/tour_seen'))
+markers.add('/root/.config/nassie/tour_seen')
+markers.add(_first_run_marker_path())
+removed_any = False
+for marker in markers:
+    if os.path.exists(marker):
+        os.remove(marker)
+        removed_any = True
+if removed_any:
     print("Reset the first-run tour for the next install.")
 PYEOF
         python3 "$nassie_prerm_script" < /dev/tty > /dev/tty 2> /dev/tty || true
