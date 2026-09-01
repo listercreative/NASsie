@@ -78,10 +78,16 @@ QR_PASSWORD_RESET_NOTE = (
 # /etc/samba/smb.conf (see _add_samba_share_config) and passed to
 # New-SmbShare on Windows - an unrestricted name (e.g. containing "]" and a
 # newline) can break out of its own config block and inject arbitrary smb.conf
-# directives. Deliberately tight (letters/digits/space/-/_ only, no "[", "]",
-# quotes, or control characters) rather than just blocking the handful of
-# characters known to be dangerous today.
-SHARE_NAME_MAX_LEN = 10
+# directives. Deliberately tight on CHARACTERS (letters/digits/space/-/_
+# only, no "[", "]", quotes, or control characters) rather than just
+# blocking the handful of characters known to be dangerous today. The
+# length cap itself isn't a protocol limit (Samba/Windows both allow much
+# longer share names; the old 8-char NetBIOS-name-over-port-137 ceiling
+# doesn't apply to modern SMB2/3) - 10 was needlessly tight in practice,
+# rejecting any reasonably descriptive underscore/hyphen-joined name
+# (e.g. "shared_docs" alone is already 11) well before the character
+# restriction above ever came into play.
+SHARE_NAME_MAX_LEN = 32
 SHARE_NAME_RE = re.compile(r'^[A-Za-z0-9 _-]+$')
 
 # Usernames are also written unescaped into smb.conf's "valid users"/"read

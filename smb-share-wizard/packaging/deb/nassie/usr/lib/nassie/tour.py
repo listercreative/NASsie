@@ -18,7 +18,7 @@ _BORDER_THICKNESS = 3
 _WHOLE_WINDOW = object()
 
 
-def _bring_to_front(win):
+def _bring_to_front(win, steal_focus=True):
     # Same "-topmost toggle" trick gui.py's own _bring_window_to_front()
     # uses (duplicated rather than imported - gui.py imports FROM this
     # module, not the other way around): some window managers (GNOME/
@@ -29,11 +29,43 @@ def _bring_to_front(win):
     # dialog, a native messagebox) had brought to front instead - the
     # user finding the main NASsie window buried behind other apps after
     # a step closed, not just its callout.
+    #
+    # Ends up "-topmost" TRUE, permanently - not toggled back off (an
+    # earlier version reset it to False here, matching gui.py's
+    # _bring_window_to_front() at the time). Explicitly reverted: every
+    # NASsie window needs to stay above other applications on the
+    # desktop for as long as it's open, not just flash to the front once
+    # - see gui.py's _bring_window_to_front() for the full reasoning
+    # (same fix, same rationale, duplicated here rather than imported
+    # since gui.py imports FROM this module, not the other way around).
+    #
+    # The False->update()->True sequence, not just setting True once, is
+    # still needed even though the end state is the same either way: Tk
+    # only re-evaluates stacking on an actual VALUE CHANGE of the
+    # attribute, so setting True on a window that's ALREADY True (every
+    # NASsie window, permanently, after its first raise) would silently
+    # no-op and never actually re-stack it above whichever OTHER
+    # already-topmost NASsie window is currently in front - dropping to
+    # False first (and update()'s synchronous round trip actually
+    # landing that, not a deferred win.after() - see gui.py's comment
+    # for the cross-window race that caused) forces the following True
+    # to register as a real transition again.
+    #
+    # steal_focus=False skips focus_force() - used by the periodic
+    # self-reassertion in GuiTour._schedule_reassert(), where forcing
+    # KEYBOARD focus onto the container every 1.5s would yank it away
+    # from whatever field the user is actively typing into (the share
+    # name, a password, ...) far more disruptively than the visibility
+    # problem this is working around. Raising the window without
+    # grabbing focus is still enough to keep it visually in front.
     try:
-        win.attributes("-topmost", True)
-        win.attributes("-topmost", False)
+        win.deiconify()
         win.lift()
-        win.focus_force()
+        win.attributes("-topmost", False)
+        win.update()
+        win.attributes("-topmost", True)
+        if steal_focus:
+            win.focus_force()
     except tk.TclError:
         pass
 
@@ -272,18 +304,35 @@ class _Callout(tk.Toplevel):
     # manual escape hatch throughout (relabeled "Close" for the final,
     # non-gated step).
     def __init__(self, parent_window, title, text, step_num, step_total, on_skip, skip_label="Skip Tour"):
+        # step_num=None omits the "Step X of Y" label entirely - used for
+        # the finish step, where a step count reads as odd right after
+        # "you're all set" (there's nothing left to count toward).
         super().__init__(parent_window)
+        # Withdrawn immediately, before anything below is even built -
+        # Tk maps a Toplevel as soon as it exists, at whatever size its
+        # widgets currently request (unwrapped text, no wraplength
+        # applied yet, before any of the content below is packed) - left
+        # visible, that showed up as one real, visible frame of the
+        # callout at the wrong (too large) size before place_near()/
+        # place_outside_container() ever got a chance to compute and
+        # apply its actual size and position. deiconify() happens once,
+        # in GuiTour._show_step()/_show_finish(), only after that first
+        # real placement has already been applied.
+        self.withdraw()
         self.transient(parent_window)
         self.overrideredirect(True)
-        # No "-topmost": that pins it above EVERY window on the desktop,
-        # not just NASsie's own - switch to an unrelated app and the
-        # callout stayed floating on top of it too, since an
-        # overrideredirect window isn't WM-managed and nothing else was
-        # ever telling it to get out of the way. GuiTour's focus-in/out
-        # tracking on the container (also set up in _track_container())
-        # raises/lowers this instead, so it only stays above other
-        # windows while NASsie itself is the focused app - the same as
-        # any of NASsie's own dialogs behave.
+        # "-topmost", left on permanently (not toggled based on focus,
+        # which an earlier version of this did - explicitly reverted:
+        # hiding the callout when NASsie loses focus read as it randomly
+        # vanishing, which was worse than staying visible). This pins it
+        # above every window on the desktop, including other apps, but
+        # that's the deliberately chosen tradeoff over disappearing - and
+        # unlike the stacking-order tricks elsewhere in this file
+        # (needed because an overrideredirect window isn't managed by
+        # this Wayland/XWayland setup's WM at all), "-topmost" is a
+        # native, reliable window attribute on Windows too, so this
+        # behaves the same on both platforms.
+        self.attributes("-topmost", True)
         self.configure(bg=_HIGHLIGHT_COLOR, padx=2, pady=2)
 
         inner = tk.Frame(self, bg=_CALLOUT_BG)
@@ -304,7 +353,8 @@ class _Callout(tk.Toplevel):
         btn_row = tk.Frame(inner, bg=_CALLOUT_BG)
         btn_row.pack(fill="x", padx=10, pady=(0, 10))
 
-        ttk.Label(btn_row, text=f"Step {step_num} of {step_total}", background=_CALLOUT_BG).pack(side="left")
+        if step_num is not None:
+            ttk.Label(btn_row, text=f"Step {step_num} of {step_total}", background=_CALLOUT_BG).pack(side="left")
         ttk.Button(btn_row, text=skip_label, command=on_skip).pack(side="right")
 
     def set_text(self, text):
@@ -376,6 +426,35 @@ class _Callout(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
         self.lift()
 
+    def place_below_titlebar(self, container):
+        # For a step whose whole point is the window's own native close
+        # button (top-right corner, minimize/maximize/close) - that's WM/
+        # OS chrome, outside container's own client-area coordinates, so
+        # it can't be highlighted or pointed at directly the way a normal
+        # widget can (see _HighlightBox.place_around_container()'s
+        # docstring for the same limit on the highlight box). Anchoring
+        # the callout to the window's top-right corner instead of below
+        # its bottom edge (the generic place_near() whole-window
+        # fallback) at least puts it as close to those controls as Tk's
+        # own coordinate space allows, rather than ~a full window-height
+        # away from what it's actually talking about.
+        self.update_idletasks()
+        w = self.winfo_reqwidth()
+        h = self.winfo_reqheight()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        container.update_idletasks()
+        cx = container.winfo_rootx()
+        cy = container.winfo_rooty()
+        cw = container.winfo_width()
+        margin = 8
+        x = cx + cw - w
+        y = cy + margin
+        x = max(0, min(x, screen_w - w))
+        y = max(0, min(y, screen_h - h))
+        self.geometry(f"+{x}+{y}")
+        self.lift()
+
     def place_outside_container(self, container):
         # For a step with nothing of NASsie's own to point at - e.g. the
         # native tk_messageBox confirming a share/user was created, which
@@ -426,20 +505,23 @@ class _Callout(tk.Toplevel):
         cx = container.winfo_rootx()
         cy = container.winfo_rooty()
 
-        margin = 14
+        margin = 24
         # Below the CENTER (where a centered dialog actually sits), not
         # the container's own bottom edge - "below the whole window" put
         # this as much as ~500px from where the user is actually looking
         # on a tall window (reported live: read as disconnected from the
-        # app entirely, "far too low"). Every message this callout ever
+        # app entirely, "far too low"). The messages this callout
         # accompanies (see the docstring above - it's only ever the
-        # native "Done" confirmation after a share/user/attach action) is
-        # short: 1-3 lines, so a real tk_messageBox for one is reliably
-        # under ~220px tall. Clearing an estimated HALF of that below
-        # center is a much smaller, still-generally-safe gap, without
-        # needing this callout's own exact size (there's no reliable way
-        # to get that - see above).
-        estimated_dialog_half_height = 110
+        # native "Done" confirmation after a share/user/attach action) run
+        # up to a few lines - e.g. the apply-done message pairs a status
+        # line with a follow-up hint, close to 200px tall on its own
+        # before the title bar and button. Confirmed live overlapping a
+        # real dialog at the previous, tighter estimate (110/14) - sized
+        # up with real headroom rather than shaving it to the minimum
+        # that happened to work for the shortest message, since there's
+        # no reliable way to get this callout's own exact size (see
+        # above) and an extra gap costs far less than an overlap.
+        estimated_dialog_half_height = 160
         below_y = cy + ch // 2 + estimated_dialog_half_height + margin
         y = below_y if below_y + h <= screen_h else max(cy - margin - h, 0)
         x = cx + (cw - w) // 2
@@ -516,15 +598,15 @@ class GuiTour:
         # e.g. "Username and Password", not "Name the user".
         return [
             (lambda: gui.root, lambda: gui._new_share_btn,
-             "New Share", "Click here to create your first share user.",
+             "New Share", "Click here to create your first share.",
              "share_dialog_opened"),
             (lambda: self._active_window, lambda: self._active_window.name_entry,
-             "Share Name", "Give your share a name and continue.",
+             "Share Name", "Give your share a name and click OK.",
              "share_name_confirmed"),
             (lambda: self._active_window, lambda: self._active_window.path_entry,
              "Folder",
              "Pick a folder for this share, or leave the suggested default and click "
-             "Create Share to continue.",
+             "OK to continue.",
              "share_created"),
             # No widget (None) - the "Done" dialog that follows is a plain
             # tk_messageBox, not one of NASsie's own, so there's no Python
@@ -561,18 +643,26 @@ class GuiTour:
             # highlighting the whole window instead still makes
             # unambiguous which one the text means.
             (lambda: gui._user_mgmt_window, lambda: _WHOLE_WINDOW,
-             "Close", "Close this window to return to the main NASsie window.",
+             "Close", "Use the ✕ in this window's top-right corner to close it and return to the main "
+             "NASsie window.",
              "user_mgmt_closed"),
 
             (lambda: gui.root, lambda: self._newest_share_region(),
              "Shares", "Select your share to reveal its actions.",
              "share_selected"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar,
-             "Attach User",
-             "These icons let you add another user, attach an existing one, remove "
-             "access, change access level, or delete the share. Click the attach icon "
-             "(\U0001F517), then pick a user from the dropdown that appears here to continue.",
+             "Share Settings",
+             "Create a new user (+\U0001F464), Attach User (\U0001F517), delete share (\U0001F5D1). "
+             "Press Attach User then pick the user that you just created to assign it to this share.",
              "user_attached"),
+            # No widget (None) - same reasoning as the other
+            # "Confirmation" steps: this is the plain Tcl tk_messageBox
+            # after a successful attach, no Python widget handle to
+            # attach a highlight to. There's no separate password step
+            # here - the account just created via "New User" already got
+            # its Samba password at creation time (see
+            # GUIWizard._commit_inline_attach()'s comment), so attaching
+            # it to this first share never actually prompts for one.
             (lambda: gui.root, None,
              "Confirmation", "Click OK to confirm.",
              "attach_apply_confirmed"),
@@ -581,6 +671,20 @@ class GuiTour:
     def start(self):
         mark_tour_started()
         self.index = 0
+        # Several steps' own dialogs (CreateShareDialog, AddUserDialog,
+        # QrCodeDialog, ChoiceDialog, plus stdlib messagebox/simpledialog)
+        # call grab_set() - a LOCAL grab restricted to this application,
+        # which is exactly what makes the Skip Tour button on the
+        # callout (a separate Toplevel) unclickable while any of them is
+        # open (reported live: stuck on the Password prompt with no way
+        # out). bind_all attaches to the "all" bindtag, which every
+        # widget in the app carries regardless of which one currently
+        # holds the grab, so this reaches the user even then - confirmed
+        # against tkinter.simpledialog.Dialog's own Escape-to-cancel
+        # binding, which doesn't return "break" and so doesn't swallow
+        # this. Scoped to the tour's own lifetime, not left as a global
+        # app-wide Escape handler.
+        self.root.bind_all("<Escape>", lambda e: self.stop())
         self._show_step()
 
     def _show_step(self):
@@ -618,7 +722,7 @@ class GuiTour:
 
         self._callout = _Callout(container, title, text, self.index + 1, len(self.steps), on_skip=self.stop)
         if widget is _WHOLE_WINDOW:
-            self._callout.place_near(container)
+            self._callout.place_below_titlebar(container)
         elif widget is not None:
             self._callout.place_near(widget)
         else:
@@ -643,6 +747,9 @@ class GuiTour:
                     except tk.TclError:
                         pass
             container.after(120, _self_correct)
+        # Revealed only now, after the real placement above - see the
+        # withdraw() in _Callout.__init__ for why.
+        self._callout.deiconify()
         self._wait_event = wait_event
         self._track_container(container, widget)
 
@@ -653,96 +760,66 @@ class GuiTour:
         # _Callout is a separate Toplevel in absolute screen coordinates
         # (see its docstring for why), so nothing repositions it on its
         # own - re-run place_near() whenever the container actually moves
-        # or resizes. Same idea for stacking: bind focus in/out on the
-        # container to hide/show the callout with it, so it only appears
-        # while NASsie is the focused app.
+        # or resizes.
         #
-        # This actually UNMAPS the window (withdraw/deiconify), not just a
-        # stacking-order request (lower()/lift(), tried first) - under
-        # Wayland (XWayland here; see XDG_SESSION_TYPE), the compositor
-        # treats an overrideredirect window as an "unmanaged" popup surface
-        # and doesn't reliably honor raw X restack requests for it the way
-        # a native X11 WM would, so lower() was getting called (confirmed)
-        # without the callout actually disappearing behind whatever the
-        # user clicked over to. An unmapped window isn't a stacking
-        # heuristic - it's simply not drawn - so this holds regardless of
-        # compositor.
-        def place_callout():
-            # Shared by reposition() and show_callout().
-            if widget is _WHOLE_WINDOW:
-                self._highlight.place_around_container()
-                self._callout.place_near(container)
-            elif widget is not None:
-                self._highlight.place_around(widget)
-                self._callout.place_near(widget)
-            else:
-                self._callout.place_outside_container(container)
-
+        # No focus in/out tracking here - a prior version hid/showed the
+        # callout with NASsie's own focus (withdraw()/deiconify()), which
+        # made it vanish the instant you clicked anywhere outside the
+        # dialog it was pointing into, including the main NASsie window
+        # itself. That read as it randomly disappearing, not as helpful
+        # restraint - explicitly reverted in favor of just staying
+        # visible always (see _Callout's own "-topmost" comment).
         def reposition(event=None):
             if self._callout is None:
                 return
             try:
-                place_callout()
+                if widget is _WHOLE_WINDOW:
+                    self._highlight.place_around_container()
+                    self._callout.place_below_titlebar(container)
+                elif widget is not None:
+                    self._highlight.place_around(widget)
+                    self._callout.place_near(widget)
+                else:
+                    self._callout.place_outside_container(container)
             except tk.TclError:
                 pass
 
-        def show_callout(event=None):
-            if self._callout is not None:
-                try:
-                    self._callout.deiconify()
-                    place_callout()
-                    self._callout.lift()
-                except tk.TclError:
-                    pass
-
-        def hide_callout(event=None):
-            if self._callout is None:
-                return
-            # Deferred, and re-checked once focus has actually settled -
-            # a container's own <FocusOut> fires just as readily when
-            # focus moves to one of NASSIE'S OWN child windows (a native
-            # messagebox.showinfo() this step's own container just
-            # opened, in particular - confirmed live: the "Share Creation
-            # Succeeded" dialog's own appearance was hiding this exact
-            # step's callout the instant it showed up) as when it moves
-            # to an unrelated external app, and there's nothing in the
-            # event itself to tell those apart. Tk's focus_get() DOES:
-            # it returns the focused widget only while focus is
-            # somewhere within THIS application, and None once it's
-            # moved to a different one entirely - checking that instead
-            # of hiding unconditionally is what keeps this step's own
-            # dialogs from hiding its own explanation of them.
-            def _maybe_hide():
-                if self._callout is None:
-                    return
-                try:
-                    # focus_get() resolves Tk's raw focus path back to a
-                    # Python widget object - and can itself raise
-                    # KeyError, not just TclError, when that path is an
-                    # internal ttk implementation widget with no such
-                    # object (confirmed live: a ttk.Combobox's own
-                    # dropdown listbox, right as a selection commits from
-                    # it). Treated the same as "still focused somewhere
-                    # in this app" (don't hide) rather than as a reason
-                    # to hide - failing toward "stays visible" is the
-                    # safe direction here, the same as the bug this whole
-                    # check exists to fix.
-                    focused = container.focus_get()
-                except (tk.TclError, KeyError):
-                    return
-                if focused is not None:
-                    return
-                try:
-                    self._callout.withdraw()
-                except tk.TclError:
-                    pass
-            container.after(50, _maybe_hide)
-
         self._tracking = [
             (container, "<Configure>", container.bind("<Configure>", reposition, add="+")),
-            (container, "<FocusIn>", container.bind("<FocusIn>", show_callout, add="+")),
-            (container, "<FocusOut>", container.bind("<FocusOut>", hide_callout, add="+")),
         ]
+        self._schedule_reassert(container)
+
+    def _schedule_reassert(self, container):
+        # Practical workaround for a real platform limitation, not a
+        # proper fix - there isn't one available here: this session's
+        # window manager (GNOME/Mutter, Wayland via XWayland-rootless)
+        # doesn't actually apply "-topmost"/_NET_WM_STATE_ABOVE requests
+        # at all - confirmed directly against the real X11 window
+        # property with xprop, not just by trusting Tk's own report of
+        # what it did (Tk claims success; the property is never set).
+        # There's no STATIC flag that reliably keeps a normal, fully-
+        # decorated window (unlike the tour callout - see its own
+        # "-topmost" comment for why THAT one doesn't have this problem)
+        # above other applications once set, on this WM. Repeatedly
+        # re-asserting it instead - every 1.5s, for as long as this
+        # step's container is still the current one - means it self-
+        # heals shortly after losing front position rather than staying
+        # lost, which is the best available fallback here.
+        my_callout = self._callout
+
+        def _reassert():
+            if self._callout is not my_callout:
+                # This step has moved on (a new one showing, or the tour
+                # stopped entirely) - let the loop end rather than keep
+                # raising a container nothing points into anymore.
+                return
+            try:
+                _bring_to_front(container, steal_focus=False)
+            except tk.TclError:
+                return
+            container.after(1500, _reassert)
+
+        container.after(1500, _reassert)
 
     def _untrack_container(self):
         for widget, event, funcid in self._tracking:
@@ -780,7 +857,7 @@ class GuiTour:
         # regardless of whether the tour is even running.
         if self._callout is None or self._wait_event != "share_name_confirmed":
             return
-        self._callout.set_text(f"That name didn't work — {message} Fix it and click Next again.")
+        self._callout.set_text(f"That name didn't work — {message} Fix it and click OK again.")
         # Re-run this step's own widget_fn, not a cached reference - the
         # dialog is still the same one, but the text changing size means
         # the callout itself may have changed size too.
@@ -810,10 +887,14 @@ class GuiTour:
         self._highlight.place_around(widget)
         self._callout = _Callout(
             self.root, "You're all set!",
-            "Your share now has a user attached to it and is ready to connect to.",
-            len(self.steps), len(self.steps), on_skip=self.stop, skip_label="Close",
+            "You now have a live SMB share with an attached user. If a QR code prompt is open behind "
+            "this, choose Yes to get an easy way to connect from another device.",
+            None, len(self.steps), on_skip=self.stop, skip_label="Close",
         )
         self._callout.place_near(widget)
+        # Revealed only now, after the real placement above - see the
+        # withdraw() in _Callout.__init__ for why.
+        self._callout.deiconify()
         self._wait_event = None
         self._track_container(self.root, widget)
 
@@ -825,6 +906,7 @@ class GuiTour:
         # vanished bailout, which isn't a deliberate choice at all.
         if completed:
             mark_tour_completed()
+        self.root.unbind_all("<Escape>")
         self._teardown_current()
 
     def _teardown_current(self):
