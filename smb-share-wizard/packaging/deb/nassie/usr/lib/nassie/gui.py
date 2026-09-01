@@ -511,7 +511,7 @@ class CreateShareDialog(tk.Toplevel):
         action_frame = ttk.Frame(self.name_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
         _icon_button(action_frame, "✔", "Next", self._confirm_name).pack(side="left")
-        _icon_button(action_frame, "✖", "Close", self._on_close).pack(side="right")
+        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right")
 
     def _build_path_page(self):
         self.path_page = ttk.Frame(self)
@@ -536,7 +536,7 @@ class CreateShareDialog(tk.Toplevel):
         _icon_button(action_frame, "◀", "Back", self._show_name_page).pack(side="left")
         self.create_button = _icon_button(action_frame, "✔", "Create Share", self._on_create_share)
         self.create_button.pack(side="left", padx=(4, 0))
-        _icon_button(action_frame, "✖", "Close", self._on_close).pack(side="right")
+        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right")
 
     def _show_name_page(self):
         self.path_page.pack_forget()
@@ -677,12 +677,19 @@ class CreateShareDialog(tk.Toplevel):
             # messagebox rather than nesting a new grab underneath it.
             self.destroy()
             self.app._notify_tour("share_created")
-            self.app._tour_watch_dialog(self.app.root)
             messagebox.showinfo(
                 "Share Creation Succeeded",
                 "Configuration attempt finished — see the log for details.\n\n"
                 "Add users from the shares list (New User / Attach User) whenever you're ready.",
             )
+            # _patch_messagebox_front's own -topmost toggle drops back to
+            # False the instant this returns (its finally block, right as
+            # OK is clicked) - some window managers read that as "no
+            # longer wants focus" and drop the main window behind
+            # whatever else is on screen. Explicitly re-raising it here
+            # closes that gap rather than counting on the NEXT tour
+            # step's own _bring_to_front() to happen fast enough.
+            _bring_window_to_front(self.app.root)
             self.app._notify_tour("share_apply_confirmed")
         else:
             self.create_button.configure(state="normal")
@@ -1163,16 +1170,6 @@ class GUIWizard:
         if tour:
             tour.on_event(event, window=window)
 
-    def _tour_watch_dialog(self, parent):
-        # Call right before a blocking messagebox.showX() call whose
-        # preceding _notify_tour() just showed a widget=None step's
-        # callout centered over `parent` - see GuiTour.
-        # attach_callout_to_next_dialog(), which repositions it below the
-        # real dialog once it actually exists.
-        tour = getattr(self, "_tour", None)
-        if tour:
-            tour.attach_callout_to_next_dialog(parent)
-
     def _start_tour(self):
         # Rebuilt each time rather than cached - a stale GuiTour with a
         # half-run index would otherwise resume mid-tour instead of
@@ -1592,8 +1589,11 @@ class GUIWizard:
             self._append_log(log_output)
         if added:
             self._notify_tour("user_attached")
-            self._tour_watch_dialog(self.root)
             messagebox.showinfo("Added", f"Added '{username}' to share '{share_name}'.")
+            # See _apply_done's identical call for why this is needed
+            # right here, not left to the next tour step's own
+            # _bring_to_front().
+            _bring_window_to_front(self.root)
             self._notify_tour("attach_apply_confirmed")
             # password is None for an existing, unmanaged Windows account
             # NASsie deliberately left untouched (see
@@ -1664,8 +1664,11 @@ class GUIWizard:
             self._append_log(log_output)
         if created:
             self._notify_tour("user_created")
-            self._tour_watch_dialog(self.root)
             messagebox.showinfo("User Created", f"'{username}' has been created.")
+            # See _apply_done's identical call for why this is needed
+            # right here, not left to the next tour step's own
+            # _bring_to_front().
+            _bring_window_to_front(self.root)
             self._notify_tour("user_apply_confirmed")
         else:
             messagebox.showerror("Failed", f"Could not set up user '{username}' — see log.")
