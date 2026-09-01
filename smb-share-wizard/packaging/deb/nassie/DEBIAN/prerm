@@ -20,18 +20,40 @@ if { [ "$1" = "remove" ] || [ "$1" = "purge" ]; } && [ -z "$NASSIE_REINSTALLING"
         # fd 0 for /dev/tty.
         nassie_prerm_script=$(mktemp)
         cat > "$nassie_prerm_script" <<'PYEOF'
+import os
+import subprocess
 import sys
 sys.path.insert(0, '/usr/lib/nassie')
 from core import SMBWizard
+from tour import _first_run_marker_path
 
 w = SMBWizard()
-# Only shares carrying NASsie's own group-naming signature - a share
-# NASsie didn't create (pre-existing, or made through some other tool)
-# should never be touched here.
-shares = [
-    s for s in w.list_shares()
-    if s.get('group') and (s['group'].startswith('smbshare_') or s['group'].startswith('nassie_')) and s.get('path')
-]
+
+
+def _group_exists(name):
+    return subprocess.run(["getent", "group", name], capture_output=True).returncode == 0
+
+
+# A share counts as NASsie's own if the ownership group NASsie itself
+# unconditionally creates for every share it makes (_ensure_group() in
+# run_linux(), right after _share_group_name()) actually exists - NOT
+# whether the share's directory is CURRENTLY owned by that group.
+# Those can genuinely differ: _grant_directory_access() deliberately
+# skips chgrp'ing a directory that already existed before the share was
+# created, to avoid clobbering ownership on what could be an unrelated
+# pre-existing folder (see its own comment) - so a share pointed at a
+# pre-existing path stays fully configured and real, but its folder's
+# group never becomes smbshare_<slug>. Checking the live directory group
+# (as this used to) silently dropped exactly that share from cleanup
+# entirely - no prompt, nothing removed - even though it's unambiguously
+# still a NASsie share sitting in smb.conf.
+shares = []
+for s in w.list_shares():
+    if not s.get('path'):
+        continue
+    expected_group = w._share_group_name(s['name'])
+    if _group_exists(expected_group):
+        shares.append(dict(s, group=expected_group))
 
 # Every NASsie-owned share's ownership group - captured before
 # delete_share() below removes the share, since list_groups() never
@@ -86,6 +108,18 @@ for u in w.list_users():
 
 for name in sorted(all_groups):
     w.delete_group(name)
+
+# The first-run tour marker lives outside the package too (~/.config/
+# nassie, or root's/the real sudo user's equivalent - see
+# _first_run_marker_path()) - apt has no idea it exists either, so
+# nothing else would ever clear it. Without this, a genuine uninstall
+# followed by a fresh reinstall still skips the tour: has_seen_tour()
+# only ever checks for this one file, and it survives right through
+# both the removal and the reinstall untouched.
+marker = _first_run_marker_path()
+if os.path.exists(marker):
+    os.remove(marker)
+    print("Reset the first-run tour for the next install.")
 PYEOF
         python3 "$nassie_prerm_script" < /dev/tty > /dev/tty 2> /dev/tty || true
         rm -f "$nassie_prerm_script"

@@ -87,6 +87,7 @@ class _Tooltip:
         self.widget = widget
         self.text = text
         self.tip = None
+        self._focus_binding = None
         widget.bind("<Enter>", self._show, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<Destroy>", self._hide, add="+")
@@ -99,17 +100,34 @@ class _Tooltip:
         self.tip = tk.Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
-        try:
-            self.tip.wm_attributes("-topmost", True)
-        except tk.TclError:
-            pass
         ttk.Label(
             self.tip, text=self.text, background="#ffffe0", relief="solid", borderwidth=1, padding=(4, 2),
         ).pack()
+        self.tip.lift()
+        # No "-topmost" - same fix as GuiTour's _Callout (see tour.py):
+        # it pins the tooltip above EVERY window on the desktop, not just
+        # NASsie's own. And <Leave> alone doesn't reliably clean this up
+        # either - switching to another window WITHOUT the mouse actually
+        # leaving the button first (Alt-Tab, clicking a taskbar icon)
+        # never fires it, leaving the tooltip floating over whatever's
+        # now in front. Hiding on the owning window's own FocusOut closes
+        # that gap.
+        toplevel = self.widget.winfo_toplevel()
+        self._focus_binding = (toplevel, toplevel.bind("<FocusOut>", self._hide, add="+"))
 
     def _hide(self, event=None):
+        if self._focus_binding:
+            toplevel, funcid = self._focus_binding
+            try:
+                toplevel.unbind("<FocusOut>", funcid)
+            except tk.TclError:
+                pass
+            self._focus_binding = None
         if self.tip:
-            self.tip.destroy()
+            try:
+                self.tip.destroy()
+            except tk.TclError:
+                pass
             self.tip = None
 
 
@@ -251,89 +269,65 @@ class _SortableTree:
 
 
 class AddUserDialog(tk.Toplevel):
-    """mode="create": a typed username that must NOT already exist -
-    creating a brand-new account. mode="attach": pick an EXISTING username
-    only, no typing - granting an already-existing account access. These
-    used to be the same combobox (type a new name or pick an old one) -
-    splitting them is the whole point: "type a name" and "pick a name" are
-    different intents, and conflating them made it easy to accidentally
-    reset an existing account's password when you meant to create a new
-    one, or vice versa."""
-    def __init__(self, parent, mode, existing_usernames=(), show_access_level=True, app=None, has_credentials=()):
+    """Creates a brand-new account - a typed username that must NOT
+    already exist. Granting an EXISTING account access to a share is a
+    separate, inline flow now (see GUIWizard._attach_user_to_selected_
+    share()/_build_inline_attach()) - not this dialog; conflating "type a
+    new name" and "pick an old one" in one combobox used to make it easy
+    to accidentally reset an existing account's password when you meant
+    to create a new one, or vice versa, and a whole second dialog just to
+    pick a name from a list was more than that one choice needed anyway."""
+    def __init__(self, parent, existing_usernames=(), show_access_level=True, app=None):
         super().__init__(parent)
-        self.mode = mode
         self.existing_usernames = set(existing_usernames)
-        # attach mode only: usernames that already have valid Samba/SMB
-        # credentials from some OTHER share - Samba (and, worse, macOS)
-        # store one password per account, not one per share, so an
-        # account already attached anywhere else doesn't need a new one
-        # just to attach it here too. See core._add_user_to_share_linux's
-        # comment for the full reasoning.
-        self.has_credentials = set(has_credentials)
         self._app = app
-        self.title("New User" if mode == "create" else "Attach User")
+        self.title("New User")
         self.resizable(False, False)
         self.transient(parent)
         self.result = None
 
         ttk.Label(self, text="Username:").grid(row=0, column=0, sticky="e", padx=8, pady=6)
         self.username_var = tk.StringVar()
-        if mode == "attach":
-            self.username_entry = ttk.Combobox(
-                self, textvariable=self.username_var, values=sorted(self.existing_usernames), state="readonly",
-            )
-            self.username_entry.bind("<<ComboboxSelected>>", self._update_password_visibility)
-        else:
-            username_vcmd = (self.register(self._validate_username_input), "%P")
-            self.username_entry = ttk.Entry(
-                self, textvariable=self.username_var, validate="key", validatecommand=username_vcmd,
-            )
+        username_vcmd = (self.register(self._validate_username_input), "%P")
+        self.username_entry = ttk.Entry(
+            self, textvariable=self.username_var, validate="key", validatecommand=username_vcmd,
+        )
         self.username_entry.grid(row=0, column=1, padx=8, pady=6)
 
-        # One grid cell (row 1) toggles between the password fields and a
-        # note explaining why they're not needed - see
-        # _update_password_visibility - rather than the fields just
-        # disappearing and leaving a gap, or the layout renumbering rows
-        # underneath them.
-        self.password_frame = ttk.Frame(self)
-        ttk.Label(self.password_frame, text="Password:").grid(row=0, column=0, sticky="e", padx=8, pady=6)
-        self.password_entry = ttk.Entry(self.password_frame, show="*")
-        self.password_entry.grid(row=0, column=1, padx=8, pady=6)
-        ttk.Label(self.password_frame, text="Confirm Password:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
-        self.confirm_entry = ttk.Entry(self.password_frame, show="*")
-        self.confirm_entry.grid(row=1, column=1, padx=8, pady=6)
-
-        self.credentials_note = ttk.Label(
-            self,
-            text="This account already has file-sharing access set up elsewhere - no new "
-                 "password needed.",
-            wraplength=260, justify="left",
-        )
+        # Gridded directly in THIS dialog, not a nested Frame with its own
+        # independent grid - a nested frame's column widths are negotiated
+        # separately from the parent's, which left "Confirm Password:"
+        # (wider than "Username:") pushing its entry out of alignment with
+        # the username field above it.
+        ttk.Label(self, text="Password:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
+        self.password_entry = ttk.Entry(self, show="*")
+        self.password_entry.grid(row=1, column=1, padx=8, pady=6)
+        ttk.Label(self, text="Confirm Password:").grid(row=2, column=0, sticky="e", padx=8, pady=6)
+        self.confirm_entry = ttk.Entry(self, show="*")
+        self.confirm_entry.grid(row=2, column=1, padx=8, pady=6)
 
         # Only relevant when this user is being granted access to a share -
         # not shown for standalone user creation, which has no share (and
         # so no access level) to set at all.
         self.show_access_level = show_access_level
         self.read_only_var = tk.BooleanVar(value=False)
-        next_row = 2
+        next_row = 3
         if show_access_level:
             ttk.Checkbutton(
                 self, text="Read-only access", variable=self.read_only_var
-            ).grid(row=2, column=0, columnspan=2, pady=(0, 6))
-            next_row = 3
+            ).grid(row=3, column=0, columnspan=2, pady=(0, 6))
+            next_row = 4
 
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=next_row, column=0, columnspan=2, pady=10)
         _icon_button(btn_frame, "✔", "OK", self._on_ok).pack(side="left", padx=4)
         _icon_button(btn_frame, "✖", "Cancel", self.destroy).pack(side="left", padx=4)
 
-        self._update_password_visibility()
         self.username_entry.focus_set()
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
         if self._app is not None:
-            event = "user_dialog_opened" if mode == "create" else "attach_dialog_opened"
-            self._app._notify_tour(event, window=self)
+            self._app._notify_tour("user_dialog_opened", window=self)
         self.grab_set()
         self.wait_window(self)
 
@@ -346,57 +340,34 @@ class AddUserDialog(tk.Toplevel):
             return True
         return len(proposed) <= USERNAME_MAX_LEN and bool(USERNAME_RE.match(proposed))
 
-    def _needs_password(self):
-        username = self.username_var.get().strip()
-        return not (self.mode == "attach" and username in self.has_credentials)
-
-    def _update_password_visibility(self, event=None):
-        if self._needs_password():
-            self.credentials_note.grid_remove()
-            self.password_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
-        else:
-            self.password_frame.grid_remove()
-            self.credentials_note.grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=6)
-
     def _on_ok(self):
         username = self.username_var.get().strip()
-        needs_password = self._needs_password()
-        password = self.password_entry.get() if needs_password else None
-        confirm = self.confirm_entry.get() if needs_password else None
+        password = self.password_entry.get()
+        confirm = self.confirm_entry.get()
 
         if not username:
+            messagebox.showerror("Invalid input", "Username cannot be empty.", parent=self)
+            return
+
+        username_ok, username_message = SMBWizard.check_username(username)
+        if not username_ok:
+            messagebox.showerror("Invalid input", username_message, parent=self)
+            return
+        if username in self.existing_usernames:
             messagebox.showerror(
-                "Invalid input",
-                "Select a username." if self.mode == "attach" else "Username cannot be empty.",
+                "Already exists",
+                f"'{username}' already exists - use the attach dropdown on a share's row to "
+                "grant an existing account access instead.",
                 parent=self,
             )
             return
 
-        if self.mode == "create":
-            username_ok, username_message = SMBWizard.check_username(username)
-            if not username_ok:
-                messagebox.showerror("Invalid input", username_message, parent=self)
-                return
-            if username in self.existing_usernames:
-                messagebox.showerror(
-                    "Already exists",
-                    f"'{username}' already exists - use Attach User to grant an existing account "
-                    "access instead.",
-                    parent=self,
-                )
-                return
-        else:  # attach
-            if username not in self.existing_usernames:
-                messagebox.showerror("Invalid input", "Select an existing username.", parent=self)
-                return
-
-        if needs_password:
-            if not password:
-                messagebox.showerror("Invalid input", "Password cannot be empty.", parent=self)
-                return
-            if password != confirm:
-                messagebox.showerror("Invalid input", "Passwords do not match.", parent=self)
-                return
+        if not password:
+            messagebox.showerror("Invalid input", "Password cannot be empty.", parent=self)
+            return
+        if password != confirm:
+            messagebox.showerror("Invalid input", "Passwords do not match.", parent=self)
+            return
 
         self.result = {"username": username, "password": password}
         if self.show_access_level:
@@ -586,6 +557,14 @@ class CreateShareDialog(tk.Toplevel):
         self.name_page.pack_forget()
         self.path_page.pack(fill="both", expand=True)
         self.after_idle(lambda: _center_over_parent(self, self.app.root))
+        # After the re-center above, not before - the tour's own callout
+        # placement (triggered synchronously by this) reads this dialog's
+        # CURRENT position, so it needs to see the recentered one, not the
+        # stale name-page position. update_idletasks() (which reading a
+        # widget's geometry always does) flushes idle callbacks in the
+        # order they were queued, so scheduling this after the recenter
+        # above is enough to guarantee that ordering.
+        self.app._notify_tour("share_name_confirmed", window=self)
 
     def _validate_name_input(self, proposed):
         # Blocks disallowed characters at the keystroke - see
@@ -698,15 +677,19 @@ class CreateShareDialog(tk.Toplevel):
             # messagebox rather than nesting a new grab underneath it.
             self.destroy()
             self.app._notify_tour("share_created")
+            self.app._tour_watch_dialog(self.app.root)
             messagebox.showinfo(
-                "Done",
+                "Share Creation Succeeded",
                 "Configuration attempt finished — see the log for details.\n\n"
                 "Add users from the shares list (New User / Attach User) whenever you're ready.",
             )
+            self.app._notify_tour("share_apply_confirmed")
         else:
             self.create_button.configure(state="normal")
             messagebox.showerror(
-                "Failed", "Configuration attempt failed — see the log for details.", parent=self
+                "Share Creation Failed",
+                "Configuration attempt failed — see the log for details.",
+                parent=self,
             )
 
 
@@ -754,12 +737,20 @@ class UserManagementWindow(tk.Toplevel):
         self.app = app
         self.wizard = app.wizard
         self.title("User Management")
-        self.protocol("WM_DELETE_WINDOW", self.withdraw)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x", padx=8, pady=(8, 0))
         self._new_user_toolbar_btn = _icon_button(toolbar, "+👤", "New User", self._create_new_user)
         self._new_user_toolbar_btn.pack(side="left")
+        # An in-content Close button, not just the WM titlebar's own "X" -
+        # the tour's highlight box is a real child widget drawn inside
+        # NASsie's own window content (see _HighlightBox's docstring), so
+        # it physically can't be drawn over a window-manager-rendered
+        # decoration outside that content area. Without this, its "Close"
+        # step had nothing of NASsie's own left to point at.
+        self._close_toolbar_btn = _icon_button(toolbar, "✖", "Close", self._on_close)
+        self._close_toolbar_btn.pack(side="right")
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=8, pady=8)
@@ -809,6 +800,10 @@ class UserManagementWindow(tk.Toplevel):
         _bring_window_to_front(self)
         self.app._notify_tour("user_mgmt_opened", window=self)
 
+    def _on_close(self):
+        self.withdraw()
+        self.app._notify_tour("user_mgmt_closed")
+
     def refresh(self):
         selected = self._selected_username()
         users = self.wizard.list_users()
@@ -837,7 +832,7 @@ class UserManagementWindow(tk.Toplevel):
     def _create_new_user(self):
         existing = {u["username"] for u in self.wizard.list_users()}
         dialog = AddUserDialog(
-            self, mode="create", existing_usernames=existing, show_access_level=False, app=self.app
+            self, existing_usernames=existing, show_access_level=False, app=self.app
         )
         if not dialog.result:
             return
@@ -849,12 +844,53 @@ class UserManagementWindow(tk.Toplevel):
         self._change_password_flow(confirm_qr=True)
 
     def _show_qr(self):
-        # Same underlying operation as Change Password (see its comment
-        # for why a password change is the only honest way to do this) -
-        # confirm_qr=False just skips the separate "want to see it?" ask
-        # afterward, since clicking a dedicated Show QR button already is
-        # that confirmation.
-        self._change_password_flow(confirm_qr=False)
+        # Asks for the CURRENT password and verifies it live (see
+        # SMBWizard.verify_password()) rather than resetting it - unlike
+        # _change_password_flow, this never touches the account, so
+        # showing a QR code again doesn't invalidate whatever other
+        # devices already connected with the old one. Falls back to that
+        # reset flow only if verification fails - covers "I don't
+        # remember it" without forcing a reset on the common case.
+        username = self._selected_username()
+        if not username:
+            messagebox.showinfo("Show QR Code", "Select a user first.")
+            return
+        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
+        shares = user.get("shares", []) if user else []
+        if not shares:
+            messagebox.showinfo("Show QR Code", f"'{username}' doesn't have access to any share yet.")
+            return
+
+        password = simpledialog.askstring(
+            "Show QR Code", f"Enter '{username}'s current password to show their QR code:",
+            show="*", parent=self,
+        )
+        if not password:
+            return
+
+        # Any one of the user's own shares works - see
+        # _verify_password_linux for why a real ("guest ok = no") share
+        # has to be named on Linux specifically.
+        if not self.wizard.verify_password(username, password, shares[0]):
+            if messagebox.askyesno(
+                "Incorrect password",
+                "That doesn't match this account's current password.\n\n"
+                "Forgot it? Reset the password instead to generate a new QR code.",
+            ):
+                self._change_password_flow(confirm_qr=False)
+            return
+
+        if len(shares) == 1:
+            share_name = shares[0]
+        else:
+            dialog = ChoiceDialog(
+                self, "Choose share", "Show a QR code for which share?", shares, ok_label="Show",
+            )
+            if not dialog.result:
+                return
+            share_name = dialog.result
+
+        self.app._offer_qr_codes(share_name, [{"username": username, "password": password}], confirm=False)
 
     def _change_password_flow(self, confirm_qr):
         # Passwords are stored as hashes everywhere (Samba, Windows, macOS)
@@ -948,6 +984,13 @@ class UserManagementWindow(tk.Toplevel):
 class GUIWizard:
     def __init__(self):
         self.wizard = SMBWizard()
+        # Which shares_list item (if any) is currently showing the inline
+        # "Attach User" combobox instead of its normal action-bar icons -
+        # see _build_share_action_bar()/_attach_user_to_selected_share().
+        self._attaching_item = None
+        self._attaching_share = None
+        self._attaching_candidates = []
+        self._attaching_candidate_users = {}
 
         # className sets WM_CLASS, which is what taskbars/docks/app-switchers
         # use to match this running window back to nassie.desktop (and thus
@@ -1120,6 +1163,16 @@ class GUIWizard:
         if tour:
             tour.on_event(event, window=window)
 
+    def _tour_watch_dialog(self, parent):
+        # Call right before a blocking messagebox.showX() call whose
+        # preceding _notify_tour() just showed a widget=None step's
+        # callout centered over `parent` - see GuiTour.
+        # attach_callout_to_next_dialog(), which repositions it below the
+        # real dialog once it actually exists.
+        tour = getattr(self, "_tour", None)
+        if tour:
+            tour.attach_callout_to_next_dialog(parent)
+
     def _start_tour(self):
         # Rebuilt each time rather than cached - a stale GuiTour with a
         # half-run index would otherwise resume mid-tour instead of
@@ -1182,6 +1235,15 @@ class GUIWizard:
         self.shares_list.bind("<<TreeviewSelect>>", lambda e: self._notify_tour("share_selected"), add="+")
 
     def _build_share_action_bar(self, container, item):
+        # Attach mode replaces the normal icon row with an inline
+        # combobox for THIS specific item - see _attach_user_to_selected_
+        # share()/_build_inline_attach(). _RowActionBar rebuilds this bar
+        # from scratch on every selection/scroll/resize event, so this
+        # check has to happen on every call, not just once when attach
+        # mode is entered.
+        if item == self._attaching_item:
+            return self._build_inline_attach(container, item)
+
         parent = self.shares_list.parent(item)
         if parent:
             username = self.shares_list.set(item, "username") or None
@@ -1197,13 +1259,61 @@ class GUIWizard:
             _icon_button(
                 container, "➖👤", "Unattach User", self._unattach_selected_user
             ).pack(side="left", fill="y", padx=1)
+            # The icon itself doubles as the access-level badge (padlock
+            # closed = read-only, open = read-write) as well as the
+            # toggle control - clicking it flips the level immediately,
+            # no confirmation dialog (see _change_access_level_for_
+            # selection()). The row's own label (see
+            # _populate_shares_list()) carries the same information for
+            # when this bar isn't showing at all (nothing selected).
+            share_name, _ = self._selected_share_and_user()
+            share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
+            share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
+            read_only = bool(share_user and share_user.get("read_only"))
+            icon, tip = ("🔒", "Read-only - click to make read-write") if read_only else (
+                "🔓", "Read-write - click to make read-only"
+            )
             _icon_button(
-                container, "🔒", "Change Access Level", self._change_access_level_for_selection
+                container, icon, tip, self._change_access_level_for_selection
             ).pack(side="left", fill="y", padx=1)
         _icon_button(container, "🗑", "Delete Share", self._delete_selected_share).pack(
             side="left", fill="y", padx=1
         )
         return True
+
+    def _build_inline_attach(self, container, item):
+        # Selecting a value commits immediately - no OK/Cancel, no
+        # separate dialog window. See _attach_user_to_selected_share()
+        # for how attach mode is entered and _commit_inline_attach() for
+        # what happens on selection.
+        var = tk.StringVar()
+        combo = ttk.Combobox(
+            container, textvariable=var, values=self._attaching_candidates, state="readonly",
+        )
+        combo.pack(side="left", fill="both", expand=True, padx=1)
+        combo.bind("<<ComboboxSelected>>", lambda e: self._commit_inline_attach(var.get()))
+        _icon_button(container, "✖", "Cancel", self._cancel_inline_attach).pack(side="left", fill="y", padx=1)
+        # Opens the dropdown right away - the whole point of "contextual
+        # dropdown" is picking a user in one motion, not a second click
+        # just to open what clicking the attach icon conceptually already
+        # asked for. Guarded: by the time this fires, a fast selection (or
+        # Cancel) may have already rebuilt this bar out from under it via
+        # _RowActionBar.update(), destroying this exact combobox.
+        def _open_dropdown():
+            try:
+                combo.focus_set()
+                combo.event_generate("<Down>")
+            except tk.TclError:
+                pass
+        container.after(10, _open_dropdown)
+        return True
+
+    def _cancel_inline_attach(self):
+        self._attaching_item = None
+        self._attaching_share = None
+        self._attaching_candidates = []
+        self._attaching_candidate_users = {}
+        self._share_action_bar.update()
 
     def _selected_share_and_user(self):
         # Returns (share_name, username) - username is None when the
@@ -1275,7 +1385,12 @@ class GUIWizard:
                 "", tk.END, text=name, values=(path, ""), open=(name in open_shares) or name == selected_share,
             )
             for u in share.get("users", []):
-                label = u["username"] + (" (read-only)" if u.get("read_only") else "")
+                # Always shown, not just for the read-only exception -
+                # otherwise the level is invisible for every user until
+                # you select their row and see the toggle button's own
+                # icon (see _build_share_action_bar).
+                level = "read-only" if u.get("read_only") else "read-write"
+                label = f"{u['username']} ({level})"
                 override = overrides.get((name, u["username"]))
                 if override:
                     # Their own read-only setting above is masked by a
@@ -1303,7 +1418,7 @@ class GUIWizard:
             messagebox.showinfo("New User", "Select a share first.")
             return
         existing = {u["username"] for u in self.wizard.list_users()}
-        dialog = AddUserDialog(self.root, mode="create", existing_usernames=existing, app=self)
+        dialog = AddUserDialog(self.root, existing_usernames=existing, app=self)
         if not dialog.result:
             return
         username = dialog.result["username"]
@@ -1325,35 +1440,65 @@ class GUIWizard:
         if not candidates:
             messagebox.showinfo("Attach User", "Every existing user already has access to this share.")
             return
-        # Already attached to at least one OTHER share means already has
-        # valid Samba/SMB credentials - see AddUserDialog's has_credentials
-        # comment for why that means no new password is needed here.
-        has_credentials = {u["username"] for u in candidates if u.get("shares")}
-        dialog = AddUserDialog(
-            self.root, mode="attach", existing_usernames=[u["username"] for u in candidates],
-            has_credentials=has_credentials, app=self,
-        )
-        if not dialog.result:
+        selection = self.shares_list.selection()
+        if not selection:
             return
-        username = dialog.result["username"]
-        password = dialog.result["password"]
-        read_only = dialog.result.get("read_only", False)
+        # Full dicts (not just names) kept for _commit_inline_attach() -
+        # it needs "managed" (existing-computer-account safety check) and
+        # "shares" (has_credentials - see its own comment) per candidate,
+        # not just the name the combobox itself hands back.
+        self._attaching_item = selection[0]
+        self._attaching_share = share_name
+        self._attaching_candidates = [u["username"] for u in candidates]
+        self._attaching_candidate_users = {u["username"]: u for u in candidates}
+        self._share_action_bar.update()
+
+    def _commit_inline_attach(self, username):
+        share_name = self._attaching_share
+        candidate_users = self._attaching_candidate_users
+        self._attaching_item = None
+        self._attaching_share = None
+        self._attaching_candidates = []
+        self._attaching_candidate_users = {}
+        if not username:
+            self._share_action_bar.update()
+            return
+
+        # Already attached to at least one OTHER share means already has
+        # valid Samba/SMB credentials - Samba (and, worse, macOS) store
+        # one password per account, not one per share, so an account
+        # already attached elsewhere doesn't need a new one just to
+        # attach it here too. See core._add_user_to_share_linux's comment
+        # for the full reasoning.
+        existing_user = candidate_users.get(username)
+        password = None
+        if not (existing_user and existing_user.get("shares")):
+            password = simpledialog.askstring(
+                "Password", f"Set a password for '{username}' on this share:", show="*", parent=self.root,
+            )
+            if not password:
+                self._share_action_bar.update()
+                return
 
         # A name matching a real, pre-existing computer account (not one
         # NASsie created) needs a heads-up before granting it access, and
         # on Windows must never actually use the typed password - see
         # existing_account_grant_message()/_add_user_to_share_windows.
-        existing_user = next((u for u in candidates if u["username"] == username), None)
         if existing_user and not existing_user.get("managed", False):
             if not messagebox.askyesno(
                 "Existing computer account", self.existing_account_grant_message(username)
             ):
+                self._share_action_bar.update()
                 return
             if self.wizard.system == "Windows":
                 password = None
 
+        # New attaches default to read-write - access level is now a
+        # one-click toggle on the row itself (see _build_share_action_bar)
+        # rather than a checkbox set once at attach time, so there's no
+        # reason to ask for it here too.
         threading.Thread(
-            target=self._grant_access_worker, args=(share_name, username, password, read_only), daemon=True
+            target=self._grant_access_worker, args=(share_name, username, password, False), daemon=True
         ).start()
 
     def _unattach_selected_user(self):
@@ -1388,6 +1533,10 @@ class GUIWizard:
         )
 
     def _change_access_level_for_selection(self):
+        # No confirmation dialog - the button itself already shows the
+        # CURRENT level (padlock closed/open, see _build_share_action_bar)
+        # and doing this is a one-click toggle back if it was wrong,
+        # unlike deleting a share or a user.
         share_name, username = self._selected_share_and_user()
         if not share_name or not username:
             messagebox.showinfo("Change Access Level", "Select a user under a share first.")
@@ -1395,13 +1544,6 @@ class GUIWizard:
         share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
         share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
         current_read_only = share_user.get("read_only", False) if share_user else False
-        current_label = "read-only" if current_read_only else "read-write"
-        new_label = "read-write" if current_read_only else "read-only"
-        if not messagebox.askyesno(
-            "Change Access Level",
-            f"'{username}' is currently {current_label} on '{share_name}'.\n\nChange to {new_label}?",
-        ):
-            return
         threading.Thread(
             target=self._change_access_worker, args=(share_name, username, not current_read_only), daemon=True
         ).start()
@@ -1421,10 +1563,12 @@ class GUIWizard:
         self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
-        if changed:
-            level = "read-only" if read_only else "read-write"
-            messagebox.showinfo("Changed", f"'{username}' is now {level} on '{share_name}'.")
-        else:
+        if not changed:
+            # No success popup (see _change_access_level_for_selection's
+            # comment - the toggle button/badge already show the result),
+            # but a FAILURE still needs to interrupt: the row silently
+            # not changing could otherwise look identical to "there was
+            # nothing to change."
             messagebox.showerror("Failed", f"Could not change '{username}''s access level — see log.")
         self._refresh_all_lists()
 
@@ -1448,7 +1592,9 @@ class GUIWizard:
             self._append_log(log_output)
         if added:
             self._notify_tour("user_attached")
+            self._tour_watch_dialog(self.root)
             messagebox.showinfo("Added", f"Added '{username}' to share '{share_name}'.")
+            self._notify_tour("attach_apply_confirmed")
             # password is None for an existing, unmanaged Windows account
             # NASsie deliberately left untouched (see
             # _add_user_to_share_windows) - there's no password to encode,
@@ -1518,7 +1664,9 @@ class GUIWizard:
             self._append_log(log_output)
         if created:
             self._notify_tour("user_created")
-            messagebox.showinfo("Done", f"'{username}' has been created.")
+            self._tour_watch_dialog(self.root)
+            messagebox.showinfo("User Created", f"'{username}' has been created.")
+            self._notify_tour("user_apply_confirmed")
         else:
             messagebox.showerror("Failed", f"Could not set up user '{username}' — see log.")
         self._refresh_all_lists()

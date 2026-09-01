@@ -249,6 +249,29 @@ class SMBWizard:
             return self.add_user_to_share(share_name, username, password, read_only)
         return self.elevate_and_grant_access(share_name, username, password, read_only)
 
+    def verify_password(self, username, password, share_name=None):
+        # True if `password` is this account's CURRENT real SMB
+        # credential - checked live against whichever service actually
+        # enforces it, since NASsie never stores or can retrieve a
+        # plaintext password otherwise (see build_locknas_qr_payload's
+        # comment). This is what lets the GUI show an existing user's QR
+        # code again without resetting their password first (see
+        # QR_PASSWORD_RESET_NOTE) - ask for the password they already
+        # have, confirm it's actually right, then just re-encode it.
+        # Read-only: never needs admin/elevation, unlike everything else
+        # in this file that touches an account.
+        #
+        # share_name: Linux only, and required there - see
+        # _verify_password_linux's comment for why a share genuinely has
+        # to be named (this isn't optional convenience).
+        if self.system == "Linux":
+            return self._verify_password_linux(username, password, share_name)
+        elif self.system == "Darwin":
+            return self._verify_password_macos(username, password)
+        elif self.system == "Windows":
+            return self._verify_password_windows(username, password)
+        return False
+
     def set_share_user_access(self, share_name, username, read_only):
         # Changes an existing share user's read-only status without
         # touching their password or group membership - the "change access
@@ -1437,10 +1460,11 @@ foreach ($username in $affectedUsers.Keys) {{
     def build_locknas_qr_payload(self, share_name, username, password):
         # Matches LockNAS's own BridgeQrCode.decode() format exactly (see
         # NASPicker/app/src/main/java/.../storage/BridgeQrCode.kt) so a scan
-        # populates a new bridge with zero manual entry. Only ever call this
-        # right when a password is set (share creation / add user) - NASsie
-        # doesn't persist plaintext passwords anywhere, so there's no way to
-        # generate this later for an existing user.
+        # populates a new bridge with zero manual entry. `password` has to
+        # come from somewhere - either just set (share creation / add
+        # user) or freshly typed and confirmed via verify_password() for
+        # an existing user, since NASsie never persists plaintext
+        # passwords anywhere itself.
         # "name" is the bridge's own display name (the computer/NAS being
         # connected to) - "sharePath" is the specific share on it. Using
         # share_name for both meant the "Bridge Name" field in LockNAS
@@ -1589,6 +1613,32 @@ Remove-Item $cfgPath,$dbPath -ErrorAction SilentlyContinue
             # visibility untouched.
             self._hide_windows_account_from_logon(username)
             self._deny_interactive_logon_windows(username)
+
+    def _verify_password_windows(self, username, password):
+        # Windows has no separate SMB-only password store - share access
+        # authenticates with the account's own real Windows password (see
+        # _add_user_to_share_windows), so ValidateCredentials against the
+        # LOCAL machine context is the correct, standard, non-destructive
+        # way to check it: the same official API Windows itself uses for
+        # "is this password right", it never touches the account, and it
+        # works for both NASsie-managed and pre-existing accounts alike.
+        # Username/password travel via env vars, never interpolated into
+        # the script text, for the same injection reasons
+        # _configure_windows_user's NASSIE_TEMP_PW does.
+        script = (
+            "Add-Type -AssemblyName System.DirectoryServices.AccountManagement\n"
+            "$ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Machine')\n"
+            "if ($ctx.ValidateCredentials($env:NASSIE_VERIFY_USER, $env:NASSIE_VERIFY_PW)) {\n"
+            "    Write-Output 'NASSIE_VERIFY_OK'\n"
+            "} else {\n"
+            "    Write-Output 'NASSIE_VERIFY_FAIL'\n"
+            "}\n"
+        )
+        env = dict(os.environ)
+        env["NASSIE_VERIFY_USER"] = username
+        env["NASSIE_VERIFY_PW"] = password
+        proc = self._run_ps_script(script, capture_output=True, text=True, env=env)
+        return "NASSIE_VERIFY_OK" in proc.stdout
 
     def _add_windows_user_to_group(self, username, group_name):
         # -ErrorAction SilentlyContinue is what makes this idempotent (a
@@ -2143,6 +2193,42 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             raise subprocess.CalledProcessError(proc.returncode, "smbpasswd", output=proc.stdout, stderr=proc.stderr)
         _run(["smbpasswd", "-e", username], check=True, capture_output=True, text=True)
 
+    def _verify_password_linux(self, username, password, share_name):
+        # smbpasswd's own hash is one-way, and neither `id`/`getent` (the
+        # Linux LOGIN password, unrelated - see _LINUX_NOLOGIN_SHELL: a
+        # managed account has no usable login password at all) nor
+        # anything else exposes a check against it directly. Actually
+        # authenticating against the running smbd - the exact service and
+        # credential store a real client connecting to a share would hit
+        # - is the only live, read-only way to confirm it.
+        #
+        # MUST be a real share, not IPC$ (tried first) - confirmed live
+        # on a real server: with Samba's common default "map to guest =
+        # bad user", a REJECTED login to IPC$ (the administrative share
+        # every Samba server exposes) doesn't fail at all, it silently
+        # falls back to a successful GUEST session instead - smbclient
+        # still exits 0 for completely made-up credentials, making that
+        # check worthless. A real share NASsie creates always has "guest
+        # ok = no" (see _add_samba_share_config), which guest can't reach
+        # regardless of the server's map-to-guest setting - wrong
+        # credentials against a "guest ok = no" share genuinely fail
+        # instead of quietly downgrading. The password goes via $PASSWD,
+        # not a "-U user%pass" argument - a literal "%" in the password
+        # itself would otherwise be ambiguous with smbclient's own
+        # separator.
+        if not share_name:
+            return False
+        if not shutil.which("smbclient"):
+            print("[Linux] 'smbclient' not found (part of the 'smbclient' package) - can't verify a password.")
+            return False
+        env = os.environ.copy()
+        env["PASSWD"] = password
+        proc = _run(
+            ["smbclient", f"//localhost/{share_name}", "-U", username, "-c", "quit"],
+            capture_output=True, text=True, env=env,
+        )
+        return proc.returncode == 0
+
     def _share_group_name(self, share_name):
         slug = re.sub(r'[^a-z0-9_-]', '_', share_name.lower()).strip('_-') or "share"
         return f"smbshare_{slug}"[:32]
@@ -2658,6 +2744,16 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             print(f"[macOS] Setting password for existing user '{username}'...")
             _run(["dscl", ".", "-passwd", f"/Users/{username}", password], check=True, capture_output=True, text=True)
         _run(["dseditgroup", "-o", "edit", "-a", username, "-t", "user", "com.apple.access_smb"], check=True, capture_output=True, text=True)
+
+    def _verify_password_macos(self, username, password):
+        # macOS has no separate SMB-only password store either (Apple's
+        # own smbd authenticates with the account's real login password,
+        # same as _configure_macos_user's -passwd sets) - dscl's own
+        # -authonly is the standard, non-destructive way to check a local
+        # account's password without changing it. Passed as argv, not
+        # through a shell, so no quoting/injection concern.
+        proc = _run(["dscl", ".", "-authonly", username, password], capture_output=True, text=True)
+        return proc.returncode == 0
 
     def _macos_group_name(self, share_name):
         slug = re.sub(r'[^a-zA-Z0-9_-]', '_', share_name).strip('_-') or 'share'
