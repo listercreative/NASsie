@@ -365,16 +365,39 @@ class AddUserDialog(tk.Toplevel):
         # _build_name_page for the same convention and why.
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=next_row, column=0, columnspan=2, pady=10)
-        _icon_button(btn_frame, "✖", "Cancel", self.destroy).pack(side="left", padx=4)
+        # Kept as an attribute (unlike every other dialog's Cancel
+        # button) so the tour's own "New User" step (see tour.py) can
+        # point a highlight box directly at it once this dialog opens.
+        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self._on_cancel)
+        self.cancel_button.pack(side="left", padx=4)
         _icon_button(btn_frame, "✔", "OK", self._on_ok).pack(side="left", padx=4)
+        # Same handler as the Cancel button - the tour's own "open this,
+        # then close it" steps (see tour.py) need to know it was actually
+        # dismissed either way, not just via the button.
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
         self.username_entry.focus_set()
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
         if self._app is not None:
-            self._app._notify_tour("user_dialog_opened", window=self)
+            # Deferred, not fired synchronously right here - the tour's
+            # own "Cancel" step (see tour.py) responds to this by
+            # creating a NEW Toplevel (the callout) parented to THIS
+            # dialog, right in the middle of this dialog's own
+            # __init__, before grab_set()/wait_window() have even run -
+            # confirmed live, that reentrant construction left the
+            # callout stuck at a degenerate 1x1 placement that never
+            # settled. after(0, ...) runs it once wait_window()'s own
+            # event loop is pumping normally instead, after this dialog
+            # is actually fully constructed and mapped.
+            self.after(0, lambda: self._app._notify_tour("user_dialog_opened", window=self))
         self.grab_set()
         self.wait_window(self)
+
+    def _on_cancel(self):
+        if self._app is not None:
+            self._app._notify_tour("user_dialog_cancelled", window=self)
+        self.destroy()
 
     def _validate_username_input(self, proposed):
         # Blocks disallowed characters at the keystroke - see
@@ -1034,12 +1057,12 @@ class UserManagementWindow(tk.Toplevel):
         if not (user and user.get("managed", False)):
             # Never delete an account NASsie didn't create - that's a real
             # person's computer account, not an SMB-only one NASsie can
-            # freely remove. Unattaching from shares is still fine;
+            # freely remove. Detaching from shares is still fine;
             # deleting the account itself is not NASsie's call to make.
             messagebox.showinfo(
                 "Delete User",
                 f"'{username}' is an existing computer account, not one NASsie created - NASsie won't "
-                "delete it. Unattach it from its shares instead, or delete the account itself from "
+                "delete it. Detach it from its shares instead, or delete the account itself from "
                 "your computer's own account settings.",
             )
             return
@@ -1062,6 +1085,11 @@ class GUIWizard:
         self._attaching_candidates = []
         self._attaching_candidate_users = {}
         self._attaching_labels = {}
+        # Counts real toggles while the tour's own "Permission" step (see
+        # tour.py) is showing - that step wants the user to see BOTH
+        # states (read-only and read-write) before moving on, which
+        # means two clicks, not one - see _change_access_done().
+        self._tour_permission_clicks = 0
 
         # className sets WM_CLASS, which is what taskbars/docks/app-switchers
         # use to match this running window back to nassie.desktop (and thus
@@ -1117,7 +1145,7 @@ class GUIWizard:
         # (see _measure_action_bar_width) is the only way to get this
         # right regardless of that.
         self.root.update_idletasks()
-        share_bar_w = self._measure_action_bar_width(("✂️", "🔍", "📱", "+👤", "🔗", "🗑"))
+        share_bar_w = self._measure_action_bar_width(("📖", "📷", "➖", "+👤", "🔗", "🗑"))
         name_col_w = self.shares_list.column("#0", "width")
         # name column + vertical scrollbar (~20px) + a floor for the Path
         # column so it isn't squeezed to nothing + the action bar itself +
@@ -1243,6 +1271,16 @@ class GUIWizard:
         if tour:
             tour.on_event(event, window=window)
 
+    def _tour_waiting_on(self, event):
+        # True only while the tour is actually showing a step whose
+        # wait_event is this one - used to guard Delete Share/Detach so
+        # the tour's own "click this to see what it does" steps (see
+        # tour.py) can never actually perform the destructive action
+        # regardless of what gets clicked, not just rely on the user
+        # correctly hitting Cancel/No.
+        tour = getattr(self, "_tour", None)
+        return bool(tour and tour._callout is not None and tour._wait_event == event)
+
     def _tour_flash_name_error(self, message):
         tour = getattr(self, "_tour", None)
         if tour:
@@ -1344,29 +1382,38 @@ class GUIWizard:
             # this share, not the share itself - New User/Attach
             # User/Delete Share belong to the share row (see below), not
             # here.
-            _icon_button(
-                container, "✂️", "Unattach User", self._unattach_selected_user
-            ).pack(side="left", fill="y", padx=1)
-            # The icon itself doubles as the access-level badge (magnifying
-            # glass = read-only "inspect only", feather pen = read-write)
-            # as well as the toggle control - clicking it flips the level
-            # immediately, no confirmation dialog (see
-            # _change_access_level_for_selection()). The row's own label
-            # (see _populate_shares_list()) carries the same information
-            # for when this bar isn't showing at all (nothing selected).
+            # Order: permission toggle, QR code, detach - read/write
+            # first (the state someone checks most often), detach last
+            # (the destructive one, furthest from an accidental click).
+            #
+            # The icon itself doubles as the access-level badge (open book
+            # = read-only, memo = read-write) as well as the toggle
+            # control - clicking it flips the level immediately, no
+            # confirmation dialog (see _change_access_level_for_
+            # selection()). The row's own label (see
+            # _populate_shares_list()) carries the same information for
+            # when this bar isn't showing at all (nothing selected).
             share_name, _ = self._selected_share_and_user()
             share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
             share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
             read_only = bool(share_user and share_user.get("read_only"))
-            icon, tip = ("🔍", "Read-only - click to make read-write") if read_only else (
-                "🖋️", "Read-write - click to make read-only"
+            icon, tip = ("📖", "Read-only - click to make read-write") if read_only else (
+                "📝", "Read-write - click to make read-only"
             )
             _icon_button(
                 container, icon, tip, self._change_access_level_for_selection
             ).pack(side="left", fill="y", padx=1)
-            _icon_button(container, "📱", "Show QR Code", self._show_qr_for_selection).pack(
+            # No dedicated "QR code" emoji exists in Unicode (checked
+            # against the full character database, nothing named QR/
+            # barcode anywhere in it) - a camera stands in for the actual
+            # action (point your phone's camera at it) instead of trying
+            # to depict the code itself.
+            _icon_button(container, "📷", "Show QR Code", self._show_qr_for_selection).pack(
                 side="left", fill="y", padx=1
             )
+            _icon_button(
+                container, "➖", "Detach User", self._unattach_selected_user
+            ).pack(side="left", fill="y", padx=1)
         else:
             _icon_button(container, "+👤", "New User", self._new_user_for_selected_share).pack(
                 side="left", fill="y", padx=1
@@ -1575,8 +1622,19 @@ class GUIWizard:
         self._attaching_candidates = []
         self._attaching_candidate_users = {}
         self._attaching_labels = {}
+        # Reverts the bar from the inline combobox back to the row's
+        # normal icon buttons right away - previously only done on the
+        # cancel path below, leaving the (by now inert) combobox+Cancel
+        # showing for the entire in-flight grant_access_worker() call on
+        # the success path, instead of the real buttons underneath it.
+        # Harmless most of the time (the next _refresh_all_lists() papers
+        # over it once the worker finishes) but a real gap right after
+        # this call returns - e.g. the tour's own "Delete Share" step
+        # (see tour.py), reached via the "attach_apply_confirmed" event
+        # this same attach fires, needs the row's real 3rd button to
+        # exist THEN, not just eventually once refresh catches up.
+        self._share_action_bar.update()
         if not username:
-            self._share_action_bar.update()
             return
 
         # A password already exists for this account if either: it's
@@ -1629,10 +1687,25 @@ class GUIWizard:
     def _unattach_selected_user(self):
         share_name, username = self._selected_share_and_user()
         if not share_name or not username:
-            messagebox.showinfo("Unattach", "Select a user under a share first.")
+            messagebox.showinfo("Detach", "Select a user under a share first.")
+            return
+        # Same reasoning as _delete_selected_share's identical guard -
+        # the tour walks the user through clicking this on the exact
+        # user it just guided them through attaching, so the real
+        # revoke-access flow below is skipped entirely while that step
+        # is showing, not just discouraged.
+        if self._tour_waiting_on("user_detach_dialog_opened"):
+            self._notify_tour("user_detach_dialog_opened")
+            messagebox.showinfo(
+                "Detach",
+                f"This removes '{username}''s access to '{share_name}'. Skipped here so your "
+                "example share keeps its attached user.",
+                parent=self.root,
+            )
+            self._notify_tour("user_detach_dialog_cancelled")
             return
         if not messagebox.askyesno(
-            "Unattach", f"Remove '{username}''s access to '{share_name}'?"
+            "Detach", f"Remove '{username}''s access to '{share_name}'?"
         ):
             return
         threading.Thread(
@@ -1656,6 +1729,11 @@ class GUIWizard:
             show="*", parent=self.root,
         )
         if not password:
+            # Harmless no-op outside the tour - see on_event()'s own
+            # guard - but during the tour's own "QR Code" step this IS
+            # the expected way to close it (see tour.py), no password
+            # needed just to see what the button does.
+            self._notify_tour("qr_prompt_cancelled")
             return
         if not self.wizard.verify_password(username, password, share_name):
             if messagebox.askyesno(
@@ -1724,7 +1802,7 @@ class GUIWizard:
 
     def _change_access_level_for_selection(self):
         # No confirmation dialog - the button itself already shows the
-        # CURRENT level (magnifying-glass/feather-pen icon, see
+        # CURRENT level (open-book/memo icon, see
         # _build_share_action_bar)
         # and doing this is a one-click toggle back if it was wrong,
         # unlike deleting a share or a user.
@@ -1754,7 +1832,22 @@ class GUIWizard:
         self._busy_stop()
         if log_output.strip():
             self._append_log(log_output)
-        if not changed:
+        if changed:
+            # The tour's own "Permission" step (see tour.py) wants the
+            # user to see BOTH states - read-only and read-write - before
+            # moving on, which takes two real toggles, not one. Only
+            # counts while that step is actually the current one
+            # (_tour_waiting_on), so this can't leave a stale count
+            # behind for a later tour run, or fire early from ordinary
+            # (non-tour) use.
+            if self._tour_waiting_on("access_level_changed"):
+                self._tour_permission_clicks += 1
+                if self._tour_permission_clicks >= 2:
+                    self._tour_permission_clicks = 0
+                    self._notify_tour("access_level_changed")
+            else:
+                self._tour_permission_clicks = 0
+        else:
             # No success popup (see _change_access_level_for_selection's
             # comment - the toggle button/badge already show the result),
             # but a FAILURE still needs to interrupt: the row silently
@@ -1829,7 +1922,7 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if revoked:
-            messagebox.showinfo("Unattached", f"Removed '{username}''s access to '{share_name}'.")
+            messagebox.showinfo("Detached", f"Removed '{username}''s access to '{share_name}'.")
         else:
             messagebox.showerror("Failed", f"Could not remove access — see log.")
         self._refresh_all_lists()
@@ -1899,8 +1992,24 @@ class GUIWizard:
         name, _ = self._selected_share_and_user()
         if not name:
             return
+        # The tour walks the user through clicking this button on the
+        # exact share it just guided them through creating - the real
+        # confirm-and-delete flow below is skipped entirely (not just
+        # discouraged) while that step is showing, so there's no path
+        # from "clicking around during the tour" to actually losing it,
+        # regardless of what gets clicked next.
+        if self._tour_waiting_on("share_delete_dialog_opened"):
+            self._notify_tour("share_delete_dialog_opened")
+            messagebox.showinfo(
+                "Delete Share",
+                f"This removes '{name}' from Samba (and can optionally delete its folder too). "
+                "Skipped here so you keep the share you just made.",
+                parent=self.root,
+            )
+            self._notify_tour("share_delete_dialog_cancelled")
+            return
         if not messagebox.askyesno(
-            "Remove share", f"Remove share '{name}'? This updates the live share configuration."
+            "Remove share", f"Remove share '{name}'? The share will be deleted, but your data is untouched."
         ):
             return
         delete_folder = False

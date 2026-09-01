@@ -18,6 +18,35 @@ _BORDER_THICKNESS = 3
 _WHOLE_WINDOW = object()
 
 
+class _PointAtOnly:
+    """Wraps a widget for a step where the widget itself should still get
+    the usual highlight box, but _Callout.place_near(widget)'s "no room
+    around the widget itself, fall back to outside the whole container"
+    logic can't be trusted - see the "Cancel" step, which points at
+    AddUserDialog's own Cancel button, the last control at the BOTTOM of
+    a stacked Username/Password/Confirm Password/checkbox form.
+    place_near()'s room check only compares against the CONTAINER's own
+    top/bottom edges, not any sibling widgets in between - for a button
+    that low in a tall stack, "the space between the container's top and
+    the button" is almost entirely the OTHER fields, not open room, so
+    the check passed even though placing the callout there covered half
+    the form (confirmed live, in a screenshot). Callers wrap the widget
+    in this to skip place_near() for the callout (using
+    place_outside_container() instead, the same guaranteed-clear-of-the-
+    dialog placement the native-messagebox "Confirmation" steps use)
+    while still highlighting the real widget normally."""
+    def __init__(self, widget):
+        self.widget = widget
+
+
+def _dialog_half_height_for(wait_event):
+    # See _Callout.place_outside_container()'s own comment - most native
+    # dialogs this points at are one short line, but the share-creation
+    # apply-done message is genuinely longer (a status line plus a
+    # follow-up hint), so it alone needs a taller estimate.
+    return 160 if wait_event == "share_apply_confirmed" else 90
+
+
 def _bring_to_front(win, steal_focus=True):
     # Same "-topmost toggle" trick gui.py's own _bring_window_to_front()
     # uses (duplicated rather than imported - gui.py imports FROM this
@@ -303,10 +332,7 @@ class _Callout(tk.Toplevel):
     # being paced by clicks through a narrated slideshow. Skip is the one
     # manual escape hatch throughout (relabeled "Close" for the final,
     # non-gated step).
-    def __init__(self, parent_window, title, text, step_num, step_total, on_skip, skip_label="Skip Tour"):
-        # step_num=None omits the "Step X of Y" label entirely - used for
-        # the finish step, where a step count reads as odd right after
-        # "you're all set" (there's nothing left to count toward).
+    def __init__(self, parent_window, title, text, on_skip, skip_label="Skip Tour"):
         super().__init__(parent_window)
         # Withdrawn immediately, before anything below is even built -
         # Tk maps a Toplevel as soon as it exists, at whatever size its
@@ -353,8 +379,6 @@ class _Callout(tk.Toplevel):
         btn_row = tk.Frame(inner, bg=_CALLOUT_BG)
         btn_row.pack(fill="x", padx=10, pady=(0, 10))
 
-        if step_num is not None:
-            ttk.Label(btn_row, text=f"Step {step_num} of {step_total}", background=_CALLOUT_BG).pack(side="left")
         ttk.Button(btn_row, text=skip_label, command=on_skip).pack(side="right")
 
     def set_text(self, text):
@@ -471,7 +495,7 @@ class _Callout(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
         self.lift()
 
-    def place_outside_container(self, container):
+    def place_outside_container(self, container, estimated_dialog_half_height=90):
         # For a step with nothing of NASsie's own to point at - e.g. the
         # native tk_messageBox confirming a share/user was created, which
         # is a plain Tcl dialog with no Python widget handle to attach a
@@ -514,7 +538,9 @@ class _Callout(tk.Toplevel):
         container.update()
         cw, ch = container.winfo_width(), container.winfo_height()
         if cw <= 1 or ch <= 1:
-            self.after(20, lambda: self.place_outside_container(container))
+            self.after(
+                20, lambda: self.place_outside_container(container, estimated_dialog_half_height)
+            )
             return
         cx = container.winfo_rootx()
         cy = container.winfo_rooty()
@@ -524,18 +550,18 @@ class _Callout(tk.Toplevel):
         # the container's own bottom edge - "below the whole window" put
         # this as much as ~500px from where the user is actually looking
         # on a tall window (reported live: read as disconnected from the
-        # app entirely, "far too low"). The messages this callout
-        # accompanies (see the docstring above - it's only ever the
-        # native "Done" confirmation after a share/user/attach action) run
-        # up to a few lines - e.g. the apply-done message pairs a status
-        # line with a follow-up hint, close to 200px tall on its own
-        # before the title bar and button. Confirmed live overlapping a
-        # real dialog at the previous, tighter estimate (110/14) - sized
-        # up with real headroom rather than shaving it to the minimum
-        # that happened to work for the shortest message, since there's
-        # no reliable way to get this callout's own exact size (see
-        # above) and an extra gap costs far less than an overlap.
-        estimated_dialog_half_height = 160
+        # app entirely, "far too low"). estimated_dialog_half_height has
+        # no reliable way to be exact (see above - there's no way to
+        # measure the real dialog), so callers pass a value sized to
+        # THEIR OWN message: most of these are one short line ("Added
+        # 'x' to share 'y'.", "'x' has been created.") - the default here
+        # - but the share-creation apply-done message pairs a status line
+        # with a follow-up hint, close to 200px tall on its own before
+        # the title bar and button, and passes a taller estimate
+        # explicitly (see _build_steps()). Confirmed live both ways this
+        # can go wrong: too tight overlapped a real dialog; sized up
+        # uniformly to cover that one long case instead left a large gap
+        # under every short one.
         below_y = cy + ch // 2 + estimated_dialog_half_height + margin
         y = below_y if below_y + h <= screen_h else max(cy - margin - h, 0)
         x = cx + (cw - w) // 2
@@ -595,6 +621,21 @@ class GuiTour:
         share_item = children[-1]
         return _TreeRegion(tree, [share_item] + list(tree.get_children(share_item)))
 
+    def _newest_user_row(self):
+        # Just the user row itself (not the share above it too - see
+        # _newest_share_region()) - for the "select the user you just
+        # attached" step, which needs to point at exactly the row the
+        # user still has to click, not the whole region.
+        tree = self.gui.shares_list
+        children = tree.get_children("")
+        if not children:
+            return tree
+        share_item = children[-1]
+        user_children = tree.get_children(share_item)
+        if not user_children:
+            return tree
+        return _TreeRegion(tree, [user_children[-1]])
+
     def _build_steps(self):
         # (container_fn, widget_fn, title, text, wait_event) - container_fn
         # is which window to attach the highlight/callout to for this step
@@ -615,12 +656,11 @@ class GuiTour:
              "New Share", "Click here to create your first share.",
              "share_dialog_opened"),
             (lambda: self._active_window, lambda: self._active_window.name_entry,
-             "Share Name", "Give your share a name and click OK.",
+             "Share Name", "Type a share name and click OK.",
              "share_name_confirmed"),
             (lambda: self._active_window, lambda: self._active_window.path_entry,
              "Folder",
-             "Pick a folder for this share, or leave the suggested default and click "
-             "OK to continue.",
+             "Pick a folder for this share or use the provided default, then click OK.",
              "share_created"),
             # No widget (None) - the "Done" dialog that follows is a plain
             # tk_messageBox, not one of NASsie's own, so there's no Python
@@ -633,10 +673,10 @@ class GuiTour:
              "share_apply_confirmed"),
 
             (lambda: gui.root, lambda: gui._manage_users_btn,
-             "Manage Users", "Open this to manage user accounts.",
+             "Manage Users", "Open Manage Users to create and delete user accounts.",
              "user_mgmt_opened"),
             (lambda: self._active_window, lambda: self._active_window._new_user_toolbar_btn,
-             "New User", "Click here to create a new share user.",
+             "New User", "Click New User to create a new share user.",
              "user_dialog_opened"),
             (lambda: self._active_window, lambda: self._active_window.username_entry,
              "Username and Password", "Type a username and password, then click OK.",
@@ -664,10 +704,27 @@ class GuiTour:
             (lambda: gui.root, lambda: self._newest_share_region(),
              "Shares", "Select your share to reveal its actions.",
              "share_selected"),
-            (lambda: gui.root, lambda: gui._share_action_bar.bar,
-             "Delete Share",
-             "Create a new user (+\U0001F464), Attach User (\U0001F517), delete share (\U0001F5D1). "
-             "Press Attach User then pick the user that you just created to assign it to this share.",
+            # Walking every share-row button in its actual left-to-right
+            # order (New User, Attach User, Delete Share - see
+            # GUIWizard._build_share_action_bar()) - indexed off the
+            # live action bar rather than a stored reference, since it's
+            # rebuilt from scratch on every selection (see
+            # _RowActionBar's own docstring); safe to index into
+            # positionally because it's rebuilt in this same fixed order
+            # every time a share row (not a user row) is selected.
+            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[0],
+             "New User",
+             "Click to open a New User dialog. Adding a user this way also attaches the user "
+             "to the share.",
+             "user_dialog_opened"),
+            (lambda: self._active_window, lambda: _PointAtOnly(self._active_window.cancel_button),
+             "Cancel", "You already made one, so close this box with the Cancel button.",
+             "user_dialog_cancelled"),
+            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[1],
+             "Attach User",
+             "Press Attach User. A dropdown appears listing every user, including ones not "
+             "created by NASsie, which are labeled for convenience. Please select the user "
+             "that you created in the previous steps.",
              "user_attached"),
             # No widget (None) - same reasoning as the other
             # "Confirmation" steps: this is the plain Tcl tk_messageBox
@@ -677,9 +734,58 @@ class GuiTour:
             # its Samba password at creation time (see
             # GUIWizard._commit_inline_attach()'s comment), so attaching
             # it to this first share never actually prompts for one.
+            # Has to sit right here, immediately after "Attach User", not
+            # further down the list with the rest of the share-row
+            # buttons - GUIWizard._grant_access_done() fires
+            # "attach_apply_confirmed" the moment this dialog's OK is
+            # clicked, and on_event() only reacts to whichever step is
+            # current at that instant; any step in between would eat
+            # "user_attached" and leave this one waiting on an event that
+            # already came and went.
             (lambda: gui.root, None,
              "Confirmation", "Click OK to confirm.",
              "attach_apply_confirmed"),
+            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
+             "Delete Share",
+             "Click Delete Share to see what it does - this is turned off for the rest of the "
+             "tour so you keep the share you just made.",
+             "share_delete_dialog_opened"),
+            # No widget (None) - same reasoning as the other
+            # "Confirmation" steps: GUIWizard._delete_selected_share()'s
+            # own guarded info box is a plain tk_messageBox, no Python
+            # widget handle to attach a highlight to.
+            (lambda: gui.root, None,
+             "Confirmation", "Press OK to return to the main window. Your share will NOT be deleted.",
+             "share_delete_dialog_cancelled"),
+
+            (lambda: gui.root, lambda: self._newest_user_row(),
+             "Select User", "Select the user you just attached to reveal its own actions.",
+             "share_selected"),
+            # Same reasoning as the share row above - walking the user
+            # row's buttons in order (permission toggle, QR code, detach
+            # - see the same _build_share_action_bar()).
+            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[0],
+             "Permission",
+             "Toggles this user between read-only (\U0001F4D6) and read-write (\U0001F4DD) - "
+             "click it twice to see both and land back on the value you started with.",
+             "access_level_changed"),
+            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[1],
+             "QR Code",
+             "Shows a scannable QR code for this user's login - click it, then click Cancel on "
+             "the password prompt to skip generating one right now.",
+             "qr_prompt_cancelled"),
+            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
+             "Detach",
+             "Removes this user's access to the share. This is turned off for the rest of the "
+             "tour so your example keeps its attached user.",
+             "user_detach_dialog_opened"),
+            # No widget (None) - same reasoning as the other
+            # "Confirmation" steps: GUIWizard._unattach_selected_user()'s
+            # own guarded info box is a plain tk_messageBox, no Python
+            # widget handle to attach a highlight to.
+            (lambda: gui.root, None,
+             "Confirmation", "Press OK to return to the main window. This user will NOT be detached.",
+             "user_detach_dialog_cancelled"),
         ]
 
     def start(self):
@@ -724,40 +830,47 @@ class GuiTour:
         # the container itself instead of a specific widget within it -
         # see _HighlightBox.place_around_container().
         widget = widget_fn() if widget_fn is not None else None
+        point_at_only = isinstance(widget, _PointAtOnly)
+        highlight_target = widget.widget if point_at_only else widget
 
-        if widget is _WHOLE_WINDOW:
+        if highlight_target is _WHOLE_WINDOW:
             self._highlight = _HighlightBox(container)
             self._highlight.place_around_container()
-        elif widget is not None:
+        elif highlight_target is not None:
             self._highlight = _HighlightBox(container)
-            self._highlight.place_around(widget)
+            self._highlight.place_around(highlight_target)
         else:
             self._highlight = None
 
-        self._callout = _Callout(container, title, text, self.index + 1, len(self.steps), on_skip=self.stop)
-        if widget is _WHOLE_WINDOW:
+        self._callout = _Callout(container, title, text, on_skip=self.stop)
+        if highlight_target is _WHOLE_WINDOW:
             self._callout.place_below_titlebar(container)
-        elif widget is not None:
-            self._callout.place_near(widget)
+        elif highlight_target is not None and not point_at_only:
+            self._callout.place_near(highlight_target)
         else:
-            self._callout.place_outside_container(container)
-            # One extra self-correction shortly after, specifically for
-            # this widget=None case - confirmed live (intermittently,
-            # timing-dependent - a race, not a one-off) landing at a
-            # stale (0, 0) with no later event to ever fix it, right
-            # after a step transition that both destroys a dialog AND
-            # withdraws that dialog's own OWNER window in the same beat
-            # (e.g. AddUserDialog closing while UserManagementWindow
-            # withdraws right under it) - evidently sometimes enough WM
-            # churn that even container.update()'s round trip inside
-            # place_outside_container() itself isn't a hard guarantee.
-            # This costs nothing when the first placement was already
-            # right - it just recomputes the same answer.
+            # Both the widget=None steps (native tk_messageBox
+            # confirmations, no Python widget handle at all) and
+            # _PointAtOnly ones (a real widget IS highlighted above, but
+            # place_near() can't be trusted for it - see the class's own
+            # docstring) land here.
+            half_height = _dialog_half_height_for(wait_event)
+            self._callout.place_outside_container(container, half_height)
+            # One extra self-correction shortly after - confirmed live
+            # (intermittently, timing-dependent - a race, not a one-off)
+            # landing at a stale (0, 0) with no later event to ever fix
+            # it, right after a step transition that both destroys a
+            # dialog AND withdraws that dialog's own OWNER window in the
+            # same beat (e.g. AddUserDialog closing while
+            # UserManagementWindow withdraws right under it) - evidently
+            # sometimes enough WM churn that even container.update()'s
+            # round trip inside place_outside_container() itself isn't a
+            # hard guarantee. This costs nothing when the first placement
+            # was already right - it just recomputes the same answer.
             index_at_schedule = self.index
             def _self_correct(step_index=index_at_schedule):
                 if self._callout is not None and self.index == step_index:
                     try:
-                        self._callout.place_outside_container(container)
+                        self._callout.place_outside_container(container, half_height)
                     except tk.TclError:
                         pass
             container.after(120, _self_correct)
@@ -783,18 +896,28 @@ class GuiTour:
         # itself. That read as it randomly disappearing, not as helpful
         # restraint - explicitly reverted in favor of just staying
         # visible always (see _Callout's own "-topmost" comment).
+        point_at_only = isinstance(widget, _PointAtOnly)
+        highlight_target = widget.widget if point_at_only else widget
+
         def reposition(event=None):
             if self._callout is None:
                 return
             try:
-                if widget is _WHOLE_WINDOW:
+                if highlight_target is _WHOLE_WINDOW:
                     self._highlight.place_around_container()
                     self._callout.place_below_titlebar(container)
-                elif widget is not None:
-                    self._highlight.place_around(widget)
-                    self._callout.place_near(widget)
+                elif highlight_target is not None:
+                    self._highlight.place_around(highlight_target)
+                    if point_at_only:
+                        self._callout.place_outside_container(
+                            container, _dialog_half_height_for(self._wait_event)
+                        )
+                    else:
+                        self._callout.place_near(highlight_target)
                 else:
-                    self._callout.place_outside_container(container)
+                    self._callout.place_outside_container(
+                        container, _dialog_half_height_for(self._wait_event)
+                    )
             except tk.TclError:
                 pass
 
@@ -901,9 +1024,8 @@ class GuiTour:
         self._highlight.place_around(widget)
         self._callout = _Callout(
             self.root, "You're all set!",
-            "You now have a live SMB share with an attached user. If a QR code prompt is open behind "
-            "this, choose Yes to get an easy way to connect from another device.",
-            None, len(self.steps), on_skip=self.stop, skip_label="Close",
+            "You now have a live SMB share with an attached user.",
+            on_skip=self.stop, skip_label="Close",
         )
         self._callout.place_near(widget)
         # Revealed only now, after the real placement above - see the
