@@ -7,17 +7,23 @@ import threading
 
 from core import SMBWizard, QR_PASSWORD_RESET_NOTE
 
-# Big block-letter "NASSIE" wordmark shown above the sea-serpent banner -
-# width matched to the logo (60 vs 62 columns) so they read as one unit.
+# Block-letter "NASSIE" wordmark shown above the sea-serpent banner.
+# pyfiglet's stock "univers" font, unedited. Went through several other
+# stock fonts first (plain line-art ones read as too light; the
+# original font, "colossal", had an "A" that took three separate
+# hand-edited attempts to fix and still didn't read right - see git
+# history) - this one's own "A" glyph is correct as shipped, and it's
+# still the same bold, 3D-shaded "8/d/b/P/Y" block style the original
+# banner had.
 NASSIE_TITLE = [
-    '888b    888       d8888 .d8888b.  .d8888b.88888888888888888 ',
-    '8888b   888      d88888d88P  Y88bd88P  Y88b 888  888        ',
-    '88888b  888     d88P888Y88b.     Y88b.      888  888        ',
-    '888Y88b 888    d88P 888 "Y888b.   "Y888b.   888  8888888    ',
-    '888 Y88b888   d88P  888    "Y88b.    "Y88b. 888  888        ',
-    '888  Y88888  d88P   888      "888      "888 888  888        ',
-    '888   Y8888 d8888888888Y88b  d88PY88b  d88P 888  888        ',
-    '888    Y888d88P     888 "Y8888P"  "Y8888P"88888888888888888 ',
+    '888b      88        db        ad88888ba   ad88888ba  88 88888888888  ',
+    '8888b     88       d88b      d8"     "8b d8"     "8b 88 88           ',
+    "88 `8b    88      d8'`8b     Y8,         Y8,         88 88           ",
+    "88  `8b   88     d8'  `8b    `Y8aaaaa,   `Y8aaaaa,   88 88aaaaa      ",
+    '88   `8b  88    d8YaaaaY8b     `"""""8b,   `"""""8b, 88 88"""""      ',
+    '88    `8b 88   d8""""""""8b          `8b         `8b 88 88           ',
+    "88     `8888  d8'        `8b Y8a     a8P Y8a     a8P 88 88           ",
+    '88      `888 d8\'          `8b "Y88888P"   "Y88888P"  88 88888888888  ',
 ]
 
 NASSIE_LOGO = [
