@@ -10,6 +10,13 @@ _HIGHLIGHT_COLOR = "#0e92ab"
 _CALLOUT_BG = "#eaf6f8"
 _BORDER_THICKNESS = 3
 
+# Sentinel a step's widget_fn returns to mean "highlight the whole
+# container window" (see the "Close" step - it points at
+# UserManagementWindow's own real close control, its WM titlebar, which
+# has nothing of NASsie's own to point at) rather than None (no highlight
+# at all - e.g. the "Confirmation" steps) or a specific widget.
+_WHOLE_WINDOW = object()
+
 
 def _bring_to_front(win):
     # Same "-topmost toggle" trick gui.py's own _bring_window_to_front()
@@ -38,7 +45,7 @@ def _real_home():
     # marker has to land in the real invoking user's home instead: written
     # against /root, it'd not just miss recording that user's actual first
     # look, it'd permanently hide the tour from every later real launch
-    # too, since has_seen_tour() would then only ever check root's own
+    # too, since tour_state() would then only ever check root's own
     # copy. Same signal core.py's SMBWizard._real_home() uses.
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
@@ -58,16 +65,45 @@ def _first_run_marker_path():
     return os.path.join(base, "tour_seen")
 
 
-def has_seen_tour():
-    return os.path.exists(_first_run_marker_path())
+def tour_state():
+    # "new": never started - auto-start it, the normal first-run case.
+    # "interrupted": started but neither finished nor explicitly skipped
+    # (the file exists but its content isn't "completed") - the app
+    # closed mid-tour (crash, force-quit, or just clicking NASsie's own
+    # window close button) before mark_tour_completed() ever ran. Worth
+    # distinguishing from "new" so GUIWizard can OFFER to pick it back up
+    # instead of either silently never showing it again (this used to
+    # write "seen" the instant the tour started, before the user had done
+    # anything - a crash one step in meant never seeing it again) or
+    # unconditionally restarting it every single launch until it happens
+    # to be finished (which would get old fast for anyone who skips it
+    # more than once on purpose).
+    # "completed": finished, or explicitly skipped - never show again.
+    path = _first_run_marker_path()
+    if not os.path.exists(path):
+        return "new"
+    try:
+        with open(path) as f:
+            content = f.read().strip()
+    except OSError:
+        return "new"
+    return "completed" if content == "completed" else "interrupted"
 
 
-def mark_tour_seen():
+def mark_tour_started():
+    _write_tour_state("started")
+
+
+def mark_tour_completed():
+    _write_tour_state("completed")
+
+
+def _write_tour_state(state):
     path = _first_run_marker_path()
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    with open(path, "w"):
-        pass
+    with open(path, "w") as f:
+        f.write(state)
     _chown_to_real_user(directory, path)
 
 
@@ -175,6 +211,34 @@ class _HighlightBox:
         for bar in self.bars:
             bar.lift()
 
+    def place_around_container(self):
+        # Highlights the WHOLE window this box's bars are children of
+        # (self.root itself), not a widget within it - for a step asking
+        # to close a window that has nothing of NASsie's own left to
+        # highlight otherwise (the "Close" tour step: UserManagementWindow
+        # already has a real, working close control - its own WM titlebar
+        # "X" - so there's no reason to add a redundant in-content button
+        # just to have something to point at instead).
+        #
+        # Inset from the window's own edges, not padded OUTWARD around
+        # them the way place_around() pads around a normal (smaller,
+        # centered-within-its-window) widget - these bars are ordinary
+        # place()'d CHILD widgets of self.root, so anything positioned
+        # outside self.root's own bounds is simply clipped away by X, not
+        # rendered at all.
+        self.root.update_idletasks()
+        inset = 3
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        t = _BORDER_THICKNESS
+        top, bottom, left, right = self.bars
+        top.place(x=inset, y=inset, width=w - inset * 2, height=t)
+        bottom.place(x=inset, y=h - inset - t, width=w - inset * 2, height=t)
+        left.place(x=inset, y=inset, width=t, height=h - inset * 2)
+        right.place(x=w - inset - t, y=inset, width=t, height=h - inset * 2)
+        for bar in self.bars:
+            bar.lift()
+
     def destroy(self):
         for bar in self.bars:
             try:
@@ -228,15 +292,23 @@ class _Callout(tk.Toplevel):
         ttk.Label(
             inner, text=title, font=("TkDefaultFont", 11, "bold"), background=_CALLOUT_BG
         ).pack(anchor="w", padx=10, pady=(10, 2))
-        ttk.Label(
+        # Kept (not just set once) - see set_text(), used to flash a
+        # validation error's own explanation into an already-showing
+        # step's callout without tearing down and rebuilding the whole
+        # window just to change its message.
+        self.text_label = ttk.Label(
             inner, text=text, background=_CALLOUT_BG, wraplength=260, justify="left"
-        ).pack(anchor="w", padx=10, pady=(0, 8))
+        )
+        self.text_label.pack(anchor="w", padx=10, pady=(0, 8))
 
         btn_row = tk.Frame(inner, bg=_CALLOUT_BG)
         btn_row.pack(fill="x", padx=10, pady=(0, 10))
 
         ttk.Label(btn_row, text=f"Step {step_num} of {step_total}", background=_CALLOUT_BG).pack(side="left")
         ttk.Button(btn_row, text=skip_label, command=on_skip).pack(side="right")
+
+    def set_text(self, text):
+        self.text_label.configure(text=text)
 
     def place_near(self, widget):
         self.update_idletasks()
@@ -353,10 +425,22 @@ class _Callout(tk.Toplevel):
             return
         cx = container.winfo_rootx()
         cy = container.winfo_rooty()
-        cbottom = cy + ch
 
         margin = 14
-        below_y = cbottom + margin
+        # Below the CENTER (where a centered dialog actually sits), not
+        # the container's own bottom edge - "below the whole window" put
+        # this as much as ~500px from where the user is actually looking
+        # on a tall window (reported live: read as disconnected from the
+        # app entirely, "far too low"). Every message this callout ever
+        # accompanies (see the docstring above - it's only ever the
+        # native "Done" confirmation after a share/user/attach action) is
+        # short: 1-3 lines, so a real tk_messageBox for one is reliably
+        # under ~220px tall. Clearing an estimated HALF of that below
+        # center is a much smaller, still-generally-safe gap, without
+        # needing this callout's own exact size (there's no reliable way
+        # to get that - see above).
+        estimated_dialog_half_height = 110
+        below_y = cy + ch // 2 + estimated_dialog_half_height + margin
         y = below_y if below_y + h <= screen_h else max(cy - margin - h, 0)
         x = cx + (cw - w) // 2
         x = max(0, min(x, screen_w - w))
@@ -469,7 +553,14 @@ class GuiTour:
             # AddUserDialog from the "Username and Password" step; nothing
             # since has updated it, since neither "user_created" nor
             # "user_apply_confirmed" hands a window= back.
-            (lambda: gui._user_mgmt_window, lambda: gui._user_mgmt_window._close_toolbar_btn,
+            # _WHOLE_WINDOW, not a specific widget - UserManagementWindow
+            # already has a real, working close control (its own WM
+            # titlebar "X"), which is outside NASsie's own window content
+            # and so physically can't be highlighted directly (see
+            # _HighlightBox.place_around_container()'s docstring) -
+            # highlighting the whole window instead still makes
+            # unambiguous which one the text means.
+            (lambda: gui._user_mgmt_window, lambda: _WHOLE_WINDOW,
              "Close", "Close this window to return to the main NASsie window.",
              "user_mgmt_closed"),
 
@@ -488,6 +579,7 @@ class GuiTour:
         ]
 
     def start(self):
+        mark_tour_started()
         self.index = 0
         self._show_step()
 
@@ -498,8 +590,10 @@ class GuiTour:
         if container is None:
             # The window this step depends on isn't around (the tour was
             # interrupted, or something closed out of order) - bail out
-            # quietly rather than point at nothing.
-            self.stop()
+            # quietly rather than point at nothing. completed=False: this
+            # wasn't a deliberate Skip, it's genuinely unfinished - see
+            # tour_state()'s docstring for why that distinction matters.
+            self.stop(completed=False)
             return
         container.update_idletasks()
         _bring_to_front(container)
@@ -508,17 +602,24 @@ class GuiTour:
         # which is a plain Tcl tk_messageBox with no Python widget handle
         # to attach a highlight to) skips the highlight box entirely and
         # places the callout outside the container's own bounds instead -
-        # see _Callout.place_outside_container().
+        # see _Callout.place_outside_container(). _WHOLE_WINDOW highlights
+        # the container itself instead of a specific widget within it -
+        # see _HighlightBox.place_around_container().
         widget = widget_fn() if widget_fn is not None else None
 
-        if widget is not None:
+        if widget is _WHOLE_WINDOW:
+            self._highlight = _HighlightBox(container)
+            self._highlight.place_around_container()
+        elif widget is not None:
             self._highlight = _HighlightBox(container)
             self._highlight.place_around(widget)
         else:
             self._highlight = None
 
         self._callout = _Callout(container, title, text, self.index + 1, len(self.steps), on_skip=self.stop)
-        if widget is not None:
+        if widget is _WHOLE_WINDOW:
+            self._callout.place_near(container)
+        elif widget is not None:
             self._callout.place_near(widget)
         else:
             self._callout.place_outside_container(container)
@@ -568,7 +669,10 @@ class GuiTour:
         # compositor.
         def place_callout():
             # Shared by reposition() and show_callout().
-            if widget is not None:
+            if widget is _WHOLE_WINDOW:
+                self._highlight.place_around_container()
+                self._callout.place_near(container)
+            elif widget is not None:
                 self._highlight.place_around(widget)
                 self._callout.place_near(widget)
             else:
@@ -667,11 +771,37 @@ class GuiTour:
         else:
             self._show_step()
 
+    def show_name_error(self, message):
+        # Called from CreateShareDialog._confirm_name() right when its own
+        # "Invalid name" messagebox fires - only meaningfully acts if the
+        # tour is actually showing the "Share Name" step right now
+        # (checked via wait_event, the step's own unique signal - see
+        # on_event()'s docstring), so it's safe to call unconditionally
+        # regardless of whether the tour is even running.
+        if self._callout is None or self._wait_event != "share_name_confirmed":
+            return
+        self._callout.set_text(f"That name didn't work — {message} Fix it and click Next again.")
+        # Re-run this step's own widget_fn, not a cached reference - the
+        # dialog is still the same one, but the text changing size means
+        # the callout itself may have changed size too.
+        widget_fn = self.steps[self.index][1]
+        try:
+            self._callout.place_near(widget_fn())
+        except tk.TclError:
+            pass
+
     def _show_finish(self):
         # The one step with no further action to gate on - a manual close
         # is the right call here, since the walkthrough is genuinely done.
         # Always back on the main window by this point (attaching a user
         # closes its dialog), so gui.root/shares_list, not _active_window.
+        #
+        # Marked completed right here, not deferred until Close is
+        # actually clicked - every real action the tour asks for is done
+        # by this point, so a force-quit ON this step shouldn't count as
+        # "interrupted" (see tour_state()) any more than clicking Close
+        # itself would.
+        mark_tour_completed()
         self._teardown_current()
         widget = self._newest_share_region()
         self.root.update_idletasks()
@@ -687,7 +817,14 @@ class GuiTour:
         self._wait_event = None
         self._track_container(self.root, widget)
 
-    def stop(self):
+    def stop(self, completed=True):
+        # completed=True is the right default for the common caller (the
+        # callout's own Skip/Close button) - a deliberate dismissal is as
+        # good as finishing it, same reasoning as _show_finish's. The one
+        # caller that passes False is _show_step()'s own container-
+        # vanished bailout, which isn't a deliberate choice at all.
+        if completed:
+            mark_tour_completed()
         self._teardown_current()
 
     def _teardown_current(self):
