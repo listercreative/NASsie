@@ -724,7 +724,12 @@ class GuiTour:
             (lambda: gui.root, lambda: gui._users_toggle_btn.label,
              "Manage Users", "Open Manage Users to create and delete user accounts.",
              "user_mgmt_opened"),
-            (lambda: gui.root, lambda: gui._user_mgmt_panel.add_row.strip,
+            # "New User" is a real row of the Users panel's own Treeview
+            # now too (row #1 - see UserManagementPanel.refresh()'s
+            # add_row tag), same _TreeRegion adapter the "New Share" step
+            # above uses for its own list row.
+            (lambda: gui.root,
+             lambda: _TreeRegion(gui._user_mgmt_panel.users_list, [gui._user_mgmt_panel._add_user_row_id]),
              "New User", "Click New User to create a new share user.",
              "user_dialog_opened"),
             (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.username_entry),
@@ -787,8 +792,7 @@ class GuiTour:
              "attach_apply_confirmed"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
              "Delete Share",
-             "Click Delete Share to see what it does - this is turned off for the rest of the "
-             "tour so you keep the share you just made.",
+             "Press the Delete share button.",
              "share_delete_dialog_opened"),
             # No widget (None) - same reasoning as the other
             # "Confirmation" steps: GUIWizard._delete_selected_share()'s
@@ -816,8 +820,10 @@ class GuiTour:
              "qr_prompt_cancelled"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
              "Detach",
-             "Removes this user's access to the share. This is turned off for the rest of the "
-             "tour so your example keeps its attached user.",
+             lambda: (
+                 f"This removes {gui._selected_share_and_user()[1]} access to "
+                 f"{gui._selected_share_and_user()[0]}. Skipped here during tour."
+             ),
              "user_detach_dialog_opened"),
             # No widget (None) - same reasoning as the other
             # "Confirmation" steps: GUIWizard._unattach_selected_user()'s
@@ -850,6 +856,14 @@ class GuiTour:
     def _show_step(self):
         self._teardown_current()
         container_fn, widget_fn, title, text, wait_event = self.steps[self.index]
+        # A step's text is usually a plain string, but the "Detach" step
+        # needs the actual username/share name being demonstrated (see
+        # its own entry in _build_steps()) - callable, called lazily
+        # same as container_fn/widget_fn, so it reads gui's CURRENT
+        # selection at the moment this step actually shows rather than
+        # whatever it was when the step list was first built.
+        if callable(text):
+            text = text()
         container = container_fn()
         if container is None:
             # The window this step depends on isn't around (the tour was
