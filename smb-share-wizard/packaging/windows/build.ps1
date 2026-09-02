@@ -63,7 +63,8 @@ python -m PyInstaller `
   --name NASsie `
   --icon (Join-Path $PSScriptRoot "nassie_icon.ico") `
   --add-data "$(Join-Path $RepoSrc 'nassie_icon.png');." `
-  --hidden-import=core --hidden-import=cli --hidden-import=gui --hidden-import=tui --hidden-import=tour `
+  --add-data "$(Join-Path $RepoSrc 'nassie_ttk');nassie_ttk" `
+  --hidden-import=core --hidden-import=cli --hidden-import=gui --hidden-import=tui --hidden-import=tour --hidden-import=nassie_ttk --hidden-import=window_corners --hidden-import=linux_titlebar `
   --collect-all=rich `
   --collect-all=qrcode `
   --collect-all=PIL `

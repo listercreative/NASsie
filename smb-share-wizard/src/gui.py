@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import platform
 import sys
 import tempfile
 import threading
@@ -14,6 +15,9 @@ from core import (
     USERNAME_MAX_LEN, USERNAME_RE,
 )
 from tour import GuiTour, tour_state, mark_tour_completed
+import nassie_ttk
+import window_corners
+import linux_titlebar
 
 
 def _patch_messagebox_front(messagebox_module, simpledialog_module):
@@ -173,15 +177,13 @@ class _Tooltip:
             self.tip = None
 
 
-def _icon_button(parent, icon, tooltip, command, **kwargs):
+def _icon_button(parent, icon, tooltip, command, width=3, **kwargs):
     # A plain "+" (or any single glyph) at the default button font size
     # reads as thin/washed-out next to full-color emoji icons - a larger
     # size (see the "Icon.TButton" style) gives it comparable visual
     # weight without needing to fall back to a colored-pill emoji glyph
     # just for "add".
-    btn = ttk.Button(
-        parent, text=icon, command=command, width=3, style="Icon.TButton", **kwargs
-    )
+    btn = ttk.Button(parent, text=icon, command=command, width=width, style="Icon.TButton", **kwargs)
     _Tooltip(btn, tooltip)
     return btn
 
@@ -396,6 +398,13 @@ class AddUserDialog(tk.Toplevel):
 
     def _on_cancel(self):
         if self._app is not None:
+            # See GUIWizard._tour_blocks_closing()'s docstring - lets the
+            # dedicated "Cancel" step's own Cancel click through as
+            # normal, blocks it everywhere else in the tour (e.g. midway
+            # through "Username and Password") so it can't strand the
+            # tour pointed at a field on a dialog that no longer exists.
+            if self._app._tour_blocks_closing(self, "user_dialog_cancelled"):
+                return
             self._app._notify_tour("user_dialog_cancelled", window=self)
         self.destroy()
 
@@ -601,7 +610,7 @@ class CreateShareDialog(tk.Toplevel):
         # page 1 is confirmed - see _confirm_name) for anyone happy to
         # just accept it - Create Share makes that folder itself if it
         # doesn't exist yet, same as it always has.
-        self.path_entry = ttk.Entry(form, width=32, state="readonly")
+        self.path_entry = ttk.Entry(form, width=32, state="readonly", cursor="arrow")
         self.path_entry.grid(row=0, column=1, sticky="w", pady=4)
         _icon_button(form, "📂", "Browse", self._browse_path).grid(row=0, column=2, padx=4)
 
@@ -659,6 +668,13 @@ class CreateShareDialog(tk.Toplevel):
         # window too) - the background thread still holds a reference to
         # this dialog's widgets via _apply_done's closure.
         if self._working:
+            return
+        # No step here ever expects Cancel/WM-close as the right move
+        # (unlike AddUserDialog's dedicated "Cancel" step) - own_close_
+        # event=None can never match a real wait_event, so this blocks
+        # unconditionally for as long as the tour is actively on a step
+        # inside this dialog. See GUIWizard._tour_blocks_closing().
+        if self.app._tour_blocks_closing(self, None):
             return
         self.destroy()
 
@@ -883,7 +899,6 @@ class UserManagementWindow(tk.Toplevel):
         _icon_button(container, "🔑", "Change Password", self._change_password).pack(
             side="left", fill="y", padx=1
         )
-        _icon_button(container, "📱", "Show QR Code", self._show_qr).pack(side="left", fill="y", padx=1)
         _icon_button(container, "🗑", "Delete User", self._delete_user).pack(side="left", fill="y", padx=1)
         return True
 
@@ -893,6 +908,13 @@ class UserManagementWindow(tk.Toplevel):
         self.app._notify_tour("user_mgmt_opened", window=self)
 
     def _on_close(self):
+        # See GUIWizard._tour_blocks_closing()'s docstring - lets the
+        # dedicated "Close" step's own close-via-titlebar-✕ through as
+        # normal (its own wait_event, "user_mgmt_closed"), blocks it on
+        # every earlier step this window is active for (e.g. "New User",
+        # still waiting on the AddUserDialog it opens).
+        if self.app._tour_blocks_closing(self, "user_mgmt_closed"):
+            return
         self.withdraw()
         self.app._notify_tour("user_mgmt_closed")
 
@@ -934,55 +956,6 @@ class UserManagementWindow(tk.Toplevel):
 
     def _change_password(self):
         self._change_password_flow(confirm_qr=True)
-
-    def _show_qr(self):
-        # Asks for the CURRENT password and verifies it live (see
-        # SMBWizard.verify_password()) rather than resetting it - unlike
-        # _change_password_flow, this never touches the account, so
-        # showing a QR code again doesn't invalidate whatever other
-        # devices already connected with the old one. Falls back to that
-        # reset flow only if verification fails - covers "I don't
-        # remember it" without forcing a reset on the common case.
-        username = self._selected_username()
-        if not username:
-            messagebox.showinfo("Show QR Code", "Select a user first.")
-            return
-        user = next((u for u in self.wizard.list_users() if u["username"] == username), None)
-        shares = user.get("shares", []) if user else []
-        if not shares:
-            messagebox.showinfo("Show QR Code", f"'{username}' doesn't have access to any share yet.")
-            return
-
-        password = simpledialog.askstring(
-            "Show QR Code", f"Enter '{username}'s current password to show their QR code:",
-            show="*", parent=self,
-        )
-        if not password:
-            return
-
-        # Any one of the user's own shares works - see
-        # _verify_password_linux for why a real ("guest ok = no") share
-        # has to be named on Linux specifically.
-        if not self.wizard.verify_password(username, password, shares[0]):
-            if messagebox.askyesno(
-                "Incorrect password",
-                "That doesn't match this account's current password.\n\n"
-                "Forgot it? Reset the password instead to generate a new QR code.",
-            ):
-                self._change_password_flow(confirm_qr=False)
-            return
-
-        if len(shares) == 1:
-            share_name = shares[0]
-        else:
-            dialog = ChoiceDialog(
-                self, "Choose share", "Show a QR code for which share?", shares, ok_label="Show",
-            )
-            if not dialog.result:
-                return
-            share_name = dialog.result
-
-        self.app._offer_qr_codes(share_name, [{"username": username, "password": password}], confirm=False)
 
     def _change_password_flow(self, confirm_qr):
         # Passwords are stored as hashes everywhere (Samba, Windows, macOS)
@@ -1098,6 +1071,21 @@ class GUIWizard:
         # icon (set below) looks right.
         self.root = tk.Tk(className="NASsie")
         self.root.title("NASsie")
+        if platform.system() == "Linux":
+            # Withdrawn immediately, before anything below ever gets a
+            # chance to map it - linux_titlebar.install() further down
+            # strips native decorations, which would otherwise show
+            # briefly with them before losing them a moment later. This
+            # stays withdrawn until _bring_to_front()'s deiconify() at
+            # the very end of this method, the same "measure/build fully
+            # before ever showing it" approach this method already uses
+            # for its own sizing (see the block below _build_shares_page).
+            self.root.withdraw()
+        # NASsie's own recolored fork of the Sun Valley ttk theme (see
+        # nassie_ttk/__init__.py) - applied before the Icon.TButton/
+        # Treeview style tweaks below so those layer on top of it rather
+        # than getting overwritten by the theme switch.
+        nassie_ttk.set_theme("light")
         # Styles are per-interpreter, not per-window - defining these once
         # here covers every icon button/Treeview in the app, including
         # ones on Toplevels (dialogs, LogWindow, UserManagementWindow)
@@ -1110,12 +1098,41 @@ class GUIWizard:
         # actually fits its button's own padding now that it isn't also
         # being sized up to dodge clipping.
         ttk.Style(self.root).configure("Icon.TButton", font=("TkDefaultFont", 11))
-        ttk.Style(self.root).configure("Treeview", rowheight=32)
+        # 32 was tuned for the old default theme's button image size -
+        # nassie_ttk's own Icon.TButton needs 34px to render without
+        # clipping (confirmed live: winfo_reqheight() reports 34, not the
+        # 32 this used to match) - a couple of pixels of headroom beyond
+        # that so it's not sitting exactly on the edge again the next
+        # time either changes slightly.
+        ttk.Style(self.root).configure("Treeview", rowheight=36)
+        # nassie_ttk gives a readonly TEntry (CreateShareDialog's own
+        # path_entry - the only one in the app) the exact same white
+        # fieldbackground as an editable one, unlike the old default
+        # theme, which visibly grayed it out - readonly here means "set
+        # via Browse, not typed" (see path_entry's own state="readonly"
+        # comment), and looking identical to an editable field gave no
+        # visual cue of that. Global on TEntry rather than a dedicated
+        # style since path_entry is the only readonly one that exists.
+        ttk.Style(self.root).map(
+            "TEntry",
+            fieldbackground=[("readonly", "#e5e5e5")],
+            foreground=[("readonly", "#666666")],
+        )
         # Tk has no built-in "center on screen" - left alone, the window
         # manager decides placement, which is commonly the top-left corner
         # rather than anywhere near the middle of the display.
         self._load_icon_image()
         self._set_window_icon()
+        if platform.system() == "Linux":
+            # Needs the icon image above (reused at titlebar size) and
+            # must run before _build_header() packs anything, so the
+            # titlebar row it builds ends up on top - see
+            # linux_titlebar.py's own docstring for why this exists at
+            # all (rounded corners need Mutter to stop drawing a frame
+            # around this window) rather than being Windows/macOS's
+            # window_corners.apply() call below, which is enough on its
+            # own on those platforms.
+            linux_titlebar.install(self)
         self._build_header()
         self._build_shares_page()
 
@@ -1163,6 +1180,11 @@ class GUIWizard:
         # freely resizable (no resizable(False) call), so this is the only
         # thing stopping that.
         self.root.minsize(width, height)
+        # Native decorations (WM titlebar on Linux, DWM on Windows, AppKit
+        # on macOS) already round the window everywhere BUT this - see
+        # window_corners.py for why the bottom two corners specifically
+        # need it and every other platform doesn't.
+        window_corners.apply(self.root)
         self._bring_to_front()
 
         # Deferred via after() either way, so the window is fully mapped
@@ -1281,6 +1303,33 @@ class GUIWizard:
         tour = getattr(self, "_tour", None)
         return bool(tour and tour._callout is not None and tour._wait_event == event)
 
+    def _tour_blocks_closing(self, dialog, own_close_event):
+        # True while the tour is actively pointed at THIS exact dialog and
+        # wants something OTHER than closing it right now - e.g. it's on
+        # the "Username and Password" step (wait_event="user_created"),
+        # not the dedicated "Cancel" step (wait_event=
+        # "user_dialog_cancelled", own_close_event for AddUserDialog).
+        # Without this, Cancel/the WM close button/Alt+F4 could always
+        # close the dialog anyway even though the tour's on_event() never
+        # matched and so never advanced - leaving the tour's callout
+        # stuck pointing at a field on an already-destroyed dialog, with
+        # no way forward except Skip Tour. Reported live as wanting the
+        # guide to be "almost undefeatable" - this is the general version
+        # of the same idea _tour_waiting_on() already applies to Delete
+        # Share/Detach, aimed at premature exits instead of destructive
+        # clicks.
+        #
+        # own_close_event itself is always let through - some dialogs
+        # have a step where closing/cancelling IS the expected action
+        # (AddUserDialog's "Cancel" step); most (CreateShareDialog,
+        # UserManagementWindow) have no such step at all, so pass an
+        # event string that never appears in their own step list.
+        tour = getattr(self, "_tour", None)
+        return bool(
+            tour and tour._callout is not None and tour._active_window is dialog
+            and tour._wait_event != own_close_event
+        )
+
     def _tour_flash_name_error(self, message):
         tour = getattr(self, "_tour", None)
         if tour:
@@ -1320,10 +1369,12 @@ class GUIWizard:
         # whichever row is selected.
         toolbar = ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=8, pady=(8, 0))
-        self._new_share_btn = _icon_button(toolbar, "➕", "New Share", self._open_create_share_dialog)
+        self._new_share_btn = _icon_button(
+            toolbar, "➕", "New Share", self._open_create_share_dialog,
+        )
         self._new_share_btn.pack(side="left")
         self._manage_users_btn = _icon_button(
-            toolbar, "👤", "Manage Users", lambda: self._user_mgmt_window.show()
+            toolbar, "👤", "Manage Users", lambda: self._user_mgmt_window.show(),
         )
         self._manage_users_btn.pack(side="left", padx=(6, 0))
 
