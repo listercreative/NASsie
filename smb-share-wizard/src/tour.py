@@ -10,14 +10,6 @@ _HIGHLIGHT_COLOR = "#0e92ab"
 _CALLOUT_BG = "#eaf6f8"
 _BORDER_THICKNESS = 3
 
-# Sentinel a step's widget_fn returns to mean "highlight the whole
-# container window" (see the "Close" step - it points at
-# UserManagementWindow's own real close control, its WM titlebar, which
-# has nothing of NASsie's own to point at) rather than None (no highlight
-# at all - e.g. the "Confirmation" steps) or a specific widget.
-_WHOLE_WINDOW = object()
-
-
 class _PointAtOnly:
     """Wraps a widget for a step where the widget itself should still get
     the usual highlight box, but _Callout.place_near(widget)'s "no room
@@ -48,9 +40,7 @@ class _HighlightWholeDialog:
     read as pointing at one input in isolation rather than "this whole
     popup is what the callout below is about," for steps on a small modal
     dialog (CreateShareDialog, AddUserDialog) where the callout's own text
-    already makes clear which field to use. Distinct from _WHOLE_WINDOW,
-    which ALSO changes where the callout goes (place_below_titlebar(), for
-    steps with no field to point at - the native corner close button)."""
+    already makes clear which field to use."""
     def __init__(self, widget):
         self.widget = widget
 
@@ -294,12 +284,8 @@ class _HighlightBox:
 
     def place_around_container(self):
         # Highlights the WHOLE window this box's bars are children of
-        # (self.root itself), not a widget within it - for a step asking
-        # to close a window that has nothing of NASsie's own left to
-        # highlight otherwise (the "Close" tour step: UserManagementWindow
-        # already has a real, working close control - its own WM titlebar
-        # "X" - so there's no reason to add a redundant in-content button
-        # just to have something to point at instead).
+        # (self.root - the dialog itself for _HighlightWholeDialog steps),
+        # not a single widget within it.
         #
         # Inset from the window's own edges, not padded OUTWARD around
         # them the way place_around() pads around a normal (smaller,
@@ -540,33 +526,6 @@ class _Callout(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
         self.lift()
 
-    def place_below_titlebar(self, container):
-        # For a step whose whole point is the window's own native close
-        # button (top-right corner, minimize/maximize/close) - that's WM/
-        # OS chrome, outside container's own client-area coordinates, so
-        # it can't be highlighted or pointed at directly the way a normal
-        # widget can (see _HighlightBox.place_around_container()'s
-        # docstring for the same limit on the highlight box). Anchoring
-        # the callout to the window's top-right corner instead of below
-        # its bottom edge (the generic place_near() whole-window
-        # fallback) at least puts it as close to those controls as Tk's
-        # own coordinate space allows, rather than ~a full window-height
-        # away from what it's actually talking about.
-        w, h = self._measure()
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
-        container.update_idletasks()
-        cx = container.winfo_rootx()
-        cy = container.winfo_rooty()
-        cw = container.winfo_width()
-        margin = 8
-        x = cx + cw - w
-        y = cy + margin
-        x = max(0, min(x, screen_w - w))
-        y = max(0, min(y, screen_h - h))
-        self.geometry(f"+{x}+{y}")
-        self.lift()
-
     def place_outside_container(self, container, estimated_dialog_half_height=90):
         # For a step with nothing of NASsie's own to point at - e.g. the
         # native tk_messageBox confirming a share/user was created, which
@@ -723,8 +682,26 @@ class GuiTour:
         # Each title names the actual item being pointed at (its own
         # button/field label or tooltip), not the action being asked for -
         # e.g. "Username and Password", not "Name the user".
+        # New Share and New User (from the Users panel) are both triggered
+        # by a shaded "+" row now instead of a toolbar button (see gui.py's
+        # own _AddRowTrigger) - but still open the same real popup dialogs
+        # (CreateShareDialog/AddUserDialog) they always did; an earlier
+        # version of this session had the row itself expand into an inline
+        # form instead, reported live as reading wrong ("you've rebuilt
+        # the form inside of this row"), so the popup-pointing steps below
+        # are back to self._active_window + _HighlightWholeDialog (traces
+        # the whole popup's border, not just the one field - see that
+        # class's own docstring) exactly as before that detour. "Manage
+        # Users"/"New User"(-panel-toggle)/"Close" are unaffected either
+        # way - those still point at the docked panel's own toggle button
+        # and "+" row trigger, not a popup.
         return [
-            (lambda: gui.root, lambda: gui._new_share_btn,
+            # "New Share" is a real row of gui.shares_list now (row #1 -
+            # see gui.py's own _add_share_row_id), not a separate widget,
+            # so it needs the same _TreeRegion adapter the "Shares" step
+            # below already uses to point at a specific tree row rather
+            # than the whole (much taller) tree widget.
+            (lambda: gui.root, lambda: _TreeRegion(gui.shares_list, [gui._add_share_row_id]),
              "New Share", "Click here to create your first share.",
              "share_dialog_opened"),
             (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.name_entry),
@@ -744,10 +721,10 @@ class GuiTour:
              "Confirmation", "Click OK to confirm.",
              "share_apply_confirmed"),
 
-            (lambda: gui.root, lambda: gui._manage_users_btn,
+            (lambda: gui.root, lambda: gui._users_toggle_btn.label,
              "Manage Users", "Open Manage Users to create and delete user accounts.",
              "user_mgmt_opened"),
-            (lambda: self._active_window, lambda: self._active_window._new_user_toolbar_btn,
+            (lambda: gui.root, lambda: gui._user_mgmt_panel.add_row.strip,
              "New User", "Click New User to create a new share user.",
              "user_dialog_opened"),
             (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.username_entry),
@@ -756,21 +733,12 @@ class GuiTour:
             (lambda: gui.root, None,
              "Confirmation", "Click OK to confirm.",
              "user_apply_confirmed"),
-            # gui._user_mgmt_window directly, not self._active_window -
-            # active_window is still pointing at the (already-destroyed)
-            # AddUserDialog from the "Username and Password" step; nothing
-            # since has updated it, since neither "user_created" nor
-            # "user_apply_confirmed" hands a window= back.
-            # _WHOLE_WINDOW, not a specific widget - UserManagementWindow
-            # already has a real, working close control (its own WM
-            # titlebar "X"), which is outside NASsie's own window content
-            # and so physically can't be highlighted directly (see
-            # _HighlightBox.place_around_container()'s docstring) -
-            # highlighting the whole window instead still makes
-            # unambiguous which one the text means.
-            (lambda: gui._user_mgmt_window, lambda: _WHOLE_WINDOW,
-             "Close", "Use the ✕ in this window's top-right corner to close it and return to the main "
-             "NASsie window.",
+            # Same toggle button as the "Manage Users" step above - closing
+            # the panel is just clicking it again now, not a native
+            # titlebar ✕ (there's no separate window left to have one -
+            # see UserManagementPanel's own docstring).
+            (lambda: gui.root, lambda: gui._users_toggle_btn.label,
+             "Close", "Click the Users button again to close this panel and return to the shares list.",
              "user_mgmt_closed"),
 
             (lambda: gui.root, lambda: self._newest_share_region(),
@@ -898,15 +866,13 @@ class GuiTour:
         # which is a plain Tcl tk_messageBox with no Python widget handle
         # to attach a highlight to) skips the highlight box entirely and
         # places the callout outside the container's own bounds instead -
-        # see _Callout.place_outside_container(). _WHOLE_WINDOW highlights
-        # the container itself instead of a specific widget within it -
-        # see _HighlightBox.place_around_container().
+        # see _Callout.place_outside_container().
         widget = widget_fn() if widget_fn is not None else None
         point_at_only = isinstance(widget, _PointAtOnly)
         whole_dialog_highlight = isinstance(widget, _HighlightWholeDialog)
         highlight_target = widget.widget if (point_at_only or whole_dialog_highlight) else widget
 
-        if highlight_target is _WHOLE_WINDOW or whole_dialog_highlight:
+        if whole_dialog_highlight:
             self._highlight = _HighlightBox(container)
             self._highlight.place_around_container()
         elif highlight_target is not None:
@@ -916,9 +882,7 @@ class GuiTour:
             self._highlight = None
 
         self._callout = _Callout(container, title, text, on_skip=self._confirm_and_stop)
-        if highlight_target is _WHOLE_WINDOW:
-            self._callout.place_below_titlebar(container)
-        elif highlight_target is not None and not point_at_only:
+        if highlight_target is not None and not point_at_only:
             self._callout.place_near(highlight_target)
         else:
             # Both the widget=None steps (native tk_messageBox
@@ -977,16 +941,14 @@ class GuiTour:
             if self._callout is None:
                 return
             try:
-                if highlight_target is _WHOLE_WINDOW or whole_dialog_highlight:
+                if whole_dialog_highlight:
                     self._highlight.place_around_container()
                 elif highlight_target is not None:
                     # self._highlight is None (see _show_step()) when
                     # highlight_target is None - nothing to reposition.
                     self._highlight.place_around(highlight_target)
 
-                if highlight_target is _WHOLE_WINDOW:
-                    self._callout.place_below_titlebar(container)
-                elif highlight_target is not None and not point_at_only:
+                if highlight_target is not None and not point_at_only:
                     self._callout.place_near(highlight_target)
                 else:
                     self._callout.place_outside_container(
@@ -1119,6 +1081,19 @@ class GuiTour:
         # just dismissing the congratulations) and the involuntary
         # container-vanished bailout also calls directly (not a user
         # choice to confirm at all).
+        #
+        # _patch_messagebox_front (gui.py) already toggles the parent's
+        # own -topmost around a messagebox call to drag it to the front -
+        # not enough here, though: it only sets -topmost True, and root
+        # is already permanently True (see _bring_window_to_front()'s own
+        # docstring) by the time any tour step can run, so that alone is
+        # a no-op against whichever OTHER always-on-top NASsie window
+        # (UserManagementWindow, say) was raised more recently - reported
+        # live, the confirmation landing behind it. _bring_to_front()
+        # does the actual False->True re-trigger that forces a real
+        # restack, the same fix already relied on everywhere else in
+        # this file for the identical multi-window race.
+        _bring_to_front(self.root)
         if messagebox.askyesno(
             "Skip Tour", "Skip the rest of the guided tour?", parent=self.root,
         ):

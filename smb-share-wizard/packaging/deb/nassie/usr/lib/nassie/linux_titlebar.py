@@ -1,4 +1,4 @@
-"""A hand-drawn titlebar for the main window, Linux only.
+"""A hand-drawn titlebar for NASsie's own windows, Linux only.
 
 See window_corners.py's docstring for the diagnosis this exists to fix:
 Mutter draws a SEPARATE decoration frame around a normal WM-managed window
@@ -7,19 +7,24 @@ onto that frame - so no amount of shaping our own window ever rounds what's
 actually on screen. The only way around that is to stop asking Mutter to
 draw a frame at all.
 
-install() does that via the Motif WM hints property (_MOTIF_WM_HINTS,
-decorations=0) rather than Tk's overrideredirect(). That distinction is the
-whole point: overrideredirect() takes a window out of WM management
-entirely - no taskbar entry, no alt-tab, no iconify()/maximize support.
-Motif hints only stop the WM from DRAWING decorations; the window stays
-fully WM-managed, so iconify(), '-zoomed' maximize, and taskbar/alt-tab
-presence keep working exactly as they do today - the WM is still the one
-doing them, we're just also drawing our own titlebar row for the mouse to
-grab instead of leaving that row for Mutter to draw.
+apply_to_window() does that via the Motif WM hints property
+(_MOTIF_WM_HINTS, decorations=0) rather than Tk's overrideredirect(). That
+distinction is the whole point: overrideredirect() takes a window out of
+WM management entirely - no taskbar entry, no alt-tab, no iconify()/
+maximize support. Motif hints only stop the WM from DRAWING decorations;
+the window stays fully WM-managed, so iconify(), '-zoomed' maximize, and
+taskbar/alt-tab presence keep working exactly as they do today - the WM is
+still the one doing them, we're just also drawing our own titlebar row for
+the mouse to grab instead of leaving that row for Mutter to draw.
 
-Scoped to the main window only - dialogs keep their native decorations
-(never part of the complaint, and a couple of tour steps already point at
-a dialog's own native close button)."""
+Used for the main window AND every dialog/Toplevel (AddUserDialog,
+CreateShareDialog, ChoiceDialog, QrCodeDialog, LogWindow,
+UserManagementWindow) - a popup with the main window's corners rounded and
+its own still square read as an inconsistent, half-finished job (reported
+live). resizable=False dialogs get a minimize+close titlebar with no
+resize grips/maximize button (nothing to maximize a fixed-size dialog TO);
+resizable=True windows (root, LogWindow, UserManagementWindow) get the
+full set, same as root always has."""
 from __future__ import annotations
 
 import ctypes
@@ -37,13 +42,32 @@ _RESIZE_CURSORS = {
 
 
 def install(gui_wizard):
+    apply_to_window(
+        gui_wizard.root, "NASsie", gui_wizard.root.destroy,
+        icon_image=getattr(gui_wizard, "_icon_image", None), resizable=True,
+    )
+
+
+def apply_to_window(window, title, on_close, icon_image=None, resizable=True):
     """Best-effort, same posture as window_corners.apply() - if libX11
     isn't there or the property write fails, the window just keeps its
-    native decorations, silently. Never worth failing the app over this."""
-    root = gui_wizard.root
-    if not _strip_decorations(root):
-        return
-    _build_titlebar(gui_wizard)
+    native decorations, silently. Never worth failing the app over this.
+
+    on_close is called by the custom titlebar's close button - the
+    caller's OWN close method (AddUserDialog._on_cancel,
+    CreateShareDialog._on_close, ...), never window.destroy() directly.
+    Those already do real work beyond destroying the window (checking
+    GUIWizard._tour_blocks_closing(), notifying the tour, guarding a
+    create-in-flight) that a native close button used to trigger via
+    each dialog's own `protocol("WM_DELETE_WINDOW", ...)` - stripping
+    decorations doesn't touch that protocol handler (still fires for
+    Alt+F4/WM-initiated closes), but OUR button is a plain Label click,
+    not a window-manager close request, so it has to call the same
+    method explicitly to get the same behavior."""
+    if not _strip_decorations(window):
+        return False
+    _build_titlebar(window, title, on_close, icon_image, resizable)
+    return True
 
 
 class _MotifWmHints(ctypes.Structure):
@@ -56,9 +80,9 @@ class _MotifWmHints(ctypes.Structure):
     ]
 
 
-def _strip_decorations(root):
+def _strip_decorations(window):
     # Tk's own X connection is a separate client from the one opened
-    # below, and Tk batches/defers its requests - root.winfo_id() can
+    # below, and Tk batches/defers its requests - window.winfo_id() can
     # return an ID for a window Tk has decided on locally but not yet
     # actually sent a CreateWindow request for. Racing that with our own
     # connection is silent, not just theoretically wrong: it hits BadWindow
@@ -68,7 +92,7 @@ def _strip_decorations(root):
     # no-op against a window the server doesn't know about yet.
     # update_idletasks() forces Tk to flush pending work, including
     # actually creating this window, before we go read its id.
-    root.update_idletasks()
+    window.update_idletasks()
     try:
         xlib = ctypes.CDLL("libX11.so.6")
     except OSError:
@@ -102,7 +126,7 @@ def _strip_decorations(root):
     PROP_MODE_REPLACE = 0
     FORMAT_32 = 32
     xlib.XChangeProperty(
-        dpy, root.winfo_id(), motif_atom, motif_atom, FORMAT_32,
+        dpy, window.winfo_id(), motif_atom, motif_atom, FORMAT_32,
         PROP_MODE_REPLACE, ctypes.byref(hints), 5,
     )
     xlib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -113,26 +137,25 @@ def _strip_decorations(root):
     return True
 
 
-def _build_titlebar(gui_wizard):
-    root = gui_wizard.root
-    bg = ttk.Style(root).lookup("TFrame", "background") or "#f3f3f3"
+def _build_titlebar(window, title, on_close, icon_image, resizable):
+    bg = ttk.Style(window).lookup("TFrame", "background") or "#f3f3f3"
 
-    bar = tk.Frame(root, bg=bg)
+    bar = tk.Frame(window, bg=bg)
     bar.pack(side="top", fill="x")
 
     left = tk.Frame(bar, bg=bg)
     left.pack(side="left", fill="y", padx=(10, 0), pady=6)
 
-    # Kept on gui_wizard, not just a local - a PhotoImage with no surviving
-    # Python reference gets garbage collected even though Tk is still
-    # displaying it, which blanks the label the next time Tk redraws it.
-    icon_image = getattr(gui_wizard, "_icon_image", None)
+    # Kept on the window itself, not just a local - a PhotoImage with no
+    # surviving Python reference gets garbage collected even though Tk is
+    # still displaying it, which blanks the label the next time Tk
+    # redraws it.
     if icon_image:
         scale = max(1, icon_image.width() // 18)
-        gui_wizard._titlebar_icon_image = icon_image.subsample(scale, scale)
-        tk.Label(left, image=gui_wizard._titlebar_icon_image, bg=bg).pack(side="left", padx=(0, 6))
+        window._titlebar_icon_image = icon_image.subsample(scale, scale)
+        tk.Label(left, image=window._titlebar_icon_image, bg=bg).pack(side="left", padx=(0, 6))
 
-    title_label = tk.Label(left, text="NASsie", bg=bg, font=("TkDefaultFont", 10, "bold"))
+    title_label = tk.Label(left, text=title, bg=bg, font=("TkDefaultFont", 10, "bold"))
     title_label.pack(side="left")
 
     right = tk.Frame(bar, bg=bg)
@@ -143,23 +166,23 @@ def _build_titlebar(gui_wizard):
     def toggle_maximize(event=None):
         if maximize_state["maximized"]:
             try:
-                root.attributes("-zoomed", False)
+                window.attributes("-zoomed", False)
             except tk.TclError:
                 pass
             if maximize_state["geometry"]:
-                root.geometry(maximize_state["geometry"])
+                window.geometry(maximize_state["geometry"])
             maximize_state["maximized"] = False
             maximize_btn.configure(text="▢")
         else:
-            maximize_state["geometry"] = root.geometry()
+            maximize_state["geometry"] = window.geometry()
             try:
-                root.attributes("-zoomed", True)
+                window.attributes("-zoomed", True)
             except tk.TclError:
                 # '-zoomed' needs an EWMH-capable WM to honor it - true of
                 # Mutter, but a manual full-work-area fallback costs
                 # nothing and keeps this from being a dead button on
                 # whatever WM doesn't.
-                root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
+                window.geometry(f"{window.winfo_screenwidth()}x{window.winfo_screenheight()}+0+0")
             maximize_state["maximized"] = True
             maximize_btn.configure(text="❘❘")
         return "break"
@@ -179,43 +202,51 @@ def _build_titlebar(gui_wizard):
         btn.pack(side="left")
         return btn
 
-    _titlebar_button(right, "─", root.iconify, "#e5e5e5")
-    maximize_btn = _titlebar_button(right, "▢", toggle_maximize, "#e5e5e5")
-    _titlebar_button(right, "✕", root.destroy, "#e81123", hover_fg="white")
+    _titlebar_button(right, "─", window.iconify, "#e5e5e5")
+    # A fixed-size (resizable(False, False)) dialog has nothing to
+    # maximize TO - its own content dictates its size either way - so
+    # native decorations never give one a maximize control either;
+    # matching that instead of showing a button that would just re-center
+    # the same fixed size on screen.
+    if resizable:
+        maximize_btn = _titlebar_button(right, "▢", toggle_maximize, "#e5e5e5")
+    _titlebar_button(right, "✕", on_close, "#e81123", hover_fg="white")
 
     drag_state = {}
 
     def on_drag_press(event):
-        drag_state["x"] = event.x_root - root.winfo_x()
-        drag_state["y"] = event.y_root - root.winfo_y()
+        drag_state["x"] = event.x_root - window.winfo_x()
+        drag_state["y"] = event.y_root - window.winfo_y()
 
     def on_drag_motion(event):
         if maximize_state["maximized"]:
             return
-        root.geometry(f"+{event.x_root - drag_state['x']}+{event.y_root - drag_state['y']}")
+        window.geometry(f"+{event.x_root - drag_state['x']}+{event.y_root - drag_state['y']}")
 
     for widget in (bar, left, title_label):
         widget.bind("<ButtonPress-1>", on_drag_press)
         widget.bind("<B1-Motion>", on_drag_motion)
-        widget.bind("<Double-Button-1>", toggle_maximize)
+        if resizable:
+            widget.bind("<Double-Button-1>", toggle_maximize)
 
-    _install_resize_grips(root, bg)
+    if resizable:
+        _install_resize_grips(window, bg)
 
 
-def _install_resize_grips(root, bg):
+def _install_resize_grips(window, bg):
     thickness = 5
     corner_size = 10
     grips = {}
 
     def make_grip(edge):
-        grip = tk.Frame(root, bg=bg, cursor=_RESIZE_CURSORS[edge])
+        grip = tk.Frame(window, bg=bg, cursor=_RESIZE_CURSORS[edge])
         start = {}
 
         def on_press(event):
             start["data"] = (
                 event.x_root, event.y_root,
-                root.winfo_x(), root.winfo_y(),
-                root.winfo_width(), root.winfo_height(),
+                window.winfo_x(), window.winfo_y(),
+                window.winfo_width(), window.winfo_height(),
             )
 
         def on_motion(event):
@@ -224,7 +255,7 @@ def _install_resize_grips(root, bg):
             start_x, start_y, orig_x, orig_y, orig_w, orig_h = start["data"]
             dx = event.x_root - start_x
             dy = event.y_root - start_y
-            min_w, min_h = root.minsize()
+            min_w, min_h = window.minsize()
             x, y, w, h = orig_x, orig_y, orig_w, orig_h
             if "e" in edge:
                 w = max(min_w, orig_w + dx)
@@ -236,15 +267,16 @@ def _install_resize_grips(root, bg):
             if "n" in edge:
                 h = max(min_h, orig_h - dy)
                 y = orig_y + (orig_h - h)
-            root.geometry(f"{w}x{h}+{x}+{y}")
+            window.geometry(f"{w}x{h}+{x}+{y}")
 
         grip.bind("<ButtonPress-1>", on_press)
         grip.bind("<B1-Motion>", on_motion)
         return grip
 
-    # place() rather than pack()/grid() specifically so these track root's
-    # own size on every resize for free via relx/rely/relwidth/relheight,
-    # with no <Configure> handler needed to keep repositioning them.
+    # place() rather than pack()/grid() specifically so these track the
+    # window's own size on every resize for free via relx/rely/relwidth/
+    # relheight, with no <Configure> handler needed to keep repositioning
+    # them.
     edge_placement = {
         "n": dict(relx=0, rely=0, relwidth=1, height=thickness),
         "s": dict(relx=0, rely=1.0, anchor="sw", relwidth=1, height=thickness),
