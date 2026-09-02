@@ -1,7 +1,7 @@
 import os
 import platform
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 # Matches the app icon's teal (the serpent body/water) - a light tint of the
 # same hue for the callout background, rather than an unrelated color, so
@@ -39,12 +39,32 @@ class _PointAtOnly:
         self.widget = widget
 
 
+class _HighlightWholeDialog:
+    """Wraps a widget for a step where the CALLOUT should still point near
+    the widget as usual (place_near(widget) - the step is about that one
+    field, and the callout text says so), but the HIGHLIGHT BOX should
+    trace the whole dialog's border instead of tightly hugging just that
+    field - reported live as looking wrong: a small field-only highlight
+    read as pointing at one input in isolation rather than "this whole
+    popup is what the callout below is about," for steps on a small modal
+    dialog (CreateShareDialog, AddUserDialog) where the callout's own text
+    already makes clear which field to use. Distinct from _WHOLE_WINDOW,
+    which ALSO changes where the callout goes (place_below_titlebar(), for
+    steps with no field to point at - the native corner close button)."""
+    def __init__(self, widget):
+        self.widget = widget
+
+
 def _dialog_half_height_for(wait_event):
     # See _Callout.place_outside_container()'s own comment - most native
     # dialogs this points at are one short line, but the share-creation
     # apply-done message is genuinely longer (a status line plus a
-    # follow-up hint), so it alone needs a taller estimate.
-    return 160 if wait_event == "share_apply_confirmed" else 90
+    # follow-up hint), so it alone needs a taller estimate. 160 (measured
+    # against an older, shorter render of this same dialog) overshot the
+    # real thing badly enough to read as "far too low" once confirmed
+    # against an actual screenshot of it - about 235px tall, so ~117 half
+    # -height, not 160.
+    return 120 if wait_event == "share_apply_confirmed" else 90
 
 
 def _bring_to_front(win, steal_focus=True):
@@ -453,9 +473,61 @@ class _Callout(tk.Toplevel):
         margin = 14
         below_widget_y = wy + wh + margin
         above_widget_y = wy - margin - h
-        if below_widget_y + h <= min(cbottom, screen_h):
+        # "Room below/above the WIDGET" used to mean just "doesn't cross
+        # the CONTAINER's own top/bottom edge" - true even when a sibling
+        # field sits in that space, not open room at all. Confirmed live:
+        # the "Username and Password" step (username_entry, at the TOP of
+        # a multi-field dialog) placed itself "below the widget" and
+        # covered the Password/Confirm Password entries sitting right
+        # underneath it (both siblings of username_entry, gridded on the
+        # same dialog), once the dialog's own padding (nassie_ttk's,
+        # different from the old default theme's) shifted the numbers
+        # enough to newly trigger this.
+        #
+        # A proximity-to-container-edge heuristic (an earlier version of
+        # this fix) overcorrected: it also blocked the "New Share"/"Manage
+        # Users" toolbar buttons from placing below themselves, since
+        # they sit near the TOP of the tall main window, not the bottom -
+        # even though nothing is actually in the way there (their only
+        # sibling is each other, side by side in the same toolbar row).
+        # That forced them into the whole-window fallback instead, ~500px
+        # from the button - exactly the disconnected-bubble problem this
+        # method's own docstring above describes. Checking for an actual
+        # SIBLING (a widget sharing widget's own parent - the level a
+        # dialog's stacked fields or a toolbar's buttons live at) in the
+        # candidate rect targets the real conflict directly instead of
+        # guessing from position.
+        def _sibling_in_rect(y0, y1):
+            # widget isn't always a real Tk widget - _TreeRegion (see its
+            # own docstring) adapts one or more Treeview ROWS to this same
+            # winfo_* interface for the "Shares" step, and has no .master/
+            # sibling concept at all (confirmed live: AttributeError,
+            # '_TreeRegion' object has no attribute 'master', the first
+            # time this ran against a real installed build). Nothing
+            # meaningful to check there - the geometry-fit condition above
+            # is on its own exactly what this used to be before siblings
+            # were checked at all, which was already fine for a tree
+            # region (there's no adjacent sibling FIELD to cover, just
+            # more of the same tree).
+            master = getattr(widget, "master", None)
+            if master is None:
+                return False
+            for sib in master.winfo_children():
+                if sib is widget or not sib.winfo_ismapped():
+                    continue
+                sx0 = sib.winfo_rootx()
+                sy0 = sib.winfo_rooty()
+                sx1 = sx0 + sib.winfo_width()
+                sy1 = sy0 + sib.winfo_height()
+                if sx0 < wx + w and sx1 > wx and sy0 < y1 and sy1 > y0:
+                    return True
+            return False
+
+        if (below_widget_y + h <= min(cbottom, screen_h)
+                and not _sibling_in_rect(below_widget_y, below_widget_y + h)):
             x, y = wx, below_widget_y
-        elif above_widget_y >= max(cy, 0):
+        elif (above_widget_y >= max(cy, 0)
+                and not _sibling_in_rect(above_widget_y, above_widget_y + h)):
             x, y = wx, above_widget_y
         else:
             # No room around the widget itself within its own window -
@@ -655,10 +727,10 @@ class GuiTour:
             (lambda: gui.root, lambda: gui._new_share_btn,
              "New Share", "Click here to create your first share.",
              "share_dialog_opened"),
-            (lambda: self._active_window, lambda: self._active_window.name_entry,
+            (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.name_entry),
              "Share Name", "Type a share name and click OK.",
              "share_name_confirmed"),
-            (lambda: self._active_window, lambda: self._active_window.path_entry,
+            (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.path_entry),
              "Folder",
              "Pick a folder for this share or use the provided default, then click OK.",
              "share_created"),
@@ -678,7 +750,7 @@ class GuiTour:
             (lambda: self._active_window, lambda: self._active_window._new_user_toolbar_btn,
              "New User", "Click New User to create a new share user.",
              "user_dialog_opened"),
-            (lambda: self._active_window, lambda: self._active_window.username_entry,
+            (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.username_entry),
              "Username and Password", "Type a username and password, then click OK.",
              "user_created"),
             (lambda: gui.root, None,
@@ -804,7 +876,7 @@ class GuiTour:
         # binding, which doesn't return "break" and so doesn't swallow
         # this. Scoped to the tour's own lifetime, not left as a global
         # app-wide Escape handler.
-        self.root.bind_all("<Escape>", lambda e: self.stop())
+        self.root.bind_all("<Escape>", lambda e: self._confirm_and_stop())
         self._show_step()
 
     def _show_step(self):
@@ -831,9 +903,10 @@ class GuiTour:
         # see _HighlightBox.place_around_container().
         widget = widget_fn() if widget_fn is not None else None
         point_at_only = isinstance(widget, _PointAtOnly)
-        highlight_target = widget.widget if point_at_only else widget
+        whole_dialog_highlight = isinstance(widget, _HighlightWholeDialog)
+        highlight_target = widget.widget if (point_at_only or whole_dialog_highlight) else widget
 
-        if highlight_target is _WHOLE_WINDOW:
+        if highlight_target is _WHOLE_WINDOW or whole_dialog_highlight:
             self._highlight = _HighlightBox(container)
             self._highlight.place_around_container()
         elif highlight_target is not None:
@@ -842,7 +915,7 @@ class GuiTour:
         else:
             self._highlight = None
 
-        self._callout = _Callout(container, title, text, on_skip=self.stop)
+        self._callout = _Callout(container, title, text, on_skip=self._confirm_and_stop)
         if highlight_target is _WHOLE_WINDOW:
             self._callout.place_below_titlebar(container)
         elif highlight_target is not None and not point_at_only:
@@ -897,23 +970,24 @@ class GuiTour:
         # restraint - explicitly reverted in favor of just staying
         # visible always (see _Callout's own "-topmost" comment).
         point_at_only = isinstance(widget, _PointAtOnly)
-        highlight_target = widget.widget if point_at_only else widget
+        whole_dialog_highlight = isinstance(widget, _HighlightWholeDialog)
+        highlight_target = widget.widget if (point_at_only or whole_dialog_highlight) else widget
 
         def reposition(event=None):
             if self._callout is None:
                 return
             try:
-                if highlight_target is _WHOLE_WINDOW:
+                if highlight_target is _WHOLE_WINDOW or whole_dialog_highlight:
                     self._highlight.place_around_container()
-                    self._callout.place_below_titlebar(container)
                 elif highlight_target is not None:
+                    # self._highlight is None (see _show_step()) when
+                    # highlight_target is None - nothing to reposition.
                     self._highlight.place_around(highlight_target)
-                    if point_at_only:
-                        self._callout.place_outside_container(
-                            container, _dialog_half_height_for(self._wait_event)
-                        )
-                    else:
-                        self._callout.place_near(highlight_target)
+
+                if highlight_target is _WHOLE_WINDOW:
+                    self._callout.place_below_titlebar(container)
+                elif highlight_target is not None and not point_at_only:
+                    self._callout.place_near(highlight_target)
                 else:
                     self._callout.place_outside_container(
                         container, _dialog_half_height_for(self._wait_event)
@@ -1033,6 +1107,22 @@ class GuiTour:
         self._callout.deiconify()
         self._wait_event = None
         self._track_container(self.root, widget)
+
+    def _confirm_and_stop(self):
+        # A second verification before an actual skip takes effect -
+        # reported live wanting the guide close to undefeatable, so one
+        # stray click on Skip Tour (or Escape press) can't silently drop
+        # out of a real walkthrough. This wraps the two USER-INITIATED
+        # exits (the Skip Tour button, Escape) - not stop() itself, which
+        # the FINISH screen's own "Close" button still calls directly
+        # (nothing left to skip there - the tour's already done, this is
+        # just dismissing the congratulations) and the involuntary
+        # container-vanished bailout also calls directly (not a user
+        # choice to confirm at all).
+        if messagebox.askyesno(
+            "Skip Tour", "Skip the rest of the guided tour?", parent=self.root,
+        ):
+            self.stop()
 
     def stop(self, completed=True):
         # completed=True is the right default for the common caller (the

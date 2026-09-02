@@ -12,11 +12,25 @@ SRC="$PROJECT_ROOT/src"
 PKG="$SCRIPT_DIR/nassie"
 PKGLIB="$PKG/usr/lib/nassie"
 
-cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/nassie_icon.png" "$PKGLIB/"
+cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/window_corners.py" "$SRC/linux_titlebar.py" "$SRC/nassie_icon.png" "$PKGLIB/"
 cp "$PROJECT_ROOT/assets/nassie_icon.png" "$PKG/usr/share/pixmaps/nassie.png"
+
+# nassie_ttk/ is a real package (theme/*.tcl, theme/*.png, sv.tcl,
+# LICENSE, __init__.py) - a plain cp of individual files (like the *.py
+# list above) won't pick up its subdirectory. Removed and re-copied
+# rather than merged, so a regenerated theme's deleted/renamed files
+# don't linger as stale copies in the package dir.
+rm -rf "$PKGLIB/nassie_ttk"
+cp -r "$SRC/nassie_ttk" "$PKGLIB/"
+# A local py_compile/import of nassie_ttk leaves __pycache__ inside
+# src/nassie_ttk/ itself (unlike the top-level *.py files above, which
+# are copied individually and so never sweep one in) - cp -r happily
+# copies it straight into the package if present.
+find "$PKGLIB/nassie_ttk" -name "__pycache__" -exec rm -rf {} +
 
 find "$PKG" -type d -exec chmod 755 {} \;
 chmod 644 "$PKGLIB"/*.py "$PKGLIB/nassie_icon.png"
+find "$PKGLIB/nassie_ttk" -type f -exec chmod 644 {} \;
 chmod 755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/usr/bin/nassie"
 chmod 644 "$PKG/DEBIAN/control" \
           "$PKG/usr/share/applications/nassie.desktop" \
