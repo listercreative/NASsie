@@ -177,12 +177,38 @@ class _Tooltip:
             self.tip = None
 
 
-def _icon_button(parent, icon, tooltip, command, width=3, **kwargs):
+def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs):
     # A plain "+" (or any single glyph) at the default button font size
     # reads as thin/washed-out next to full-color emoji icons - a larger
     # size (see the "Icon.TButton" style) gives it comparable visual
     # weight without needing to fall back to a colored-pill emoji glyph
     # just for "add".
+    if shadow:
+        # nassie_ttk's flat theme draws buttons with no border/relief at
+        # all (its own flat, modern look), which reads fine for a busy
+        # toolbar but left a dialog's one or two decision buttons (Cancel/
+        # OK) looking like plain white boxes with nothing to distinguish
+        # them as clickable (reported live). ttk buttons in this theme
+        # are image-rendered, not relief/borderwidth-driven, so
+        # style.configure(relief=...) wouldn't do anything - this fakes a
+        # drop shadow with plain geometry instead: a slightly darker
+        # Frame BEHIND the button, peeking out along the bottom/right
+        # edge because the button inside it is packed flush to the
+        # top-left instead of centered. Solid color, no theme/image
+        # dependency, so it's guaranteed to actually render regardless of
+        # what the current ttk theme does with real button styling.
+        card = tk.Frame(parent, background="#adadad")
+        btn = ttk.Button(
+            card, text=icon, command=command, width=width, style="Icon.TButton", **kwargs
+        )
+        btn.pack(padx=(0, 2), pady=(0, 2))
+        _Tooltip(btn, tooltip)
+        # card itself has no -state option (it's a plain tk.Frame, not a
+        # ttk widget) - .button is how a caller that needs to reconfigure
+        # the real button later (CreateShareDialog.create_button, see its
+        # own comment) reaches it instead.
+        card.button = btn
+        return card
     btn = ttk.Button(parent, text=icon, command=command, width=width, style="Icon.TButton", **kwargs)
     _Tooltip(btn, tooltip)
     return btn
@@ -281,13 +307,23 @@ class _SortableTree:
     _populate_shares_list/UserManagementWindow.refresh), which would
     otherwise silently drop whatever sort was active - call reapply() right
     after repopulating to restore it instead of resetting to insertion
-    order every time."""
-    def __init__(self, tree, columns, key_fn):
+    order every time.
+
+    pinned_first, if given, is a callable returning the id of a row that
+    must always stay at index 0 regardless of sorting (the add-row - see
+    _populate_shares_list()) - re-applied after EVERY sort(), not just
+    reapply(), since sort() is what a real column-heading click runs
+    directly; only re-pinning in reapply() left a sort genuinely reachable
+    by clicking a heading (confirmed live: sorting by Share Name knocked
+    the add-row to wherever "➕" happened to collate to instead of leaving
+    it first)."""
+    def __init__(self, tree, columns, key_fn, pinned_first=None):
         # columns: [(column_id, heading_label), ...] - column_id "#0" is
         # the tree's own hierarchy column. key_fn(item_id, column_id) -> str
         self.tree = tree
         self.columns = columns
         self.key_fn = key_fn
+        self.pinned_first = pinned_first
         self.sort_col = None
         self.reverse = False
         for col_id, label in columns:
@@ -306,10 +342,94 @@ class _SortableTree:
             if col_id == self.sort_col:
                 arrow = " ▼" if self.reverse else " ▲"
             self.tree.heading(col_id, text=label + arrow, command=lambda c=col_id: self.sort(c))
+        self._repin()
 
     def reapply(self):
         if self.sort_col is not None:
             self.sort(self.sort_col, toggle=False)
+        else:
+            self._repin()
+
+    def _repin(self):
+        if self.pinned_first is None:
+            return
+        item_id = self.pinned_first()
+        if item_id and self.tree.exists(item_id):
+            self.tree.move(item_id, "", 0)
+
+
+# Matches tour.py's own _CALLOUT_BG - same light teal tint the tour's own
+# callout bubble uses, reused here for visual consistency across the app's
+# other "here's something to notice" surfaces.
+_ADD_ROW_BG = "#eaf6f8"
+
+
+class _AddRowTrigger:
+    """A permanently-visible shaded strip with a centered "+", styled and
+    positioned as row #1 of the shares/users list (above the Treeview -
+    see _build_shares_page()/UserManagementPanel) - clicking it calls
+    `command`, which opens the real add dialog (CreateShareDialog/
+    AddUserDialog). An earlier version of this had the ROW ITSELF expand
+    into an inline form instead of opening a popup - reported live as
+    reading wrong ("you've rebuilt the form inside of this row" - a real
+    popup is what's actually wanted here). This row's only job is to be a
+    nicer-looking, list-integrated trigger for that popup than a toolbar
+    button was, not to replace the popup."""
+    def __init__(self, parent, command, bg=_ADD_ROW_BG):
+        self.strip = tk.Frame(parent, bg=bg, cursor="hand2")
+        self.plus_label = tk.Label(
+            self.strip, text="+", bg=bg, fg="#0e92ab", font=("TkDefaultFont", 14, "bold"),
+        )
+        self.plus_label.pack(pady=6)
+        self.strip.bind("<Button-1>", lambda e: command())
+        self.plus_label.bind("<Button-1>", lambda e: command())
+
+    def pack(self, **kwargs):
+        self.strip.pack(**kwargs)
+
+
+class _ToggleButton:
+    """A toolbar icon button that stays visually "pressed" (a solid teal
+    fill, matching the app's own highlight color - see tour.py's own
+    _HIGHLIGHT_COLOR) for as long as its panel is open, instead of the
+    momentary press-then-release look a plain button gives - see
+    GUIWizard._toggle_users_panel()/_toggle_log_panel(). Plain tk.Label-
+    based rather than a ttk style, for the same reason _icon_button
+    (shadow=True)/linux_titlebar.py's own titlebar buttons are:
+    nassie_ttk's buttons are image-rendered, so a ttk style swap has no
+    guaranteed visible effect to build a reliable toggle look on."""
+    _PRESSED_BG = "#0e92ab"
+    _SIZE = 34
+
+    def __init__(self, parent, icon, tooltip, command, idle_bg):
+        self.idle_bg = idle_bg
+        self.pressed = False
+        # Fixed pixel size, not just font+padding - different emoji
+        # glyphs (👤 vs 📜) render at different natural sizes even at the
+        # same font/padding, which left the two toggle buttons visibly
+        # different heights (reported live). pack_propagate(False) keeps
+        # this frame at exactly _SIZE regardless of what its child needs,
+        # and the Label fills it completely, so both buttons end up
+        # pixel-identical no matter which glyph is inside.
+        self.frame = tk.Frame(parent, width=self._SIZE, height=self._SIZE, bg=idle_bg)
+        self.frame.pack_propagate(False)
+        self.label = tk.Label(
+            self.frame, text=icon, font=("TkDefaultFont", 12), bg=idle_bg, fg="#333333", cursor="hand2",
+        )
+        self.label.pack(fill="both", expand=True)
+        for widget in (self.frame, self.label):
+            widget.bind("<Button-1>", lambda e: command())
+        _Tooltip(self.label, tooltip)
+
+    def pack(self, **kwargs):
+        self.frame.pack(**kwargs)
+
+    def set_pressed(self, pressed):
+        self.pressed = pressed
+        bg = self._PRESSED_BG if pressed else self.idle_bg
+        fg = "white" if pressed else "#333333"
+        self.frame.configure(bg=bg)
+        self.label.configure(bg=bg, fg=fg)
 
 
 class AddUserDialog(tk.Toplevel):
@@ -323,31 +443,59 @@ class AddUserDialog(tk.Toplevel):
     pick a name from a list was more than that one choice needed anyway."""
     def __init__(self, parent, existing_usernames=(), show_access_level=True, app=None):
         super().__init__(parent)
+        if platform.system() == "Linux":
+            # Withdrawn immediately, before anything below ever gets a
+            # chance to map it - matches GUIWizard.__init__'s own
+            # withdraw()/linux_titlebar.apply_to_window() sequencing (see
+            # its comment there for why): decorations get stripped and
+            # the custom titlebar built further down, before this dialog
+            # is ever shown, so there's no native-decorated-then-stripped
+            # flash.
+            self.withdraw()
         self.existing_usernames = set(existing_usernames)
         self._app = app
         self.title("New User")
         self.resizable(False, False)
         self.transient(parent)
         self.result = None
+        # Same handler as the Cancel button - the tour's own "open this,
+        # then close it" steps (see tour.py) need to know it was actually
+        # dismissed either way, not just via the button.
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        if platform.system() == "Linux":
+            # Before body below, so the titlebar packs first/on top - see
+            # its own module docstring. Tk also can't mix pack() (what
+            # the titlebar uses) and grid() (what body's own content
+            # below uses) on the SAME parent, which is the other reason
+            # body exists at all now (confirmed live: "cannot use
+            # geometry manager pack inside .!adduserdialog which already
+            # has slaves managed by grid" the first time this ran without
+            # it) - self itself now only ever has pack()ed children.
+            linux_titlebar.apply_to_window(
+                self, "New User", self._on_cancel,
+                icon_image=getattr(self._app, "_icon_image", None), resizable=False,
+            )
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
 
-        ttk.Label(self, text="Username:").grid(row=0, column=0, sticky="e", padx=8, pady=6)
+        ttk.Label(body, text="Username:").grid(row=0, column=0, sticky="e", padx=8, pady=6)
         self.username_var = tk.StringVar()
         username_vcmd = (self.register(self._validate_username_input), "%P")
         self.username_entry = ttk.Entry(
-            self, textvariable=self.username_var, validate="key", validatecommand=username_vcmd,
+            body, textvariable=self.username_var, validate="key", validatecommand=username_vcmd,
         )
         self.username_entry.grid(row=0, column=1, padx=8, pady=6)
 
-        # Gridded directly in THIS dialog, not a nested Frame with its own
-        # independent grid - a nested frame's column widths are negotiated
-        # separately from the parent's, which left "Confirm Password:"
-        # (wider than "Username:") pushing its entry out of alignment with
-        # the username field above it.
-        ttk.Label(self, text="Password:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
-        self.password_entry = ttk.Entry(self, show="*")
+        # Gridded directly in body, not a further-nested Frame with its
+        # own independent grid - a nested frame's column widths are
+        # negotiated separately from body's, which left "Confirm
+        # Password:" (wider than "Username:") pushing its entry out of
+        # alignment with the username field above it.
+        ttk.Label(body, text="Password:").grid(row=1, column=0, sticky="e", padx=8, pady=6)
+        self.password_entry = ttk.Entry(body, show="*")
         self.password_entry.grid(row=1, column=1, padx=8, pady=6)
-        ttk.Label(self, text="Confirm Password:").grid(row=2, column=0, sticky="e", padx=8, pady=6)
-        self.confirm_entry = ttk.Entry(self, show="*")
+        ttk.Label(body, text="Confirm Password:").grid(row=2, column=0, sticky="e", padx=8, pady=6)
+        self.confirm_entry = ttk.Entry(body, show="*")
         self.confirm_entry.grid(row=2, column=1, padx=8, pady=6)
 
         # Only relevant when this user is being granted access to a share -
@@ -358,25 +506,21 @@ class AddUserDialog(tk.Toplevel):
         next_row = 3
         if show_access_level:
             ttk.Checkbutton(
-                self, text="Read-only access", variable=self.read_only_var
+                body, text="Read-only access", variable=self.read_only_var
             ).grid(row=3, column=0, columnspan=2, pady=(0, 6))
             next_row = 4
 
         # Cancel first (ends up on the left), OK second (ends up on the
         # right, as the primary/default action) - see CreateShareDialog's
         # _build_name_page for the same convention and why.
-        btn_frame = ttk.Frame(self)
+        btn_frame = ttk.Frame(body)
         btn_frame.grid(row=next_row, column=0, columnspan=2, pady=10)
         # Kept as an attribute (unlike every other dialog's Cancel
         # button) so the tour's own "New User" step (see tour.py) can
         # point a highlight box directly at it once this dialog opens.
-        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self._on_cancel)
+        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self._on_cancel, shadow=True)
         self.cancel_button.pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", "OK", self._on_ok).pack(side="left", padx=4)
-        # Same handler as the Cancel button - the tour's own "open this,
-        # then close it" steps (see tour.py) need to know it was actually
-        # dismissed either way, not just via the button.
-        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        _icon_button(btn_frame, "✔", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
 
         self.username_entry.focus_set()
         _center_over_parent(self, parent)
@@ -458,22 +602,32 @@ class ChoiceDialog(tk.Toplevel):
     share to change a password on)."""
     def __init__(self, parent, title, prompt, choices, ok_label="OK"):
         super().__init__(parent)
+        if platform.system() == "Linux":
+            self.withdraw()
         self.title(title)
         self.resizable(False, False)
         self.transient(parent)
         self.result = None
+        if platform.system() == "Linux":
+            # Before body below - see AddUserDialog's identical comment:
+            # Tk can't mix pack() (the titlebar) and grid() (body's own
+            # content) on the same parent, so self itself now only ever
+            # has pack()ed children.
+            linux_titlebar.apply_to_window(self, title, self.destroy, resizable=False)
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
 
-        ttk.Label(self, text=prompt).grid(row=0, column=0, columnspan=2, padx=8, pady=6)
+        ttk.Label(body, text=prompt).grid(row=0, column=0, columnspan=2, padx=8, pady=6)
         self.choice_var = tk.StringVar(value=choices[0])
-        combo = ttk.Combobox(self, textvariable=self.choice_var, values=choices, state="readonly")
+        combo = ttk.Combobox(body, textvariable=self.choice_var, values=choices, state="readonly")
         combo.grid(row=1, column=0, columnspan=2, padx=8, pady=6)
 
         # Cancel first (left), primary action second (right) - see
         # AddUserDialog's identical btn_frame for the same convention.
-        btn_frame = ttk.Frame(self)
+        btn_frame = ttk.Frame(body)
         btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
-        _icon_button(btn_frame, "✖", "Cancel", self.destroy).pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", ok_label, self._on_ok).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✖", "Cancel", self.destroy, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "✔", ok_label, self._on_ok, shadow=True).pack(side="left", padx=4)
 
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
@@ -493,6 +647,8 @@ class QrCodeDialog(tk.Toplevel):
     QR_PASSWORD_RESET_NOTE)."""
     def __init__(self, parent, share_name, username, payload):
         super().__init__(parent)
+        if platform.system() == "Linux":
+            self.withdraw()
         self.title(f"QR Code - {username}")
         self.resizable(False, False)
         self.transient(parent)
@@ -535,6 +691,8 @@ class QrCodeDialog(tk.Toplevel):
                  "on screen or let anyone photograph it who shouldn't have access.",
             foreground="#b00000", justify="center", padding=8,
         ).pack()
+        if platform.system() == "Linux":
+            linux_titlebar.apply_to_window(self, self.title(), self.destroy, resizable=False)
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
         self.grab_set()
@@ -542,14 +700,21 @@ class QrCodeDialog(tk.Toplevel):
 
 
 class CreateShareDialog(tk.Toplevel):
-    """Reached via the toolbar's "New Share" button (or automatically once,
-    during first-run onboarding) - a second share is uncommon enough that
-    this doesn't need permanent space in the main window. Users are added
-    afterward, from the shares list itself (New/Attach User) - not here;
-    there's no reason share creation and granting access need to be the
-    same step."""
+    """Reached via the shares list's "+" row (row #1 - see
+    _AddRowTrigger) - a second share is uncommon enough that this doesn't
+    need permanent space in the main window. Users are added afterward,
+    from the shares list itself (New/Attach User) - not here; there's no
+    reason share creation and granting access need to be the same step.
+
+    A real popup, not an inline expansion of the "+" row itself - an
+    earlier version of this session tried the row-expands-in-place
+    approach and it read wrong in practice ("you've rebuilt the form
+    inside of this row," reported live) - the row's only job is to be a
+    nicer-looking trigger for this dialog than a toolbar button was."""
     def __init__(self, app):
         super().__init__(app.root)
+        if platform.system() == "Linux":
+            self.withdraw()
         self.app = app
         self.wizard = app.wizard
         self._working = False
@@ -557,6 +722,15 @@ class CreateShareDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(app.root)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if platform.system() == "Linux":
+            # Before the two pages below, so the titlebar row packs
+            # first/on top - stays there across _show_name_page()/
+            # _confirm_name()'s pack_forget()+pack() page swaps since
+            # those only ever touch name_page/path_page, never this.
+            linux_titlebar.apply_to_window(
+                self, "Create Share", self._on_close,
+                icon_image=getattr(app, "_icon_image", None), resizable=False,
+            )
 
         # Two pages, shown one at a time - a name, THEN (only if the
         # suggested default isn't fine as-is) a folder - rather than both
@@ -593,8 +767,8 @@ class CreateShareDialog(tk.Toplevel):
         # with Cancel just to its left.
         action_frame = ttk.Frame(self.name_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "✔", "OK", self._confirm_name).pack(side="right")
-        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right", padx=(0, 4))
+        _icon_button(action_frame, "✔", "OK", self._confirm_name, shadow=True).pack(side="right")
+        _icon_button(action_frame, "✖", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
 
     def _build_path_page(self):
         self.path_page = ttk.Frame(self)
@@ -620,10 +794,15 @@ class CreateShareDialog(tk.Toplevel):
         # right, same reasoning and pack order as _build_name_page's.
         action_frame = ttk.Frame(self.path_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "◀", "Back", self._show_name_page).pack(side="left")
-        self.create_button = _icon_button(action_frame, "✔", "OK", self._on_create_share)
+        _icon_button(action_frame, "◀", "Back", self._show_name_page, shadow=True).pack(side="left")
+        # shadow=True returns the shadow-casting Frame, not the ttk.Button
+        # itself - .button reaches the real one, needed here since
+        # _apply_done()/its own start disable this via .configure(state=
+        # ...) after the fact (every OTHER shadowed button in this dialog
+        # is fire-and-forget, never touched again post-creation).
+        self.create_button = _icon_button(action_frame, "✔", "OK", self._on_create_share, shadow=True)
         self.create_button.pack(side="right")
-        _icon_button(action_frame, "✖", "Cancel", self._on_close).pack(side="right", padx=(0, 4))
+        _icon_button(action_frame, "✖", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
 
     def _show_name_page(self):
         self.path_page.pack_forget()
@@ -725,7 +904,7 @@ class CreateShareDialog(tk.Toplevel):
         self.wizard.users = []
 
         self._working = True
-        self.create_button.configure(state="disabled")
+        self.create_button.button.configure(state="disabled")
 
         threading.Thread(target=self._apply_worker, daemon=True).start()
 
@@ -787,7 +966,7 @@ class CreateShareDialog(tk.Toplevel):
             _bring_window_to_front(self.app.root)
             self.app._notify_tour("share_apply_confirmed")
         else:
-            self.create_button.configure(state="normal")
+            self.create_button.button.configure(state="normal")
             messagebox.showerror(
                 "Share Creation Failed",
                 "Configuration attempt failed — see the log for details.",
@@ -795,30 +974,19 @@ class CreateShareDialog(tk.Toplevel):
             )
 
 
-class LogWindow(tk.Toplevel):
+class LogPanel:
     """Raw stdout output from every action (share/user create, delete,
-    grant/revoke access, ...) collects here - a separate, non-modal window
-    (opened via the header's log button) rather than a permanently visible
-    panel, since most people only need to check it occasionally. Closing
-    it (the window's own X button) just hides it instead of destroying it,
-    so the accumulated log survives across show/hide."""
-    def __init__(self, parent):
-        super().__init__(parent)
-        # See UserManagementWindow's identical comment - same gap, same
-        # fix: this never had the WM hint that keeps it reliably above
-        # its parent, unlike every one of NASsie's other dialogs.
-        self.transient(parent)
-        self.title("NASsie Log")
-        self.geometry("640x320")
-        self.protocol("WM_DELETE_WINDOW", self.withdraw)
-
-        self.log_text = ScrolledText(self, state="disabled")
+    grant/revoke access, ...) collects here - a docked panel on the main
+    window's right edge (toggled via the toolbar's Log button), not a
+    separate popup window - see this session's redesign away from popups
+    (GUIWizard._toggle_log_panel()) for why. Built once and left alive for
+    the app's whole lifetime; toggling only packs/unpacks self.frame, so
+    the accumulated log text survives across show/hide same as the old
+    popup version did across its own show/withdraw."""
+    def __init__(self, root):
+        self.frame = ttk.Frame(root)
+        self.log_text = ScrolledText(self.frame, state="disabled", width=48)
         self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
-
-        # Hidden until explicitly opened - not shown at startup, since an
-        # empty log window in front of the main one on first launch would
-        # just be in the way.
-        self.withdraw()
 
     def append(self, text):
         self.log_text.configure(state="normal")
@@ -826,42 +994,34 @@ class LogWindow(tk.Toplevel):
         self.log_text.see(tk.END)
         self.log_text.configure(state="disabled")
 
-    def show(self):
-        _bring_window_to_front(self)
 
 
-class UserManagementWindow(tk.Toplevel):
+class UserManagementPanel:
     """Account-level user management, decoupled from any specific share -
-    Create User, Change Password, Delete User. A separate, non-modal
-    window (opened via the main toolbar's Users button) rather than a
-    second page, same reasoning as LogWindow: most of what people do day
-    to day is share-scoped (attach/unattach), so this doesn't need to
-    compete with the shares list for space. Hidden, not destroyed, on
-    close - state survives across show/hide, same as LogWindow."""
-    def __init__(self, app):
-        super().__init__(app.root)
-        # Every OTHER dialog in this file (CreateShareDialog,
-        # AddUserDialog, ChoiceDialog, QrCodeDialog) sets this - this one
-        # never did, and it's the one window that reliably drifted behind
-        # root instead of staying raised, unlike all of those. transient()
-        # doesn't make it modal (that's grab_set(), which this still never
-        # calls - it stays fully independent/non-modal, same as always) -
-        # it's purely the WM hint "this belongs above that window", a much
-        # older and more reliably-honored mechanism (confirmed live) than
-        # "-topmost" on this session's window manager.
-        self.transient(app.root)
+    Create User, Change Password, Delete User. A docked panel on the main
+    window's left edge (toggled via the toolbar's Users button), not a
+    separate popup window - see this session's redesign away from popups
+    (GUIWizard._toggle_users_panel()) for why. Built once and left alive
+    for the app's whole lifetime, same as LogPanel; toggling only packs/
+    unpacks self.frame."""
+    def __init__(self, app, parent):
         self.app = app
         self.wizard = app.wizard
-        self.title("User Management")
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.frame = ttk.Frame(parent)
 
-        toolbar = ttk.Frame(self)
-        toolbar.pack(fill="x", padx=8, pady=(8, 0))
-        self._new_user_toolbar_btn = _icon_button(toolbar, "+👤", "New User", self._create_new_user)
-        self._new_user_toolbar_btn.pack(side="left")
+        header = ttk.Frame(self.frame)
+        header.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(header, text="Manage Users", font=("TkDefaultFont", 11, "bold")).pack(side="left")
 
-        body = ttk.Frame(self)
+        body = ttk.Frame(self.frame)
         body.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # New-user trigger - was a plain toolbar button opening a popup
+        # AddUserDialog; now a shaded "+" row (same as the shares list -
+        # see _AddRowTrigger's own docstring), packed first/on top so it
+        # reads as row #1 of the list. Still opens the same real popup.
+        self.add_row = _AddRowTrigger(body, self._create_new_user)
+        self.add_row.pack(fill="x", pady=(0, 6))
 
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True)
@@ -871,7 +1031,7 @@ class UserManagementWindow(tk.Toplevel):
         self._sort = _SortableTree(
             self.users_list, [("#0", "Username")], key_fn=lambda k, c: self.users_list.item(k, "text"),
         )
-        self.users_list.column("#0", width=260, stretch=True)
+        self.users_list.column("#0", width=220, stretch=True)
         self.users_list.grid(row=0, column=0, sticky="nsew")
         vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.users_list.yview)
         vscroll.grid(row=0, column=1, sticky="ns")
@@ -881,19 +1041,16 @@ class UserManagementWindow(tk.Toplevel):
         # panel - see _RowActionBar's docstring.
         self._action_bar = _RowActionBar(self.users_list, vscroll, self._build_action_bar)
 
-        # Measured, not guessed - see GUIWizard's sizing block (same
-        # reasoning: nothing is selected yet, so the action bar doesn't
-        # exist for winfo_reqwidth() to have accounted for on its own).
-        self.update_idletasks()
-        bar_w = self.app._measure_action_bar_width(("🔑", "📱", "🗑"))
-        name_col_w = self.users_list.column("#0", "width")
-        width = max(name_col_w + 20 + bar_w + 40, self.winfo_reqwidth())
-        height = max(380, self.winfo_reqheight())
-        self.geometry(f"{width}x{height}")
-        self.minsize(width, height)
-
-        # Hidden until explicitly opened - see LogWindow's identical reasoning.
-        self.withdraw()
+    def _create_new_user(self):
+        existing = {u["username"] for u in self.wizard.list_users()}
+        dialog = AddUserDialog(
+            self.app.root, existing_usernames=existing, show_access_level=False, app=self.app
+        )
+        if not dialog.result:
+            return
+        username = dialog.result["username"]
+        password = dialog.result["password"]
+        threading.Thread(target=self.app._create_user_worker, args=(username, password), daemon=True).start()
 
     def _build_action_bar(self, container, item):
         _icon_button(container, "🔑", "Change Password", self._change_password).pack(
@@ -901,22 +1058,6 @@ class UserManagementWindow(tk.Toplevel):
         )
         _icon_button(container, "🗑", "Delete User", self._delete_user).pack(side="left", fill="y", padx=1)
         return True
-
-    def show(self):
-        self.refresh()
-        _bring_window_to_front(self)
-        self.app._notify_tour("user_mgmt_opened", window=self)
-
-    def _on_close(self):
-        # See GUIWizard._tour_blocks_closing()'s docstring - lets the
-        # dedicated "Close" step's own close-via-titlebar-✕ through as
-        # normal (its own wait_event, "user_mgmt_closed"), blocks it on
-        # every earlier step this window is active for (e.g. "New User",
-        # still waiting on the AddUserDialog it opens).
-        if self.app._tour_blocks_closing(self, "user_mgmt_closed"):
-            return
-        self.withdraw()
-        self.app._notify_tour("user_mgmt_closed")
 
     def refresh(self):
         selected = self._selected_username()
@@ -942,17 +1083,6 @@ class UserManagementWindow(tk.Toplevel):
     def _selected_username(self):
         selection = self.users_list.selection()
         return self.users_list.item(selection[0], "text") if selection else None
-
-    def _create_new_user(self):
-        existing = {u["username"] for u in self.wizard.list_users()}
-        dialog = AddUserDialog(
-            self, existing_usernames=existing, show_access_level=False, app=self.app
-        )
-        if not dialog.result:
-            return
-        username = dialog.result["username"]
-        password = dialog.result["password"]
-        threading.Thread(target=self.app._create_user_worker, args=(username, password), daemon=True).start()
 
     def _change_password(self):
         self._change_password_flow(confirm_qr=True)
@@ -988,14 +1118,14 @@ class UserManagementWindow(tk.Toplevel):
             )
             return
 
-        if not messagebox.askokcancel("Change Password", QR_PASSWORD_RESET_NOTE, parent=self):
+        if not messagebox.askokcancel("Change Password", QR_PASSWORD_RESET_NOTE, parent=self.app.root):
             return
 
         if len(shares) == 1:
             share_name = shares[0]
         else:
             dialog = ChoiceDialog(
-                self, "Choose share", "Change password (and show a QR code) for which share?",
+                self.app.root, "Choose share", "Change password (and show a QR code) for which share?",
                 shares, ok_label="Next",
             )
             if not dialog.result:
@@ -1004,7 +1134,7 @@ class UserManagementWindow(tk.Toplevel):
 
         password = simpledialog.askstring(
             "New password", f"New password for '{username}' (replaces their current one):",
-            show="*", parent=self,
+            show="*", parent=self.app.root,
         )
         if not password:
             return
@@ -1018,7 +1148,7 @@ class UserManagementWindow(tk.Toplevel):
         threading.Thread(
             target=self.app._grant_access_worker,
             args=(share_name, username, password, read_only, confirm_qr),
-            kwargs={"parent_window": self}, daemon=True,
+            daemon=True,
         ).start()
 
     def _delete_user(self):
@@ -1136,10 +1266,20 @@ class GUIWizard:
         self._build_header()
         self._build_shares_page()
 
-        # Both non-modal, hidden until opened - see their own docstrings
-        # for why these are separate windows rather than tabs/panels.
-        self._log_window = LogWindow(self.root)
-        self._user_mgmt_window = UserManagementWindow(self)
+        # Both docked panels on self._content_row (built above, alongside
+        # the shares list itself), hidden until toggled open - see
+        # _toggle_users_panel()/_toggle_log_panel() and their own class
+        # docstrings for why these are panels, not separate windows.
+        self._log_panel = LogPanel(self._content_row)
+        self._user_mgmt_panel = UserManagementPanel(self, self._content_row)
+        self._users_panel_open = False
+        self._log_panel_open = False
+        # Measured once, unpacked - see _toggle_users_panel()/
+        # _toggle_log_panel() for why the window has to grow/shrink by
+        # exactly this much rather than a guessed constant.
+        self.root.update_idletasks()
+        self._users_panel_width = self._user_mgmt_panel.frame.winfo_reqwidth()
+        self._log_panel_width = self._log_panel.frame.winfo_reqwidth()
 
         self._refresh_all_lists()
 
@@ -1263,7 +1403,6 @@ class GUIWizard:
             ttk.Label(header, image=self._header_icon_image).pack(side="left", padx=(0, 10))
 
         ttk.Label(header, text="NASsie", font=("TkDefaultFont", 18, "bold")).pack(side="left")
-        _icon_button(header, "📋", "View Log", lambda: self._log_window.show()).pack(side="right")
         # Indeterminate progress bar doubling as a busy spinner - packed
         # only while at least one background action is running (see
         # _busy_start/_busy_stop), not a fixed part of the layout, so it
@@ -1357,9 +1496,6 @@ class GUIWizard:
         self._tour = GuiTour(self)
         self._tour.start()
 
-    def _open_create_share_dialog(self):
-        CreateShareDialog(self)
-
     def _build_shares_page(self):
         # The only page - see the shares/users restructuring discussion:
         # shares as expandable parent rows, each attached user nested
@@ -1367,21 +1503,45 @@ class GUIWizard:
         # dialogs (change access level, change password, ...) disappear
         # entirely this way, since the share is already known from
         # whichever row is selected.
+        #
+        # Toolbar now only holds the Users/Log toggle buttons (far left/
+        # right) - "New Share" moved into the shares list itself, as row
+        # #1 of the Treeview (see the "add_row" tag/self._add_share_row_id
+        # below - a real row of the list, not a separate widget floating
+        # above it, per what was actually asked for after an earlier
+        # separate-strip version didn't land right), and "Manage Users"/
+        # "View Log" stopped opening separate popup windows entirely -
+        # both are docked panels toggled from here now instead.
+        toolbar_bg = ttk.Style(self.root).lookup("TFrame", "background") or "#f3f3f3"
         toolbar = ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=8, pady=(8, 0))
-        self._new_share_btn = _icon_button(
-            toolbar, "➕", "New Share", self._open_create_share_dialog,
+        self._users_toggle_btn = _ToggleButton(
+            toolbar, "👤", "Manage Users", self._toggle_users_panel, toolbar_bg,
         )
-        self._new_share_btn.pack(side="left")
-        self._manage_users_btn = _icon_button(
-            toolbar, "👤", "Manage Users", lambda: self._user_mgmt_window.show(),
+        self._users_toggle_btn.pack(side="left")
+        self._log_toggle_btn = _ToggleButton(
+            # 📋 (clipboard) reads as "notes/tasks", not "log" - 📜
+            # (scroll) is the more common "history/log" convention.
+            toolbar, "📜", "View Log", self._toggle_log_panel, toolbar_bg,
         )
-        self._manage_users_btn.pack(side="left", padx=(6, 0))
+        self._log_toggle_btn.pack(side="right")
 
-        body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True, padx=8, pady=8)
+        # Holds, left to right: the Users panel (hidden until toggled),
+        # the shares list itself (always visible), the Log panel (hidden
+        # until toggled) - see _toggle_users_panel()/_toggle_log_panel()
+        # and _relayout_content_row() for why panels are re-packed in
+        # this fixed order on every toggle rather than just packed once.
+        self._content_row = ttk.Frame(self.root)
+        self._content_row.pack(fill="both", expand=True, padx=8, pady=8)
 
-        tree_frame = ttk.Frame(body)
+        self._shares_body = ttk.Frame(self._content_row)
+        # Set for real in _populate_shares_list() (the only place the
+        # actual row gets (re)created) - None until the first refresh so
+        # early <<TreeviewSelect>>/action-bar callbacks have something
+        # sane to compare against instead of an AttributeError.
+        self._add_share_row_id = None
+
+        tree_frame = ttk.Frame(self._shares_body)
         tree_frame.pack(fill="both", expand=True)
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
@@ -1397,10 +1557,17 @@ class GUIWizard:
         self._shares_sort = _SortableTree(
             self.shares_list, [("#0", "Share Name"), ("path", "Path")],
             key_fn=lambda k, c: self.shares_list.item(k, "text") if c == "#0" else self.shares_list.set(k, c),
+            pinned_first=lambda: self._add_share_row_id,
         )
         self.shares_list.column("#0", width=220, stretch=False)
         self.shares_list.column("path", width=320, stretch=True)
         self.shares_list.grid(row=0, column=0, sticky="nsew")
+        # "New Share" is row #1 of this same list, not a separate widget
+        # above it (see _populate_shares_list()'s own insert of it, and
+        # add_row_id's docstring there) - styled via a real Treeview tag
+        # so it's the exact same row height/font as every other row,
+        # just tinted to read as an action rather than data.
+        self.shares_list.tag_configure("add_row", background=_ADD_ROW_BG, foreground="#0e92ab")
 
         shares_vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.shares_list.yview)
         shares_vscroll.grid(row=0, column=1, sticky="ns")
@@ -1409,11 +1576,108 @@ class GUIWizard:
         self.shares_list.configure(yscrollcommand=shares_vscroll.set, xscrollcommand=shares_hscroll.set)
 
         # Floating, row-anchored action buttons instead of a fixed side
-        # panel - see _RowActionBar's docstring.
+        # panel - see _RowActionBar's docstring. Constructed (and so
+        # bound to <<TreeviewSelect>>) BEFORE _on_shares_list_select
+        # below, so _build_share_action_bar sees the add-row selected
+        # too, at least once - its own guard (see there) is what actually
+        # keeps the bar hidden for it, not binding order.
         self._share_action_bar = _RowActionBar(self.shares_list, shares_vscroll, self._build_share_action_bar)
-        self.shares_list.bind("<<TreeviewSelect>>", lambda e: self._notify_tour("share_selected"), add="+")
+        self.shares_list.bind("<<TreeviewSelect>>", self._on_shares_list_select, add="+")
+
+        self._shares_body.pack(side="left", fill="both", expand=True)
+
+    def _on_shares_list_select(self, event=None):
+        # Selecting the add-row (see _populate_shares_list()) opens the
+        # real dialog instead of treating it like a normal row - then
+        # immediately clears the selection, both so it doesn't sit there
+        # looking "selected" and so _selected_share_and_user() (used all
+        # over for "act on whatever's currently selected") never has to
+        # know this row exists at all.
+        if self._add_share_row_id in self.shares_list.selection():
+            self.shares_list.selection_remove(self._add_share_row_id)
+            CreateShareDialog(self)
+            return
+        self._notify_tour("share_selected")
+
+    def _relayout_content_row(self):
+        # Fixed left-to-right order (Users, shares, Log) rebuilt from
+        # scratch on every toggle, rather than relying on pack()'s own
+        # insertion-order bookkeeping surviving repeated pack_forget()/
+        # pack() calls - a widget re-pack()ed after being forgotten goes
+        # to the END of its master's current packing order, not back to
+        # wherever it used to be, so toggling Log open before Users
+        # (say) would otherwise leave Log sitting to the LEFT of the
+        # shares list instead of the right. Cheap to just always get
+        # right with only three possible children here.
+        self._user_mgmt_panel.frame.pack_forget()
+        self._shares_body.pack_forget()
+        self._log_panel.frame.pack_forget()
+        if self._users_panel_open:
+            self._user_mgmt_panel.frame.pack(side="left", fill="y", padx=(0, 8))
+        self._shares_body.pack(side="left", fill="both", expand=True)
+        if self._log_panel_open:
+            self._log_panel.frame.pack(side="right", fill="y", padx=(8, 0))
+
+    def _resize_root_by(self, delta_width):
+        # Relative to whatever the window's CURRENT width actually is
+        # (not a hardcoded default) - preserves a manually-resized
+        # window instead of snapping back to some assumed baseline every
+        # time a panel opens/closes. Floored at winfo_reqwidth() (read
+        # AFTER _relayout_content_row() has already updated which
+        # panels are packed) so shrinking on close can never squeeze
+        # below what's actually still on screen, and capped at the
+        # screen width so growing can't push the window off-screen.
+        self.root.update_idletasks()
+        height = self.root.winfo_height()
+        width = self.root.winfo_width() + delta_width
+        width = max(self.root.winfo_reqwidth(), min(width, self.root.winfo_screenwidth()))
+        self.root.geometry(f"{width}x{height}")
+        self.root.minsize(width, height)
+
+    def _toggle_users_panel(self):
+        if self._users_panel_open:
+            # See _tour_blocks_closing()'s docstring - lets the dedicated
+            # "Close" step's own click-to-close-the-panel through as
+            # normal (its own wait_event, "user_mgmt_closed"), blocks it
+            # on every earlier step the panel is active for (e.g. "New
+            # User", still waiting on the inline add-row it opens).
+            if self._tour_blocks_closing(self._user_mgmt_panel, "user_mgmt_closed"):
+                return
+            self._users_panel_open = False
+            self._relayout_content_row()
+            self._resize_root_by(-self._users_panel_width)
+            self._users_toggle_btn.set_pressed(False)
+            self._notify_tour("user_mgmt_closed")
+        else:
+            self._users_panel_open = True
+            self._relayout_content_row()
+            self._resize_root_by(self._users_panel_width)
+            self._users_toggle_btn.set_pressed(True)
+            self._user_mgmt_panel.refresh()
+            self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+
+    def _toggle_log_panel(self):
+        # No tour step ever points at this one, so no _tour_blocks_closing
+        # guard needed - matches the old LogWindow's own _on_close, which
+        # never had one either.
+        if self._log_panel_open:
+            self._log_panel_open = False
+            self._relayout_content_row()
+            self._resize_root_by(-self._log_panel_width)
+            self._log_toggle_btn.set_pressed(False)
+        else:
+            self._log_panel_open = True
+            self._relayout_content_row()
+            self._resize_root_by(self._log_panel_width)
+            self._log_toggle_btn.set_pressed(True)
 
     def _build_share_action_bar(self, container, item):
+        # The add-row (see _populate_shares_list()) is a real Treeview
+        # row so _RowActionBar's own <<TreeviewSelect>> binding calls
+        # this for it too, at least once before _on_shares_list_select
+        # clears the selection - nothing here applies to it.
+        if item == self._add_share_row_id:
+            return False
         # Attach mode replaces the normal icon row with an inline
         # combobox for THIS specific item - see _attach_user_to_selected_
         # share()/_build_inline_attach(). _RowActionBar rebuilds this bar
@@ -1548,12 +1812,12 @@ class GUIWizard:
 
         def apply():
             self._populate_shares_list(shares, overrides)
-            self._user_mgmt_window.refresh()
+            self._user_mgmt_panel.refresh()
 
         self.root.after(0, apply)
 
     def _append_log(self, text):
-        self._log_window.append(text)
+        self._log_panel.append(text)
 
     def _populate_shares_list(self, shares, overrides=None):
         # list_shares() only reflects live share config (Get-SmbShare /
@@ -1575,6 +1839,14 @@ class GUIWizard:
 
         for item in self.shares_list.get_children():
             self.shares_list.delete(item)
+
+        # Row #1, always - inserted fresh on every refresh (simplest way
+        # to guarantee it survives the delete-everything above, and
+        # _shares_sort.reapply() below can never sort it out of first
+        # place either - see the explicit move() after it).
+        self._add_share_row_id = self.shares_list.insert(
+            "", 0, text="➕  New Share", values=("", ""), tags=("add_row",),
+        )
 
         for share in shares:
             name = share.get("name", "?")
@@ -1609,6 +1881,8 @@ class GUIWizard:
             if name == selected_share and selected_user is None:
                 self.shares_list.selection_set(share_id)
 
+        # Re-pins the add-row to row #1 itself (see _SortableTree's own
+        # pinned_first) regardless of whatever sort is currently active.
         self._shares_sort.reapply()
         self._share_action_bar.update()
 
@@ -1994,12 +2268,10 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if deleted:
-            # Only reachable via UserManagementWindow's own "Delete User"
-            # button - see _create_user_done's identical parenting note.
-            messagebox.showinfo("Deleted", f"Deleted user '{username}'.", parent=self._user_mgmt_window)
+            messagebox.showinfo("Deleted", f"Deleted user '{username}'.", parent=self.root)
         else:
             messagebox.showerror(
-                "Failed", f"Could not delete user '{username}' — see log.", parent=self._user_mgmt_window
+                "Failed", f"Could not delete user '{username}' — see log.", parent=self.root
             )
         self._refresh_all_lists()
 
@@ -2020,22 +2292,12 @@ class GUIWizard:
             self._append_log(log_output)
         if created:
             self._notify_tour("user_created")
-            # This is only ever reached via UserManagementWindow's own
-            # "New User" button (_create_new_user) - parented and
-            # re-raised against IT, not root, so the confirmation doesn't
-            # pop up behind the window the user is actually looking at
-            # (root and UserManagementWindow are both permanently
-            # "-topmost" - see _bring_window_to_front - so whichever one
-            # this targets is the one that ends up on top).
-            messagebox.showinfo("User Created", f"'{username}' has been created.", parent=self._user_mgmt_window)
-            # See _apply_done's identical call for why this is needed
-            # right here, not left to the next tour step's own
-            # _bring_to_front().
-            _bring_window_to_front(self._user_mgmt_window)
+            messagebox.showinfo("User Created", f"'{username}' has been created.", parent=self.root)
+            _bring_window_to_front(self.root)
             self._notify_tour("user_apply_confirmed")
         else:
             messagebox.showerror(
-                "Failed", f"Could not set up user '{username}' — see log.", parent=self._user_mgmt_window
+                "Failed", f"Could not set up user '{username}' — see log.", parent=self.root
             )
         self._refresh_all_lists()
 
