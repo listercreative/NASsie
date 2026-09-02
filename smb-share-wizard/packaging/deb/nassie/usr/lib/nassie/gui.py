@@ -363,29 +363,16 @@ class _SortableTree:
 # other "here's something to notice" surfaces.
 _ADD_ROW_BG = "#eaf6f8"
 
-
-class _AddRowTrigger:
-    """A permanently-visible shaded strip with a centered "+", styled and
-    positioned as row #1 of the shares/users list (above the Treeview -
-    see _build_shares_page()/UserManagementPanel) - clicking it calls
-    `command`, which opens the real add dialog (CreateShareDialog/
-    AddUserDialog). An earlier version of this had the ROW ITSELF expand
-    into an inline form instead of opening a popup - reported live as
-    reading wrong ("you've rebuilt the form inside of this row" - a real
-    popup is what's actually wanted here). This row's only job is to be a
-    nicer-looking, list-integrated trigger for that popup than a toolbar
-    button was, not to replace the popup."""
-    def __init__(self, parent, command, bg=_ADD_ROW_BG):
-        self.strip = tk.Frame(parent, bg=bg, cursor="hand2")
-        self.plus_label = tk.Label(
-            self.strip, text="+", bg=bg, fg="#0e92ab", font=("TkDefaultFont", 14, "bold"),
-        )
-        self.plus_label.pack(pady=6)
-        self.strip.bind("<Button-1>", lambda e: command())
-        self.plus_label.bind("<Button-1>", lambda e: command())
-
-    def pack(self, **kwargs):
-        self.strip.pack(**kwargs)
+# The visual gap _pack_users_panel()/_pack_log_panel() pack between a
+# side panel and the shares list (padx=(0, _PANEL_GUTTER)/(​_PANEL_GUTTER, 0)) - shared
+# with GUIWizard.__init__'s own panel-width measurement so the two can
+# never drift apart. They have to agree exactly: _animate_root_width() grows
+# the window by the measured width to keep everything already on screen
+# in place (see its own docstring), and if that measurement silently
+# left the gutter out, the window would grow a few pixels short and the
+# shares list would visibly creep instead of staying put (confirmed
+# live - the whole point of this constant).
+_PANEL_GUTTER = 8
 
 
 class _ToggleButton:
@@ -700,9 +687,10 @@ class QrCodeDialog(tk.Toplevel):
 
 
 class CreateShareDialog(tk.Toplevel):
-    """Reached via the shares list's "+" row (row #1 - see
-    _AddRowTrigger) - a second share is uncommon enough that this doesn't
-    need permanent space in the main window. Users are added afterward,
+    """Reached via the shares list's "+" row (row #1 - a real Treeview
+    row, see _build_shares_page()'s add_row tag) - a second share is
+    uncommon enough that this doesn't need permanent space in the main
+    window. Users are added afterward,
     from the shares list itself (New/Attach User) - not here; there's no
     reason share creation and granting access need to be the same step.
 
@@ -1009,19 +997,20 @@ class UserManagementPanel:
         self.wizard = app.wizard
         self.frame = ttk.Frame(parent)
 
-        header = ttk.Frame(self.frame)
+        # Kept on self (not local-only) so GUIWizard can pack_forget()
+        # both of these before an open/close width animation and re-pack
+        # them only once it's done - see GUIWizard._toggle_users_panel().
+        self.header = header = ttk.Frame(self.frame)
         header.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(header, text="Manage Users", font=("TkDefaultFont", 11, "bold")).pack(side="left")
 
-        body = ttk.Frame(self.frame)
+        self.body = body = ttk.Frame(self.frame)
         body.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # New-user trigger - was a plain toolbar button opening a popup
-        # AddUserDialog; now a shaded "+" row (same as the shares list -
-        # see _AddRowTrigger's own docstring), packed first/on top so it
-        # reads as row #1 of the list. Still opens the same real popup.
-        self.add_row = _AddRowTrigger(body, self._create_new_user)
-        self.add_row.pack(fill="x", pady=(0, 6))
+        # Set for real in refresh() (the only place the actual row gets
+        # (re)created) - see _add_share_row_id's identical reasoning in
+        # _build_shares_page().
+        self._add_user_row_id = None
 
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True)
@@ -1030,16 +1019,36 @@ class UserManagementPanel:
         self.users_list = ttk.Treeview(tree_frame, show="tree headings", height=14)
         self._sort = _SortableTree(
             self.users_list, [("#0", "Username")], key_fn=lambda k, c: self.users_list.item(k, "text"),
+            pinned_first=lambda: self._add_user_row_id,
         )
         self.users_list.column("#0", width=220, stretch=True)
         self.users_list.grid(row=0, column=0, sticky="nsew")
+        # "New User" is row #1 of this same list (see refresh()'s own
+        # insert of it), not a separate widget above it - matches the
+        # shares list's own "New Share" row exactly (see
+        # _build_shares_page()'s identical tag).
+        self.users_list.tag_configure("add_row", background=_ADD_ROW_BG, foreground="#0e92ab")
         vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.users_list.yview)
         vscroll.grid(row=0, column=1, sticky="ns")
         self.users_list.configure(yscrollcommand=vscroll.set)
 
         # Floating, row-anchored action buttons instead of a fixed side
-        # panel - see _RowActionBar's docstring.
+        # panel - see _RowActionBar's docstring. Constructed (and so
+        # bound to <<TreeviewSelect>>) BEFORE _on_users_list_select below
+        # - see _build_share_action_bar's identical comment for why that
+        # order doesn't matter (its own guard is what hides the bar for
+        # the add-row, not binding order).
         self._action_bar = _RowActionBar(self.users_list, vscroll, self._build_action_bar)
+        self.users_list.bind("<<TreeviewSelect>>", self._on_users_list_select, add="+")
+
+    def _on_users_list_select(self, event=None):
+        # Selecting the add-row (see refresh()) opens the real dialog
+        # instead of treating it like a normal row, then immediately
+        # clears the selection - see _on_shares_list_select's identical
+        # reasoning.
+        if self._add_user_row_id in self.users_list.selection():
+            self.users_list.selection_remove(self._add_user_row_id)
+            self._create_new_user()
 
     def _create_new_user(self):
         existing = {u["username"] for u in self.wizard.list_users()}
@@ -1053,6 +1062,12 @@ class UserManagementPanel:
         threading.Thread(target=self.app._create_user_worker, args=(username, password), daemon=True).start()
 
     def _build_action_bar(self, container, item):
+        # The add-row (see refresh()) is a real Treeview row so
+        # _RowActionBar's own <<TreeviewSelect>> binding calls this for
+        # it too, at least once before _on_users_list_select clears the
+        # selection - nothing here applies to it.
+        if item == self._add_user_row_id:
+            return False
         _icon_button(container, "🔑", "Change Password", self._change_password).pack(
             side="left", fill="y", padx=1
         )
@@ -1064,6 +1079,9 @@ class UserManagementPanel:
         users = self.wizard.list_users()
         for item in self.users_list.get_children():
             self.users_list.delete(item)
+        # Row #1, always - see _add_share_row_id's identical reasoning in
+        # _populate_shares_list().
+        self._add_user_row_id = self.users_list.insert("", 0, text="➕  New User", tags=("add_row",))
         for u in users:
             # list_users() returns every OS-level account on the machine
             # (it has to, so "Attach User" pickers can offer an existing
@@ -1077,6 +1095,8 @@ class UserManagementPanel:
             item_id = self.users_list.insert("", tk.END, text=u["username"])
             if u["username"] == selected:
                 self.users_list.selection_set(item_id)
+        # Re-pins the add-row to row #1 itself (see _SortableTree's own
+        # pinned_first) regardless of whatever sort is currently active.
         self._sort.reapply()
         self._action_bar.update()
 
@@ -1278,8 +1298,42 @@ class GUIWizard:
         # _toggle_log_panel() for why the window has to grow/shrink by
         # exactly this much rather than a guessed constant.
         self.root.update_idletasks()
-        self._users_panel_width = self._user_mgmt_panel.frame.winfo_reqwidth()
-        self._log_panel_width = self._log_panel.frame.winfo_reqwidth()
+        # The Users panel frame's OWN width (no gutter) - _pack_users_
+        # panel() packs it with before=self._shares_body so it's visually
+        # left of the shares list, but that also makes it the FIRST slave
+        # Tk's packer carves cavity for on that side, not the last. A
+        # side="left" widget packed first always gets its full requested
+        # width immediately (there's always cavity for it, since nothing
+        # claimed any yet) - unlike the Log panel (packed side="right"
+        # with no before=, so it's LAST in cavity order and naturally
+        # gets clipped to whatever's left as the window grows). That
+        # meant opening the Users panel packed it at full width right
+        # away and squeezed shares_body down to whatever cavity
+        # remained, un-squeezing it frame by frame as the window grew to
+        # catch up - reported live as "the right side is the stuttery
+        # side when opening user management." _animate_root_width()
+        # below fixes this by explicitly growing/shrinking the panel
+        # frame's OWN width in lockstep with the window, via
+        # pack_propagate(False) + configure(width=...), instead of
+        # relying on the packer's cavity-order side effects the way the
+        # Log panel gets to. See _toggle_users_panel().
+        self._users_panel_frame_width = self._user_mgmt_panel.frame.winfo_reqwidth()
+        self._user_mgmt_panel.frame.configure(
+            width=self._users_panel_frame_width, height=self._user_mgmt_panel.frame.winfo_reqheight()
+        )
+        self._user_mgmt_panel.frame.pack_propagate(False)
+        self._users_panel_width = self._users_panel_frame_width + _PANEL_GUTTER
+        self._log_panel_width = self._log_panel.frame.winfo_reqwidth() + _PANEL_GUTTER
+        # None until the first time _resize_root_to() actually needs to
+        # reposition root (grow_left=True - the Users panel) - see its
+        # own docstring for what this ends up measuring and why it can
+        # only be measured against a real, already-mapped, already-
+        # decorations-stripped root, not calibrated eagerly here (tried
+        # that: a withdrawn root, or a standalone probe window, both
+        # measured a drift of 0 - confirmed live, neither reproduces
+        # whatever the WM actually does once root is the real, focused,
+        # on-screen window).
+        self._wm_reposition_drift = None
 
         self._refresh_all_lists()
 
@@ -1314,6 +1368,12 @@ class GUIWizard:
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+        # Cached with no panels open (this is the first geometry() call
+        # root ever gets) - _animate_root_width() uses this as its own
+        # floor, so closing both panels can never shrink the window
+        # below its true no-panel baseline no matter what rounding a
+        # multi-step animation introduces along the way.
+        self._base_width = width
         # Without a floor, shrinking the window below what the list+actions
         # layout actually needs squishes it into an overlapping, unreadable
         # mess instead of just clipping/scrolling - the window is otherwise
@@ -1529,8 +1589,9 @@ class GUIWizard:
         # Holds, left to right: the Users panel (hidden until toggled),
         # the shares list itself (always visible), the Log panel (hidden
         # until toggled) - see _toggle_users_panel()/_toggle_log_panel()
-        # and _relayout_content_row() for why panels are re-packed in
-        # this fixed order on every toggle rather than just packed once.
+        # and _pack_users_panel()'s own before=self._shares_body for how
+        # a panel toggling never has to touch the shares list's own
+        # packing to stay correctly ordered.
         self._content_row = ttk.Frame(self.root)
         self._content_row.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -1599,40 +1660,122 @@ class GUIWizard:
             return
         self._notify_tour("share_selected")
 
-    def _relayout_content_row(self):
-        # Fixed left-to-right order (Users, shares, Log) rebuilt from
-        # scratch on every toggle, rather than relying on pack()'s own
-        # insertion-order bookkeeping surviving repeated pack_forget()/
-        # pack() calls - a widget re-pack()ed after being forgotten goes
-        # to the END of its master's current packing order, not back to
-        # wherever it used to be, so toggling Log open before Users
-        # (say) would otherwise leave Log sitting to the LEFT of the
-        # shares list instead of the right. Cheap to just always get
-        # right with only three possible children here.
-        self._user_mgmt_panel.frame.pack_forget()
-        self._shares_body.pack_forget()
-        self._log_panel.frame.pack_forget()
-        if self._users_panel_open:
-            self._user_mgmt_panel.frame.pack(side="left", fill="y", padx=(0, 8))
-        self._shares_body.pack(side="left", fill="both", expand=True)
-        if self._log_panel_open:
-            self._log_panel.frame.pack(side="right", fill="y", padx=(8, 0))
+    def _pack_users_panel(self):
+        # before=self._shares_body - NOT a pack_forget()+repack of
+        # shares_body itself (an earlier version of this did that, on
+        # EVERY toggle of EITHER panel, unconditionally, to keep left-to-
+        # right ordering correct - see git history). before= inserts this
+        # panel immediately to shares_body's left directly, so the
+        # shares list (a real Treeview with real rows, plus its own
+        # scrollbars) never gets torn down and rebuilt by the geometry
+        # manager just because a SIBLING toggled - confirmed live as a
+        # real, separate contributor to the reported flash, on top of
+        # the window-repositioning one _resize_root_to() already
+        # compensates for.
+        self._user_mgmt_panel.frame.pack(side="left", fill="y", padx=(0, _PANEL_GUTTER), before=self._shares_body)
 
-    def _resize_root_by(self, delta_width):
-        # Relative to whatever the window's CURRENT width actually is
-        # (not a hardcoded default) - preserves a manually-resized
-        # window instead of snapping back to some assumed baseline every
-        # time a panel opens/closes. Floored at winfo_reqwidth() (read
-        # AFTER _relayout_content_row() has already updated which
-        # panels are packed) so shrinking on close can never squeeze
-        # below what's actually still on screen, and capped at the
-        # screen width so growing can't push the window off-screen.
+    def _pack_log_panel(self):
+        # side="right" always claims space from the current right edge
+        # of whatever's left in content_row regardless of pack() call
+        # order relative to shares_body's own (expand=True) - confirmed
+        # live - so this needs no before=/after= at all, unlike the
+        # Users panel on the left (see _pack_users_panel()).
+        self._log_panel.frame.pack(side="right", fill="y", padx=(_PANEL_GUTTER, 0))
+
+    def _animate_root_width(self, delta_width, grow_left=False, on_complete=None, on_step=None):
+        # Steps the window from its current width to the target width
+        # over several real mainloop turns (via after()) instead of one
+        # instant geometry() jump - see the earlier version of this
+        # method (git history) for why an instant jump flashes at all.
+        #
+        # Reported live as "super stuttery" once this was actually an
+        # animation the user could watch closely: the first version of
+        # this re-read winfo_width()/winfo_x()/winfo_y() (each a
+        # synchronous X-server round trip) AND called minsize() (an
+        # ICCCM WM_NORMAL_HINTS property write, also a round trip) on
+        # EVERY single step. At a ~13ms step interval those round trips
+        # compete for the same event-loop turn as the WM actually
+        # painting the previous step, so steps land at irregular,
+        # unpredictable intervals even though after() itself fires
+        # evenly - which reads as stutter/jank rather than smooth
+        # motion, independent of step count or duration.
+        #
+        # Fixed by doing all the expensive work ONCE, up front: read
+        # the starting geometry a single time, precompute every step's
+        # width (and, for grow_left, x) as plain arithmetic with no
+        # further widget queries, and defer minsize() to the final step
+        # only (it's a hint for user-driven resizing, not something
+        # that needs to track an in-flight animation). Each step is then
+        # just one geometry() call and nothing else.
         self.root.update_idletasks()
+        old_width = self.root.winfo_width()
+        old_x = self.root.winfo_x()
+        old_y = self.root.winfo_y()
         height = self.root.winfo_height()
-        width = self.root.winfo_width() + delta_width
-        width = max(self.root.winfo_reqwidth(), min(width, self.root.winfo_screenwidth()))
-        self.root.geometry(f"{width}x{height}")
-        self.root.minsize(width, height)
+        target_width = max(self._base_width, min(old_width + delta_width, self.root.winfo_screenwidth()))
+        actual_delta = target_width - old_width
+        if actual_delta == 0:
+            self.root.minsize(target_width, height)
+            if on_complete:
+                on_complete()
+            return
+
+        steps = 10
+        duration_ms = 160
+        step_delay = max(1, duration_ms // steps)
+        widths = [old_width + round(actual_delta * i / steps) for i in range(1, steps)] + [target_width]
+        xs = [max(0, old_x - (w - old_width)) for w in widths] if grow_left else None
+
+        def step(i):
+            w = widths[i]
+            if grow_left:
+                if self._wm_reposition_drift is None:
+                    # First time ever repositioning root - measure
+                    # Mutter's own quirk here rather than guessing it up
+                    # front: this exact window, explicitly repositioned
+                    # via geometry(), consistently lands a fixed number
+                    # of pixels below wherever it was actually asked to
+                    # go (confirmed live - looks like the WM still
+                    # reserving room for a titlebar it isn't actually
+                    # drawing on this Motif-hint-undecorated window -
+                    # see linux_titlebar.py). Measuring this eagerly at
+                    # startup (an earlier version of this) didn't work:
+                    # a withdrawn root, and a standalone probe window,
+                    # both measured a drift of 0. This costs one extra
+                    # round trip, but only once, ever, across the
+                    # program's whole lifetime - every animation after
+                    # the very first Users-panel toggle skips it.
+                    self.root.geometry(f"{w}x{height}+{xs[i]}+{old_y}")
+                    self.root.update_idletasks()
+                    self._wm_reposition_drift = self.root.winfo_y() - old_y
+                    if self._wm_reposition_drift:
+                        self.root.geometry(f"+{xs[i]}+{old_y - self._wm_reposition_drift}")
+                else:
+                    self.root.geometry(f"{w}x{height}+{xs[i]}+{old_y - self._wm_reposition_drift}")
+            else:
+                self.root.geometry(f"{w}x{height}")
+            if on_step:
+                # The actual, already-rounded pixel delta the window has
+                # moved so far this animation (signed - negative while
+                # shrinking) - NOT a separately-rounded i/steps fraction.
+                # A caller deriving its own per-step width from a second,
+                # independent round() (an earlier version of this did
+                # exactly that) drifts by a pixel or two against this
+                # width's rounding, frame to frame - small individually,
+                # but visible as a slow wobble over the whole animation.
+                # Deriving everything from this one already-committed
+                # number keeps a caller's own animated width (see
+                # _toggle_users_panel()) in exact lockstep with what's
+                # actually on screen.
+                on_step(w - old_width)
+            if i == steps - 1:
+                self.root.minsize(w, height)
+                if on_complete:
+                    on_complete()
+            else:
+                self.root.after(step_delay, lambda: step(i + 1))
+
+        step(0)
 
     def _toggle_users_panel(self):
         if self._users_panel_open:
@@ -1644,17 +1787,72 @@ class GUIWizard:
             if self._tour_blocks_closing(self._user_mgmt_panel, "user_mgmt_closed"):
                 return
             self._users_panel_open = False
-            self._relayout_content_row()
-            self._resize_root_by(-self._users_panel_width)
             self._users_toggle_btn.set_pressed(False)
-            self._notify_tour("user_mgmt_closed")
+            # Shrink the panel's OWN width in lockstep with the window
+            # (on_step - see the comment on self._users_panel_frame_width
+            # in __init__ for why this can't just rely on the packer's
+            # cavity-clipping the way the Log panel does), reaching 0
+            # exactly as the window reaches its target width. pack_forget()
+            # only runs once that's done, as a cleanup that should be a
+            # visual no-op by then.
+            def _step(consumed):
+                # consumed is <= 0 here (shrinking), from 0 down to
+                # -self._users_panel_width - see _animate_root_width()'s
+                # own comment on on_step for why this (and not a second
+                # independent round()) is what this is derived from.
+                w = max(0, min(
+                    self._users_panel_frame_width, consumed + self._users_panel_frame_width + _PANEL_GUTTER
+                ))
+                self._user_mgmt_panel.frame.configure(width=w)
+            def _done():
+                self._user_mgmt_panel.frame.pack_forget()
+                self._notify_tour("user_mgmt_closed")
+            self._animate_root_width(-self._users_panel_width, grow_left=True, on_complete=_done, on_step=_step)
         else:
             self._users_panel_open = True
-            self._relayout_content_row()
-            self._resize_root_by(self._users_panel_width)
             self._users_toggle_btn.set_pressed(True)
+            # Pack FIRST (at width 0 - see _step below), then grow both
+            # the window and the panel's own width together, step for
+            # step, so shares_body's share of the cavity never changes
+            # mid-animation. See self._users_panel_frame_width's comment
+            # in __init__ for why the window growing alone isn't enough.
+            #
+            # header/body (the Treeview, its scrollbar, and the action
+            # bar) are unpacked for the DURATION of the glide and only
+            # re-packed once it's done, in _done() - confirmed live via
+            # per-step timing that relaying THOSE out on every single
+            # width change (an earlier version of this did exactly that)
+            # is what was actually causing the reported stutter: one
+            # frame consistently took ~2x as long as the rest (~30ms vs
+            # ~16ms), every run, always at the same early point in the
+            # glide. Pre-warming the layout once at full width before
+            # starting (tried first) did NOT remove it - re-tested with
+            # the content unpacked instead, and the spike disappeared
+            # completely, confirming it's real per-frame relayout cost
+            # of that specific widget tree, not a one-time cache-miss.
+            # An empty frame costs nothing to resize regardless of width,
+            # which is what keeps the glide itself cheap and even. Only
+            # applied to opening - closing was already measured clean
+            # (no spike) without this, so it's left as it was rather
+            # than trade a real glitch (content visibly vanishing right
+            # as you click to close) for no benefit.
+            self._user_mgmt_panel.header.pack_forget()
+            self._user_mgmt_panel.body.pack_forget()
+            self._user_mgmt_panel.frame.configure(width=0)
+            self._pack_users_panel()
             self._user_mgmt_panel.refresh()
-            self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+            def _step(consumed):
+                # consumed is >= 0 here (growing), from 0 up to
+                # self._users_panel_width - see _animate_root_width()'s
+                # own comment on on_step for why this (and not a second
+                # independent round()) is what this is derived from.
+                w = max(0, min(self._users_panel_frame_width, consumed - _PANEL_GUTTER))
+                self._user_mgmt_panel.frame.configure(width=w)
+            def _done():
+                self._user_mgmt_panel.header.pack(fill="x", padx=8, pady=(8, 0))
+                self._user_mgmt_panel.body.pack(fill="both", expand=True, padx=8, pady=8)
+                self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+            self._animate_root_width(self._users_panel_width, grow_left=True, on_complete=_done, on_step=_step)
 
     def _toggle_log_panel(self):
         # No tour step ever points at this one, so no _tour_blocks_closing
@@ -1662,14 +1860,15 @@ class GUIWizard:
         # never had one either.
         if self._log_panel_open:
             self._log_panel_open = False
-            self._relayout_content_row()
-            self._resize_root_by(-self._log_panel_width)
             self._log_toggle_btn.set_pressed(False)
+            self._animate_root_width(
+                -self._log_panel_width, grow_left=False, on_complete=self._log_panel.frame.pack_forget
+            )
         else:
             self._log_panel_open = True
-            self._relayout_content_row()
-            self._resize_root_by(self._log_panel_width)
             self._log_toggle_btn.set_pressed(True)
+            self._pack_log_panel()
+            self._animate_root_width(self._log_panel_width, grow_left=False)
 
     def _build_share_action_bar(self, container, item):
         # The add-row (see _populate_shares_list()) is a real Treeview
