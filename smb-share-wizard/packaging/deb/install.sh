@@ -28,7 +28,7 @@ case " $DISTRO_ID $DISTRO_LIKE " in
 esac
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-DEB_PATH="$SCRIPT_DIR/nassie_0.1.7_all.deb"
+DEB_PATH="$SCRIPT_DIR/nassie_0.1.8_all.deb"
 
 if [ ! -f "$DEB_PATH" ]; then
     echo "Could not find $DEB_PATH — build it first: $SCRIPT_DIR/build.sh" >&2
