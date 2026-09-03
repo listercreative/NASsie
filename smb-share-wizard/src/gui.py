@@ -1467,37 +1467,62 @@ class UserManagementPanel:
         return True
 
     def refresh(self):
+        # list_users() shells out (PowerShell on Windows especially - see
+        # core.py's own comment on _list_groups_windows()'s shares= param)
+        # - running it synchronously here, right in _toggle_users_panel()'s
+        # open path, froze the whole app (not just this panel) for however
+        # long those subprocesses took, since Tk can't service ANY event -
+        # not even the panel's own open animation - while the main thread
+        # is blocked inside a subprocess call. Same fetch-in-background,
+        # apply-on-main-thread-once-ready split _refresh_all_lists_worker()
+        # already uses for list_shares()/list_groups().
         selected = self._selected_username()
-        users = self.wizard.list_users()
-        self._add_row_feedback.reset()
-        for item in self.users_list.get_children():
-            self.users_list.delete(item)
-        # Row #1, always - see _add_share_row_id's identical reasoning in
-        # _populate_shares_list().
-        # Blank text - _AddRowFeedback's own floating icon Label shows the
-        # "➕", not this cell (see its own docstring for why).
-        self._add_user_row_id = self.users_list.insert("", 0, text="", tags=("add_row",))
-        for u in users:
-            # list_users() returns every OS-level account on the machine
-            # (it has to, so "Attach User" pickers can offer an existing
-            # person) - but showing all of those here, unlabeled, means
-            # someone's own Windows sign-in or a family member's account
-            # shows up in a sharing tool with no explanation of what it is.
-            # Show an account NASsie either created itself, or that already
-            # has share access through NASsie - not every account on the box.
-            if not (u.get("managed") or u["shares"]):
-                continue
-            item_id = self.users_list.insert("", tk.END, text=u["username"])
-            if u["username"] == selected:
-                self.users_list.selection_set(item_id)
-        # Re-pins the add-row to row #1 itself (see _SortableTree's own
-        # pinned_first) regardless of whatever sort is currently active.
-        self._sort.reapply()
-        self._action_bar.update()
-        # Only now - the row this needs to overlay was just deleted and
-        # reinserted above under a brand new id (reset() couldn't do this
-        # itself; see its own comment).
-        self._add_row_feedback.reposition()
+
+        def fetch():
+            users = self.wizard.list_users()
+
+            def apply():
+                if not self.users_list.winfo_exists():
+                    # Panel (or the whole app) was torn down while this was
+                    # in flight - nothing left to populate.
+                    return
+                self._add_row_feedback.reset()
+                for item in self.users_list.get_children():
+                    self.users_list.delete(item)
+                # Row #1, always - see _add_share_row_id's identical
+                # reasoning in _populate_shares_list().
+                # Blank text - _AddRowFeedback's own floating icon Label
+                # shows the "➕", not this cell (see its own docstring for
+                # why).
+                self._add_user_row_id = self.users_list.insert("", 0, text="", tags=("add_row",))
+                for u in users:
+                    # list_users() returns every OS-level account on the
+                    # machine (it has to, so "Attach User" pickers can
+                    # offer an existing person) - but showing all of those
+                    # here, unlabeled, means someone's own Windows sign-in
+                    # or a family member's account shows up in a sharing
+                    # tool with no explanation of what it is. Show an
+                    # account NASsie either created itself, or that
+                    # already has share access through NASsie - not every
+                    # account on the box.
+                    if not (u.get("managed") or u["shares"]):
+                        continue
+                    item_id = self.users_list.insert("", tk.END, text=u["username"])
+                    if u["username"] == selected:
+                        self.users_list.selection_set(item_id)
+                # Re-pins the add-row to row #1 itself (see _SortableTree's
+                # own pinned_first) regardless of whatever sort is
+                # currently active.
+                self._sort.reapply()
+                self._action_bar.update()
+                # Only now - the row this needs to overlay was just
+                # deleted and reinserted above under a brand new id
+                # (reset() couldn't do this itself; see its own comment).
+                self._add_row_feedback.reposition()
+
+            self.app.root.after(0, apply)
+
+        threading.Thread(target=fetch, daemon=True).start()
 
     def _selected_username(self):
         selection = self.users_list.selection()
