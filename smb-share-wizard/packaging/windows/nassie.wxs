@@ -3,7 +3,7 @@
 
   <Package Name="NASsie"
            Manufacturer="Lister Creative Enterprise LLC"
-           Version="0.1.13.0"
+           Version="0.1.14.0"
            UpgradeCode="4c2e7f0a-9b1d-4e3a-8c6f-2a1b5d7e9f30"
            Compressed="yes">
 
@@ -155,10 +155,39 @@
          attribute to override it - confirmed via the same verbose log,
          "Path is a junction; skipping". This action doesn't have that
          limitation; os.remove() on a single file resolves through a
-         junction the normal way.) -->
+         junction the normal way.)
+
+         Execute="deferred", NOT the immediate default the comment above
+         (written before this was diagnosed further) still describes for
+         NASsiePromptUninstallFolders: a second verbose log showed THIS
+         action ALSO failing with the identical MSI error 1721, even
+         though it has zero tkinter/UI code at all - disproving the
+         original "tk.Tk() fails under this context" theory, since there
+         was nothing here for a GUI failure to explain. The actual
+         pattern across both logs: NASsieUninstallCleanup, the one action
+         that reliably works, is the only one marked Execute="deferred"
+         (Impersonate="no" too, for its own separate reason - see its own
+         comment). Both failing actions were plain immediate actions -
+         which under this elevated, MSI_LUA ("split token" UAC) execution
+         path can apparently fail outright just launching a new process
+         while impersonating the calling user, independent of what that
+         process does once running. Impersonate is deliberately left at
+         its default "yes" here, unlike NASsieUninstallCleanup's explicit
+         "no" - this needs to keep running AS the real interactive user
+         (not SYSTEM) for %APPDATA% to resolve correctly, the whole
+         reason this is an immediate-style/interactive-session action at
+         all (see the comment above). Execute="deferred" alone moves it
+         onto the same reliable "in-script" execution mechanism
+         NASsieUninstallCleanup already proves works in this exact
+         environment, without giving up user impersonation - a
+         combination NASsiePromptUninstallFolders can't use itself since
+         a deferred action can never show desktop UI regardless of
+         impersonation (Session 0 isolation - see its own comment), but
+         this action needs no UI at all, just a file delete. -->
     <CustomAction Id="NASsieDeleteTourMarker"
                   FileRef="NASsieExe"
                   ExeCommand="--uninstall-delete-tour-marker"
+                  Execute="deferred"
                   Return="ignore" />
 
     <!-- "Add desktop shortcut" checkbox on the final install page (see
