@@ -551,13 +551,17 @@ class SMBWizard:
     # it's never surfaced as if it were a real group.
     _MANAGED_GROUP_PREFIX = {"Linux": "nassiegrp_", "Darwin": "nassiegrp_"}
 
-    def list_groups(self):
-        # Linux and macOS are both POSIX: the same grp-database read works
-        # unchanged on either, no OS-specific logic needed here.
+    def list_groups(self, shares=None):
+        # shares - an already-fetched list_shares() result, passed straight
+        # through to _list_groups_windows() to avoid it re-running the
+        # (PowerShell-process-spawning) share scan from scratch when a
+        # caller - list_users(), below - already has one. Unused on POSIX,
+        # where list_shares() is a pure in-process pwd/grp read with no
+        # real cost to repeating.
         if self.system in ("Linux", "Darwin"):
             return self._list_groups_posix()
         elif self.system == "Windows":
-            return self._list_groups_windows()
+            return self._list_groups_windows(shares=shares)
         return []
 
     def list_users(self):
@@ -569,7 +573,7 @@ class SMBWizard:
         # unprivileged just to populate a list, so this reads the OS
         # account list instead - see _list_regular_accounts().
         shares = self.list_shares()
-        groups = self.list_groups()
+        groups = self.list_groups(shares=shares)
 
         user_shares = {}
         for share in shares:
@@ -1858,11 +1862,25 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             shares.append(share)
         return shares
 
-    def _list_groups_windows(self):
+    def _list_groups_windows(self, shares=None):
         # Same fix as _list_shares_windows: one PowerShell process for the
         # group list, one for every group's membership, plus a full second
         # pass through _list_shares_windows()'s own per-share loop - batch
         # groups+members into a single call, and reuse one shares fetch.
+        #
+        # "and reuse one shares fetch" above used to be aspirational only -
+        # this method always called self._list_shares_windows() itself
+        # below regardless of what a caller already had, so every
+        # list_users() call spent 2 whole extra powershell.exe launches
+        # (share+access, then the NASsie-group-existence check inside
+        # _list_shares_windows()) re-deriving data list_users() had
+        # already fetched one line earlier. shares (an already-fetched
+        # list_shares()/list_shares(shares=...) result) lets a caller that
+        # has one skip that repeat; still falls back to a fresh fetch for
+        # any direct caller (list_groups() with no shares, list_group(),
+        # remove_group_if_orphaned()) that doesn't have one on hand.
+        if shares is None:
+            shares = self._list_shares_windows()
         cmd = (
             "Get-LocalGroup | Where-Object { $_.Name -like 'NASsieGroup_*' } "
             "| ForEach-Object { "
@@ -1881,7 +1899,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             data = [data]
 
         group_to_shares = {}
-        for share in self._list_shares_windows():
+        for share in shares:
             group = share.get("access_group")
             if group:
                 group_to_shares.setdefault(group, []).append(share["name"])
