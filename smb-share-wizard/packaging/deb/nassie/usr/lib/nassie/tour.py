@@ -1242,6 +1242,22 @@ class GuiTour:
         # step's container is still the current one - means it self-
         # heals shortly after losing front position rather than staying
         # lost, which is the best available fallback here.
+        #
+        # Linux-only: unlike Mutter/Wayland, Windows honors "-topmost"
+        # correctly and keeps it set once applied - the one-time
+        # _bring_to_front() call already made when the step first shows
+        # (_show_step(), _track_container()'s own caller) is enough
+        # there. Running this loop unconditionally on Windows anyway was
+        # a real bug, not just needless: _bring_to_front()'s False ->
+        # update() -> True dance forces a synchronous full redraw and a
+        # topmost/z-order toggle on whatever window the step currently
+        # targets, every 1.5s, for as long as that step is up - visible
+        # as a widespread "caught in a refresh" flicker (including the
+        # text-insertion caret dropping out of whatever field has focus)
+        # across every NASsie window, confirmed as Windows-only and
+        # traced to this loop.
+        if platform.system() != "Linux":
+            return
         my_callout = self._callout
 
         def _reassert():
