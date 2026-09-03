@@ -241,8 +241,26 @@ class _TreeRegion:
         return self.tree.winfo_toplevel()
 
     def _bbox(self):
-        boxes = [self.tree.bbox(i) for i in self.item_ids]
-        boxes = [b for b in boxes if b]
+        # tree.bbox(i) doesn't just return '' for an item id that no
+        # longer exists in this tree (a resumed step referencing a row
+        # from a previous, now-gone process, or one this fresh process
+        # simply hasn't created yet) - it raises TclError outright, unlike
+        # most other winfo_*-style Tk queries. The comment below already
+        # documented "none of the ids exist anymore" as an expected,
+        # handled case, but the plain list comprehension this used to be
+        # let that exception escape before the `if b` filter ever got a
+        # chance to run, taking down the whole step (see _step_resolves()'s
+        # own comment on where that ends up: a silently swallowed
+        # exception in a windowed/no-console build, with nothing ever
+        # visibly starting for the user).
+        boxes = []
+        for i in self.item_ids:
+            try:
+                b = self.tree.bbox(i)
+            except tk.TclError:
+                continue
+            if b:
+                boxes.append(b)
         if not boxes:
             # Nothing to bound - a row scrolled out of view, or (the tour
             # was interrupted/reordered) none of the ids exist anymore -
@@ -1036,9 +1054,40 @@ class GuiTour:
         if container is None:
             return False
         try:
-            return bool(container.winfo_exists())
+            if not container.winfo_exists():
+                return False
         except tk.TclError:
             return False
+        # Container-only used to be the whole check - correct for most
+        # steps, but not the ones whose widget_fn depends on session state
+        # the container itself says nothing about (a specific Treeview row
+        # id from a *previous* process, e.g. - gui.root always exists
+        # regardless). Confirmed live: resuming an interrupted tour landed
+        # on exactly such a step, widget_fn's _TreeRegion referenced a row
+        # id that no longer existed, and the TclError that used to escape
+        # from deep inside _show_step()'s highlight/callout placement (see
+        # _TreeRegion._bbox()'s own comment) took the whole step down with
+        # nothing ever shown - on a windowed/no-console Windows build, Tk's
+        # default callback-exception handling prints that to a stderr
+        # nobody can see, so it read as "clicking Yes does nothing" with
+        # no visible error at all. Actually resolving the widget here too
+        # (not just checking the container) means _resolve_resume_index()
+        # correctly walks back PAST a step like that to the nearest one
+        # that's fully real, instead of confidently landing on one that
+        # looks fine and then silently failing once _show_step() commits
+        # to it.
+        widget_fn = self.steps[index][1]
+        if widget_fn is not None:
+            try:
+                widget = widget_fn()
+                if widget is not None:
+                    target = widget.widget if isinstance(widget, (_PointAtOnly, _HighlightWholeDialog)) else widget
+                    if target is not None:
+                        target.update_idletasks()
+                        target.winfo_rootx()
+            except (tk.TclError, AttributeError, IndexError):
+                return False
+        return True
 
     def _resolve_resume_index(self, index):
         # See start()'s own comment for why this exists at all. A fresh
@@ -1127,59 +1176,76 @@ class GuiTour:
             return
         container.update_idletasks()
         _bring_to_front(container)
-        # None (a step with nothing of NASsie's own to point at - the
-        # native "Done" confirmation dialog after a share/user is created,
-        # which is a plain Tcl tk_messageBox with no Python widget handle
-        # to attach a highlight to) skips the highlight box entirely and
-        # places the callout outside the container's own bounds instead -
-        # see _Callout.place_outside_container().
-        widget = widget_fn() if widget_fn is not None else None
-        point_at_only = isinstance(widget, _PointAtOnly)
-        whole_dialog_highlight = isinstance(widget, _HighlightWholeDialog)
-        highlight_target = widget.widget if (point_at_only or whole_dialog_highlight) else widget
+        try:
+            # None (a step with nothing of NASsie's own to point at - the
+            # native "Done" confirmation dialog after a share/user is
+            # created, which is a plain Tcl tk_messageBox with no Python
+            # widget handle to attach a highlight to) skips the highlight
+            # box entirely and places the callout outside the container's
+            # own bounds instead - see _Callout.place_outside_container().
+            widget = widget_fn() if widget_fn is not None else None
+            point_at_only = isinstance(widget, _PointAtOnly)
+            whole_dialog_highlight = isinstance(widget, _HighlightWholeDialog)
+            highlight_target = widget.widget if (point_at_only or whole_dialog_highlight) else widget
 
-        if whole_dialog_highlight:
-            self._highlight = _HighlightBox(container)
-            self._highlight.place_around_container()
-        elif highlight_target is not None:
-            self._highlight = _HighlightBox(container)
-            self._highlight.place_around(highlight_target)
-        else:
-            self._highlight = None
+            if whole_dialog_highlight:
+                self._highlight = _HighlightBox(container)
+                self._highlight.place_around_container()
+            elif highlight_target is not None:
+                self._highlight = _HighlightBox(container)
+                self._highlight.place_around(highlight_target)
+            else:
+                self._highlight = None
 
-        self._callout = _Callout(container, title, text, on_skip=self._confirm_and_stop)
-        if highlight_target is not None and not point_at_only:
-            self._callout.place_near(highlight_target)
-        else:
-            # Both the widget=None steps (native tk_messageBox
-            # confirmations, no Python widget handle at all) and
-            # _PointAtOnly ones (a real widget IS highlighted above, but
-            # place_near() can't be trusted for it - see the class's own
-            # docstring) land here.
-            half_height = _DIALOG_HALF_HEIGHT
-            self._callout.place_outside_container(container, half_height)
-            # One extra self-correction shortly after - confirmed live
-            # (intermittently, timing-dependent - a race, not a one-off)
-            # landing at a stale (0, 0) with no later event to ever fix
-            # it, right after a step transition that both destroys a
-            # dialog AND withdraws that dialog's own OWNER window in the
-            # same beat (e.g. AddUserDialog closing while
-            # UserManagementWindow withdraws right under it) - evidently
-            # sometimes enough WM churn that even container.update()'s
-            # round trip inside place_outside_container() itself isn't a
-            # hard guarantee. This costs nothing when the first placement
-            # was already right - it just recomputes the same answer.
-            index_at_schedule = self.index
-            def _self_correct(step_index=index_at_schedule):
-                if self._callout is not None and self.index == step_index:
-                    try:
-                        self._callout.place_outside_container(container, half_height)
-                    except tk.TclError:
-                        pass
-            container.after(120, _self_correct)
-        # Revealed only now, after the real placement above - see the
-        # withdraw() in _Callout.__init__ for why.
-        self._callout.deiconify()
+            self._callout = _Callout(container, title, text, on_skip=self._confirm_and_stop)
+            if highlight_target is not None and not point_at_only:
+                self._callout.place_near(highlight_target)
+            else:
+                # Both the widget=None steps (native tk_messageBox
+                # confirmations, no Python widget handle at all) and
+                # _PointAtOnly ones (a real widget IS highlighted above,
+                # but place_near() can't be trusted for it - see the
+                # class's own docstring) land here.
+                half_height = _DIALOG_HALF_HEIGHT
+                self._callout.place_outside_container(container, half_height)
+                # One extra self-correction shortly after - confirmed live
+                # (intermittently, timing-dependent - a race, not a one-off)
+                # landing at a stale (0, 0) with no later event to ever fix
+                # it, right after a step transition that both destroys a
+                # dialog AND withdraws that dialog's own OWNER window in
+                # the same beat (e.g. AddUserDialog closing while
+                # UserManagementWindow withdraws right under it) -
+                # evidently sometimes enough WM churn that even
+                # container.update()'s round trip inside
+                # place_outside_container() itself isn't a hard guarantee.
+                # This costs nothing when the first placement was already
+                # right - it just recomputes the same answer.
+                index_at_schedule = self.index
+                def _self_correct(step_index=index_at_schedule):
+                    if self._callout is not None and self.index == step_index:
+                        try:
+                            self._callout.place_outside_container(container, half_height)
+                        except tk.TclError:
+                            pass
+                container.after(120, _self_correct)
+            # Revealed only now, after the real placement above - see the
+            # withdraw() in _Callout.__init__ for why.
+            self._callout.deiconify()
+        except (tk.TclError, AttributeError, IndexError):
+            # Defense in depth alongside _step_resolves() now also probing
+            # widget_fn() (see its own comment) - that check runs BEFORE
+            # this method ever commits to showing this step, so in
+            # practice it should already have steered a resumed tour past
+            # anything that would land here. This is the fallback for
+            # whatever that check doesn't happen to anticipate: better a
+            # quiet, recoverable stop (same outcome _step_resolves()
+            # failing produces above) than an exception escaping into a
+            # Tk after()-callback, where a windowed/no-console Windows
+            # build has nowhere visible to report it - which is exactly
+            # how "clicking Yes on Resume Tour does nothing, no error, no
+            # tour" was reported and reproduced.
+            self.stop(completed=False)
+            return
         self._wait_event = wait_event
         self._track_container(container, widget)
 
