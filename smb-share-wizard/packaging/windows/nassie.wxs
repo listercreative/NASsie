@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
   <Package Name="NASsie"
            Manufacturer="Lister Creative Enterprise LLC"
-           Version="0.1.6.0"
+           Version="0.1.7.0"
            UpgradeCode="4c2e7f0a-9b1d-4e3a-8c6f-2a1b5d7e9f30"
            Compressed="yes">
 
@@ -88,8 +87,8 @@
                   ExeCommand="--uninstall-folder-prompt"
                   Return="ignore" />
 
-    <!-- "Add desktop shortcut" checkbox on the final install page (see the
-         overridden ExitDialog below). Plain ExeCommand rather than
+    <!-- "Add desktop shortcut" checkbox on the final install page (see
+         NASsieExitDialog below). Plain ExeCommand rather than
          WixShellExec (used for LaunchApplication below) because
          WixShellExec has no way to pass an argument (like the
          ExeCommand flag below) - it just ShellExecutes the target file
@@ -120,7 +119,13 @@
     <WixVariable Id="WixUIBannerBmp" Value="banner.bmp" />
     <WixVariable Id="WixUIDialogBmp" Value="dialog.bmp" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <ui:WixUI Id="WixUI_InstallDir" />
+
+    <!-- NOT "<ui:WixUI Id="WixUI_InstallDir" />" (the normal shortcut for
+         this dialog set) - see the WixUI_NASsieInstallDir Fragment at the
+         bottom of this file for why. UIRef, not ui:WixUI, since
+         WixUI_NASsieInstallDir is our own plain <UI> fragment, not
+         something the ui: extension element knows how to resolve. -->
+    <UIRef Id="WixUI_NASsieInstallDir" />
 
     <!-- "Launch NASsie" checkbox on the final install page. The checkbox's
          checked-state is its own property, separate from its label text -
@@ -141,10 +146,31 @@
          library) has room for exactly one opt-in checkbox
          (WIXUI_EXITDIALOGOPTIONALCHECKBOX, used above for "Launch NASsie")
          - getting a second, independent one ("Add desktop shortcut") means
-         replacing that whole dialog with our own copy. Overriding it is as
-         simple as redefining a Dialog with the same Id elsewhere in the
-         same UI sequence - WiX resolves same-Id dialogs by last one wins,
-         no separate "virtual"/Overridable declaration needed on this side.
+         replacing that whole dialog with our own copy.
+
+         This is named "NASsieExitDialog", NOT "ExitDialog" - a same-Id
+         override was the first thing tried here, and it doesn't work in
+         current WiX: the extension's own <Dialog Id="ExitDialog"> (and
+         every <Control> inside it) is a plain, non-virtual symbol, so a
+         second same-Id Dialog elsewhere in the same build is a hard
+         WIX0091 duplicate-symbol error, not a "last definition wins"
+         override - confirmed live, this is exactly the error that showed
+         up switching to this WiX toolset version. Renaming the dialog
+         alone isn't enough either, though: <ui:WixUI Id="WixUI_InstallDir">
+         itself contains a `<Publish Dialog="ExitDialog" Control="Finish"
+         Event="EndDialog" .../>` line, and THAT reference is what actually
+         pulls the stock ExitDialog fragment into the link at all - so as
+         long as that shortcut element is used, the stock dialog (and its
+         own `<Show Dialog="virtual ExitDialog" OnExit="success" />`,
+         fighting ours for the same "install just finished" slot) stays
+         linked in regardless of what our own dialog is named. Fixed by
+         forking the WixUI_InstallDir dialog-sequence wiring itself (see
+         the WixUI_NASsieInstallDir Fragment at the bottom of this file) -
+         a verbatim copy of the real upstream WixUI_InstallDir.wxs content
+         with that one Publish line removed, so the stock ExitDialog
+         fragment is never referenced, never linked in, and never
+         conflicts with this one.
+
          Every control below except NASsieDesktopShortcutCheckBox, and
          every coordinate, is copied verbatim from the library's own
          ExitDialog.wxs so the rest of the dialog looks identical; only
@@ -152,7 +178,7 @@
          wrap) to make room for the new checkbox directly beneath it,
          still well clear of BottomLine at Y=234. -->
     <UI>
-      <Dialog Id="ExitDialog" Width="370" Height="270" Title="!(loc.ExitDialog_Title)">
+      <Dialog Id="NASsieExitDialog" Width="370" Height="270" Title="!(loc.ExitDialog_Title)">
         <Control Id="Finish" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIFinish)" />
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUICancel)" />
         <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="!(loc.ExitDialogBitmap)" />
@@ -169,11 +195,91 @@
              to assume everyone wants. -->
         <Control Id="NASsieDesktopShortcutCheckBox" Type="CheckBox" X="135" Y="210" Width="220" Height="18" Property="NASSIE_DESKTOP_SHORTCUT" CheckBoxValue="1" Text="Add a desktop shortcut" ShowCondition="NOT Installed" />
       </Dialog>
-      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"
+
+      <!-- Takes over the "installation just finished successfully" slot
+           the stock ExitDialog.wxs's own identical Show entries (see this
+           file's own copy, in InstallUISequence/AdminUISequence) would
+           otherwise occupy - safe to do unconditionally (no "virtual"
+           needed on this side) precisely because that stock fragment is
+           never linked in at all now (see the long comment above). -->
+      <InstallUISequence>
+        <Show Dialog="NASsieExitDialog" OnExit="success" />
+      </InstallUISequence>
+      <AdminUISequence>
+        <Show Dialog="NASsieExitDialog" OnExit="success" />
+      </AdminUISequence>
+
+      <Publish Dialog="NASsieExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
-      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="NASsieCreateDesktopShortcut"
+      <Publish Dialog="NASsieExitDialog" Control="Finish" Event="DoAction" Value="NASsieCreateDesktopShortcut"
                Condition="NASSIE_DESKTOP_SHORTCUT = 1 and NOT Installed" />
     </UI>
 
   </Package>
+
+  <!-- Our own fork of the stock WixUI_InstallDir dialog-sequence wiring -
+       see NASsieExitDialog's own comment (in Package, above) for why this
+       has to exist at all rather than just using
+       "<ui:WixUI Id="WixUI_InstallDir" />" directly. This is a verbatim
+       copy of the real upstream source (wixtoolset/wix,
+       src/ext/UI/wixlib/WixUI_InstallDir.wxs, the plain non-arch-specific
+       "file WixUI_InstallDir" fragment - not the WIXUIARCH-templated
+       variants above it in that file, which this project's own
+       <ui:WixUI Id="WixUI_InstallDir" /> never used either) with exactly
+       one line removed: the
+       `<Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog"
+       Value="Return" Order="999" />` that pulls the stock, non-overridable
+       ExitDialog fragment into the link. Every other Publish rule below -
+       Welcome/License/InstallDir/VerifyReady/Maintenance navigation - is
+       unchanged, so Back/Next behavior through the rest of the installer
+       matches stock WixUI_InstallDir exactly. -->
+  <Fragment>
+    <UI Id="WixUI_NASsieInstallDir">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Condition="LicenseAccepted = &quot;1&quot;" />
+
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="3" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="[_BrowseProperty]" Order="3" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="4" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+
+      <Property Id="ARPNOMODIFY" Value="1" />
+    </UI>
+
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+
 </Wix>
