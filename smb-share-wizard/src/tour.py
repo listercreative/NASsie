@@ -45,16 +45,9 @@ class _HighlightWholeDialog:
         self.widget = widget
 
 
-def _dialog_half_height_for(wait_event):
-    # See _Callout.place_outside_container()'s own comment - most native
-    # dialogs this points at are one short line, but the share-creation
-    # apply-done message is genuinely longer (a status line plus a
-    # follow-up hint), so it alone needs a taller estimate. 160 (measured
-    # against an older, shorter render of this same dialog) overshot the
-    # real thing badly enough to read as "far too low" once confirmed
-    # against an actual screenshot of it - about 235px tall, so ~117 half
-    # -height, not 160.
-    return 120 if wait_event == "share_apply_confirmed" else 90
+# Estimated half-height (px) of whatever this step has nothing of NASsie's
+# own to point at - see _Callout.place_outside_container()'s own comment.
+_DIALOG_HALF_HEIGHT = 90
 
 
 def _bring_to_front(win, steal_focus=True):
@@ -711,14 +704,19 @@ class GuiTour:
              "Folder",
              "Pick a folder for this share or use the provided default, then click OK.",
              "share_created"),
-            # No widget (None) - the "Done" dialog that follows is a plain
-            # tk_messageBox, not one of NASsie's own, so there's no Python
-            # widget handle to attach a highlight to (see _Callout.
+            # No widget (None) - the "Share Creation" toast that follows
+            # (see GUIWizard._show_toast()) is a plain tk.Toplevel of its
+            # own, floating in root's own corner rather than sitting
+            # inside it, so there's nothing meaningful here for
+            # place_near() to point at (see _Callout.
             # place_outside_container()). Container is gui.root, not
             # _active_window - the CreateShareDialog that opened it is
             # already destroyed by this point (same as every step after it).
+            # wait_event now fires from the toast's own on_close, not a
+            # blocking messagebox's OK click - see _apply_done().
             (lambda: gui.root, None,
-             "Confirmation", "Click OK to confirm.",
+             "Confirmation", "A confirmation toast appears in the corner - dismiss it (✕) or wait for "
+             "it to disappear.",
              "share_apply_confirmed"),
 
             (lambda: gui.root, lambda: gui._users_toggle_btn.label,
@@ -735,8 +733,11 @@ class GuiTour:
             (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.username_entry),
              "Username and Password", "Type a username and password, then click OK.",
              "user_created"),
+            # See the identical "share_apply_confirmed" step above - same
+            # toast-based confirmation, same reasoning for widget=None.
             (lambda: gui.root, None,
-             "Confirmation", "Click OK to confirm.",
+             "Confirmation", "A confirmation toast appears in the corner - dismiss it (✕) or wait for "
+             "it to disappear.",
              "user_apply_confirmed"),
             # Same toggle button as the "Manage Users" step above - closing
             # the panel is just clicking it again now, not a native
@@ -759,36 +760,42 @@ class GuiTour:
             # every time a share row (not a user row) is selected.
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[0],
              "New User",
-             "Click to open a New User dialog. Adding a user this way also attaches the user "
-             "to the share.",
+             "Click to open the New User dialog.",
              "user_dialog_opened"),
             (lambda: self._active_window, lambda: _PointAtOnly(self._active_window.cancel_button),
-             "Cancel", "You already made one, so close this box with the Cancel button.",
+             "New User",
+             "Users added this way are automatically attached to the selected share. "
+             "Press the Cancel button.",
              "user_dialog_cancelled"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[1],
              "Attach User",
-             "Press Attach User. A dropdown appears listing every user, including ones not "
-             "created by NASsie, which are labeled for convenience. Please select the user "
-             "that you created in the previous steps.",
+             "Press Attach User.",
+             "attach_dropdown_opened"),
+            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[0],
+             "Attach User",
+             "This dropdown shows all available users to attach to the selected share, "
+             "including ones not made by NASsie (indicated by \"existing account\"). Select "
+             "the user that you just created.",
              "user_attached"),
             # No widget (None) - same reasoning as the other
-            # "Confirmation" steps: this is the plain Tcl tk_messageBox
-            # after a successful attach, no Python widget handle to
-            # attach a highlight to. There's no separate password step
-            # here - the account just created via "New User" already got
-            # its Samba password at creation time (see
-            # GUIWizard._commit_inline_attach()'s comment), so attaching
-            # it to this first share never actually prompts for one.
-            # Has to sit right here, immediately after "Attach User", not
-            # further down the list with the rest of the share-row
+            # "Confirmation" steps: this is a toast (see
+            # GUIWizard._show_toast()) floating in root's own corner,
+            # nothing meaningful for place_near() to point at. There's no
+            # separate password step here - the account just created via
+            # "New User" already got its Samba password at creation time
+            # (see GUIWizard._commit_inline_attach()'s comment), so
+            # attaching it to this first share never actually prompts for
+            # one. Has to sit right here, immediately after "Attach User",
+            # not further down the list with the rest of the share-row
             # buttons - GUIWizard._grant_access_done() fires
-            # "attach_apply_confirmed" the moment this dialog's OK is
-            # clicked, and on_event() only reacts to whichever step is
-            # current at that instant; any step in between would eat
-            # "user_attached" and leave this one waiting on an event that
-            # already came and went.
+            # "attach_apply_confirmed" from the toast's own on_close (see
+            # _Toast's docstring), and on_event() only reacts to whichever
+            # step is current at that instant; any step in between would
+            # eat "user_attached" and leave this one waiting on an event
+            # that already came and went.
             (lambda: gui.root, None,
-             "Confirmation", "Click OK to confirm.",
+             "Confirmation", "A confirmation toast appears in the corner - dismiss it (✕) or wait for "
+             "it to disappear.",
              "attach_apply_confirmed"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
              "Delete Share",
@@ -821,8 +828,8 @@ class GuiTour:
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
              "Detach",
              lambda: (
-                 f"This removes {gui._selected_share_and_user()[1]} access to "
-                 f"{gui._selected_share_and_user()[0]}. Skipped here during tour."
+                 f"This removes {gui._selected_share_and_user()[1]}'s access to "
+                 f"{gui._selected_share_and_user()[0]}. Click Detach to view the action."
              ),
              "user_detach_dialog_opened"),
             # No widget (None) - same reasoning as the other
@@ -904,7 +911,7 @@ class GuiTour:
             # _PointAtOnly ones (a real widget IS highlighted above, but
             # place_near() can't be trusted for it - see the class's own
             # docstring) land here.
-            half_height = _dialog_half_height_for(wait_event)
+            half_height = _DIALOG_HALF_HEIGHT
             self._callout.place_outside_container(container, half_height)
             # One extra self-correction shortly after - confirmed live
             # (intermittently, timing-dependent - a race, not a one-off)
@@ -965,9 +972,7 @@ class GuiTour:
                 if highlight_target is not None and not point_at_only:
                     self._callout.place_near(highlight_target)
                 else:
-                    self._callout.place_outside_container(
-                        container, _dialog_half_height_for(self._wait_event)
-                    )
+                    self._callout.place_outside_container(container, _DIALOG_HALF_HEIGHT)
             except tk.TclError:
                 pass
 
