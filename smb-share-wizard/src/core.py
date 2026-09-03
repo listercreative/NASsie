@@ -1259,33 +1259,61 @@ class SMBWizard:
     @staticmethod
     def delete_tour_marker_windows():
         # Split out from prompt_uninstall_folders_windows() (which also
-        # deletes this marker - see its own comment) after a real,
-        # verbose-logged uninstall showed that function's tk.Tk() call
-        # failing outright under this specific execution context (an
-        # IMMEDIATE custom action, elevated via UAC, deep inside
-        # msiexec.exe's own process tree) with MSI error 1721 - "a
-        # program required for this install to complete could not be
-        # run". Confirmed via that same log that invoking NASsie.exe from
-        # a custom action in general is NOT the problem:
-        # uninstall_cleanup_windows() (headless, no GUI) ran the very
-        # next action and succeeded cleanly. The failure is specific to
-        # creating a real Tk window there - plausibly a hard, non-
-        # Python-catchable failure at the Tcl/Tk C level (no window
-        # station/display access in that context) rather than something
-        # try/except around tk.Tk() could ever have caught, which is why
-        # prompt_uninstall_folders_windows()'s own broad try/except
-        # didn't save it. This method is deliberately kept 100% headless
-        # - no tkinter import, nothing that could hang or crash the
-        # interpreter the way that one apparently can - so it can't be
-        # taken down by that same failure mode. Still an IMMEDIATE (not
-        # deferred) action - see prompt_uninstall_folders_windows()'s own
-        # comment on why that's what makes %APPDATA% resolve to the real
-        # interactive user rather than SYSTEM's own profile.
+        # deletes this marker - see its own comment) after real, verbose-
+        # logged uninstalls chased this failure through THREE different
+        # configurations before finding one that actually works:
+        #
+        # 1. Inside prompt_uninstall_folders_windows() itself (immediate,
+        #    impersonated, launches a tk.Tk() window) - failed with MSI
+        #    error 1721 ("a program required for this install to
+        #    complete could not be run").
+        # 2. Split into this method, kept immediate + impersonated, but
+        #    made fully headless (no tkinter at all) - STILL failed with
+        #    the identical 1721, which disproved the working theory at
+        #    the time (that tk.Tk() itself was the problem - there was no
+        #    GUI code left here for that to explain).
+        # 3. Switched to Execute="deferred" while staying impersonated
+        #    (Impersonate left at its default "yes") - the deferred
+        #    *scheduling* step succeeded this time, but the actual
+        #    deferred *execution* later in the install script still
+        #    failed with the same 1721 (confirmed via the compiled action
+        #    type in the log, ActionType=1106 - deferred + impersonated +
+        #    exe-from-file, exactly as configured, so this wasn't a
+        #    scheduling mistake either).
+        #
+        # Across all three attempts, the ONE configuration that has ever
+        # actually worked in any of these logs is
+        # uninstall_cleanup_windows()'s: Execute="deferred" AND
+        # Impersonate="no" - i.e. running as SYSTEM, not impersonating
+        # the calling user at all. This points at a real, documented
+        # Windows Installer/UAC "split-token" limitation: an impersonated
+        # custom action - immediate OR deferred - can fail outright just
+        # launching a new process under this kind of elevated execution
+        # path, independent of what that process would go on to do.
+        # Impersonation itself is what's broken here, not the scheduling
+        # mode.
+        #
+        # So this method now matches nassie.wxs's Impersonate="no" too -
+        # meaning it runs as SYSTEM, and %APPDATA%/os.path.expanduser("~")
+        # would resolve to SYSTEM's OWN profile, not the real interactive
+        # user's, if it used tour._first_run_marker_path() directly the
+        # way every earlier attempt did. Instead of trying to identify
+        # exactly which of possibly several C:\Users\* profiles is "the"
+        # real one (fragile, and unnecessary - this is a single-user
+        # marker file, not sensitive data), it just clears tour_seen from
+        # every real user profile on the machine. Harmless no-ops for any
+        # profile that never ran NASsie.
+        users_root = os.path.join(os.environ.get("SystemDrive", "C:") + "\\", "Users")
         try:
-            import tour
-            os.remove(tour._first_run_marker_path())
-        except Exception:
-            pass
+            profile_names = os.listdir(users_root)
+        except OSError:
+            return
+        for name in profile_names:
+            marker = os.path.join(users_root, name, "AppData", "Roaming", "NASsie", "tour_seen")
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
 
     @staticmethod
     def prompt_uninstall_folders_windows():
