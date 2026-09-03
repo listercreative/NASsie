@@ -359,6 +359,21 @@ class _Callout(tk.Toplevel):
         # behaves the same on both platforms.
         self.attributes("-topmost", True)
         self.configure(bg=_HIGHLIGHT_COLOR, padx=2, pady=2)
+        # A one-off "-topmost" only guarantees this stays above every
+        # NON-topmost window - among the (several) OTHER windows in this
+        # app that are ALSO topmost (every dialog, via
+        # _bring_window_to_front() - and gui.py's own _Toast), stacking
+        # order between topmost windows still just follows whichever one
+        # was raised MOST RECENTLY. A fresh dialog or toast opened while
+        # a tour step is showing would win that and bury the callout
+        # underneath it - reported live ("Skip Tour... gets covered by
+        # other popups"). Re-lifting this on a recurring timer (see
+        # _relift() below) reclaims the front shortly after, rather than
+        # trying to hook every single place in gui.py that raises a
+        # window.
+        self._relift_job = None
+        self.bind("<Destroy>", self._cancel_relift, add="+")
+        self._relift()
 
         inner = tk.Frame(self, bg=_CALLOUT_BG)
         inner.pack(fill="both", expand=True)
@@ -379,6 +394,41 @@ class _Callout(tk.Toplevel):
         btn_row.pack(fill="x", padx=10, pady=(0, 10))
 
         ttk.Button(btn_row, text=skip_label, command=on_skip).pack(side="right")
+
+    def _relift(self):
+        try:
+            self.lift()
+        except tk.TclError:
+            # Already destroyed - _cancel_relift() should have stopped
+            # this loop already, but a pending after() callback can still
+            # be in flight the instant destroy() runs.
+            return
+        self._relift_job = self.after(500, self._relift)
+
+    def pause_relift(self):
+        # For the ONE case this recurring lift() actively fights instead
+        # of helps: the Skip Tour confirmation (see GuiTour._confirm_and_
+        # stop()) is a modal messagebox spawned by a button ON this very
+        # callout - Tk still services other after() callbacks during a
+        # modal tk_messageBox's own nested event loop, so left running,
+        # this timer kept winning the stacking race against a dialog IT
+        # ITSELF triggered, burying the confirmation the user just opened
+        # underneath the callout that opened it (reported live). Callers
+        # must pair this with resume_relift() once the modal call
+        # returns.
+        self._cancel_relift()
+
+    def resume_relift(self):
+        if self._relift_job is None:
+            self._relift()
+
+    def _cancel_relift(self, event=None):
+        if self._relift_job is not None:
+            try:
+                self.after_cancel(self._relift_job)
+            except tk.TclError:
+                pass
+            self._relift_job = None
 
     def set_text(self, text):
         self.text_label.configure(text=text)
@@ -1113,9 +1163,16 @@ class GuiTour:
         # restack, the same fix already relied on everywhere else in
         # this file for the identical multi-window race.
         _bring_to_front(self.root)
-        if messagebox.askyesno(
+        # See _Callout.pause_relift()'s own docstring for why this has to
+        # stop competing with the very dialog it's about to open.
+        if self._callout is not None:
+            self._callout.pause_relift()
+        answer = messagebox.askyesno(
             "Skip Tour", "Skip the rest of the guided tour?", parent=self.root,
-        ):
+        )
+        if self._callout is not None:
+            self._callout.resume_relift()
+        if answer:
             self.stop()
 
     def stop(self, completed=True):
