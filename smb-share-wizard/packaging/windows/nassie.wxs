@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
   <Package Name="NASsie"
            Manufacturer="Lister Creative Enterprise LLC"
@@ -47,6 +47,48 @@
                           Type="integer"
                           Value="1"
                           KeyPath="yes" />
+          <!-- %APPDATA%\NASsie holds tour.py's own "has the guided tour
+               been seen before" marker (tour_seen) - per-user profile
+               data, entirely outside INSTALLFOLDER, that nothing else in
+               this file's Directory/Component tree ever touches. Left
+               behind across an uninstall, a later reinstall on the same
+               machine found that stale marker and offered to "Resume"
+               a tour instead of just starting fresh - wrong for what is,
+               from that reinstall's own perspective, a brand new install.
+               core.py's prompt_uninstall_folders_windows() also deletes
+               this marker directly (see its own comment) as the primary
+               fix, correctly resolving the real interactive user's
+               %APPDATA% rather than guessing - but that's an immediate
+               custom action, and this project's own prior testing found
+               Settings > Apps > Uninstall (confirmed by testing) runs the
+               whole uninstall silently, where an immediate custom action
+               often can't even run at all (see uninstall_cleanup_windows()'s
+               docstring). This RemoveFolderEx is the belt to that belt-
+               and-suspenders: an MSI-native removal the installer engine
+               itself performs, tied to this same per-user (HKCU-keyed)
+               Component so it only ever fires for a genuine uninstall of
+               this component, not a repair/upgrade - and unlike the
+               custom action, it doesn't depend on any of our own code
+               actually getting to run. AppDataFolder is a standard MSI
+               directory property (CSIDL_APPDATA) the engine resolves
+               fresh for whichever user context is running THIS
+               transaction, so NASsieAppDataDir below re-evaluates
+               correctly at uninstall time too, not just at install. -->
+          <!-- Condition matches InstallExecuteSequence's own two Custom
+               Action guards below exactly, and for the same reason: On=
+               "uninstall" alone isn't enough to mean "only a genuine
+               standalone uninstall" - a MajorUpgrade's own removal of the
+               OLD product version (RemoveExistingProducts) is ALSO an
+               "uninstall" as far as component-removal scheduling is
+               concerned. Without this, every ordinary future update
+               would wipe %APPDATA%\NASsie the moment the old version's
+               components get removed as part of installing the new one -
+               which for tour_seen specifically would be a strictly worse
+               regression than the stale-marker bug this exists to fix:
+               EVERY user, on EVERY update, would have their tour state
+               reset and see it auto-start again from step one. -->
+          <util:RemoveFolderEx On="uninstall" Property="NASsieAppDataDir"
+                                Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
         </Component>
       </Directory>
     </StandardDirectory>
@@ -119,6 +161,16 @@
     <WixVariable Id="WixUIBannerBmp" Value="banner.bmp" />
     <WixVariable Id="WixUIDialogBmp" Value="dialog.bmp" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <!-- Feeds ApplicationShortcut's util:RemoveFolderEx (see its own
+         comment) - AppDataFolder is a standard MSI directory property
+         (CSIDL_APPDATA), always available with no AppSearch/RegistrySearch
+         needed (unlike a real installer-defined directory such as
+         INSTALLFOLDER), and re-resolved fresh by the engine for whichever
+         user context runs the CURRENT transaction - install or uninstall
+         alike - so this correctly points at the actual uninstalling
+         user's %APPDATA%, not a value frozen from install time. -->
+    <Property Id="NASsieAppDataDir" Value="[AppDataFolder]NASsie" />
 
     <!-- NOT "<ui:WixUI Id="WixUI_InstallDir" />" (the normal shortcut for
          this dialog set) - see the WixUI_NASsieInstallDir Fragment at the
