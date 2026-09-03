@@ -129,6 +129,38 @@
                   ExeCommand="--uninstall-folder-prompt"
                   Return="ignore" />
 
+    <!-- Deletes tour.py's own "guided tour already seen" marker
+         (%APPDATA%\NASsie\tour_seen) so a later reinstall on this
+         machine starts the tour fresh instead of offering to resume one.
+         Deliberately its OWN action, separate from
+         NASsiePromptUninstallFolders above, even though both are
+         immediate/interactive-session actions for the identical reason
+         (resolving the real user's %APPDATA%, not SYSTEM's - see
+         NASsieUninstallCleanup's own comment): a real, verbose-logged
+         uninstall showed NASsiePromptUninstallFolders's tk.Tk() call
+         failing outright (MSI error 1721, "a program required for this
+         install to complete could not be run") under whatever this
+         execution context actually is, while a headless action - no
+         tkinter, no window - invoked the very same exe right after it
+         and succeeded cleanly. This action is kept 100% headless for
+         exactly that reason, so it can't be taken down by the same
+         failure. (A WiX-native util:RemoveFolderEx targeting this same
+         folder was tried first, as a belt-and-suspenders MSI-native
+         alternative that wouldn't depend on our own exe running at all -
+         see ApplicationShortcut's own comment on why that's still left
+         in place despite this: on THIS test machine specifically it
+         turned out %APPDATA%\NASsie is itself a reparse point/junction,
+         and RemoveFolderEx's own shipped CA hard-codes a refusal to
+         recurse into any reparse point as a safety measure, with no
+         attribute to override it - confirmed via the same verbose log,
+         "Path is a junction; skipping". This action doesn't have that
+         limitation; os.remove() on a single file resolves through a
+         junction the normal way.) -->
+    <CustomAction Id="NASsieDeleteTourMarker"
+                  FileRef="NASsieExe"
+                  ExeCommand="--uninstall-delete-tour-marker"
+                  Return="ignore" />
+
     <!-- "Add desktop shortcut" checkbox on the final install page (see
          NASsieExitDialog below). Plain ExeCommand rather than
          WixShellExec (used for LaunchApplication below) because
@@ -148,6 +180,7 @@
                   Return="ignore" />
 
     <InstallExecuteSequence>
+      <Custom Action="NASsieDeleteTourMarker" Before="NASsiePromptUninstallFolders" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
       <Custom Action="NASsiePromptUninstallFolders" Before="NASsieUninstallCleanup" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
       <Custom Action="NASsieUninstallCleanup" Before="RemoveFiles" Condition='REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE' />
     </InstallExecuteSequence>
