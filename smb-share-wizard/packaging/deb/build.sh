@@ -12,7 +12,7 @@ SRC="$PROJECT_ROOT/src"
 PKG="$SCRIPT_DIR/nassie"
 PKGLIB="$PKG/usr/lib/nassie"
 
-cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/window_corners.py" "$SRC/linux_titlebar.py" "$SRC/nassie_icon.png" "$PKGLIB/"
+cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/window_corners.py" "$SRC/nassie_icon.png" "$PKGLIB/"
 cp "$PROJECT_ROOT/assets/nassie_icon.png" "$PKG/usr/share/pixmaps/nassie.png"
 
 # nassie_ttk/ is a real package (theme/*.tcl, theme/*.png, sv.tcl,

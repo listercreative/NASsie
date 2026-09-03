@@ -55,11 +55,19 @@ for s in w.list_shares():
     if _group_exists(expected_group):
         shares.append(dict(s, group=expected_group))
 
-# Every NASsie-owned share's ownership group - captured before
-# delete_share() below removes the share, since list_groups() never
-# surfaces these (only the admin-created nassiegrp_* access-control
-# groups are - see _MANAGED_GROUP_PREFIX's comment in core.py).
-ownership_groups = {s['group'] for s in shares}
+# Every share's own ownership group - list_groups() never surfaces
+# these (only the admin-created nassiegrp_* access-control groups are -
+# see _MANAGED_GROUP_PREFIX's comment in core.py) - but only for shares
+# actually removed below, not every share found above: with the "Remove
+# these shares from Samba?" question now answerable "N" (see below), a
+# share left in place has to keep its own ownership group too, or its
+# folder's group ownership would point at a group that no longer exists.
+ownership_groups = set()
+# True unless the admin is explicitly asked below and says no - stays
+# True when there's nothing to ask about (shares is empty), matching the
+# account/group cleanup section's own "runs even if there were no shares"
+# behavior below.
+remove_shares = True
 
 if shares:
     print()
@@ -67,47 +75,68 @@ if shares:
     for s in shares:
         print(f"  {s['name']} -> {s['path']}")
     print()
-    answer = input("Delete these folders and everything in them too? This cannot be undone. [y/N] ").strip().lower()
-    delete_folders = answer in ('y', 'yes')
-    # delete_share() removes the [share] block from smb.conf and restarts
-    # Samba, not just the on-disk folder - apt itself has no idea these
-    # entries exist (they live in Samba's own config, not any package
-    # file), so nothing else would ever remove them. Same tested code
-    # path the in-app "Delete Share" action uses, rather than duplicating
-    # smb.conf-editing/rmtree logic here.
-    for s in shares:
-        ok = w.delete_share(s['name'], delete_folder=delete_folders)
-        if ok:
-            print(f"Removed share '{s['name']}' from Samba" + (" and deleted its folder." if delete_folders else "."))
-        else:
-            print(f"Failed to remove share '{s['name']}' from Samba.")
+    # Two separate questions, not one combined prompt - matches the
+    # in-app "Delete Share" action's own two-step confirm (gui.py's
+    # _delete_selected_share(): "Remove share?" then, only if yes,
+    # "Delete folder too?"). A single "delete these folders too?" prompt
+    # read as asking about the folders alone while silently also removing
+    # the [share] block from smb.conf either way - saying "N" there still
+    # deleted the share, just left the data behind, which isn't what "N"
+    # reads as.
+    remove_answer = input("Remove these shares from Samba? [y/N] ").strip().lower()
+    remove_shares = remove_answer in ('y', 'yes')
+    if remove_shares:
+        delete_answer = input(
+            "Also permanently delete their folders and everything in them? This cannot be undone. [y/N] "
+        ).strip().lower()
+        delete_folders = delete_answer in ('y', 'yes')
+        # delete_share() removes the [share] block from smb.conf and
+        # restarts Samba, not just the on-disk folder - apt itself has no
+        # idea these entries exist (they live in Samba's own config, not
+        # any package file), so nothing else would ever remove them. Same
+        # tested code path the in-app "Delete Share" action uses, rather
+        # than duplicating smb.conf-editing/rmtree logic here.
+        for s in shares:
+            ok = w.delete_share(s['name'], delete_folder=delete_folders)
+            if ok:
+                ownership_groups.add(s['group'])
+                print(f"Removed share '{s['name']}' from Samba" + (" and deleted its folder." if delete_folders else "."))
+            else:
+                print(f"Failed to remove share '{s['name']}' from Samba.")
 
 # Groups/accounts live outside the package entirely too (local group/
 # passwd database, not any package file) - nothing else would ever clean
-# these up either. Unconditional, no confirmation, mirroring Windows'
-# uninstall_cleanup_windows(): every NASsie-owned group (ownership groups
-# for the shares just removed, plus every admin-created nassiegrp_*
-# access-control group from "New Group", used or not) and every account
-# NASsie itself created for sharing. Runs even if there were no shares
-# above - an access-control group can exist unassigned to any share.
-access_groups = {g['name'] for g in w.list_groups()}
-all_groups = ownership_groups | access_groups
+# these up either. No separate confirmation of its own, mirroring
+# Windows' uninstall_cleanup_windows(): every NASsie-owned group
+# (ownership groups for the shares just removed, plus every admin-created
+# nassiegrp_* access-control group from "New Group", used or not) and
+# every account NASsie itself created for sharing. Runs even if there
+# were no shares above - an access-control group can exist unassigned to
+# any share. Skipped entirely when the admin said "no" to removing
+# EXISTING shares above, though (remove_shares is only ever False in that
+# one case - see its own comment) - those accounts/access-control groups
+# are still backing the share(s) just deliberately left in place, not
+# leftover cruft.
+if remove_shares:
+    access_groups = {g['name'] for g in w.list_groups()}
+    all_groups = ownership_groups | access_groups
 
-# Every account NASsie itself created (list_users()'s "managed" field -
-# _configure_linux_user only sets the nologin shell this is keyed on when
-# the account didn't already exist) - checked directly against every
-# local account, not derived from group membership, so this can't sweep
-# up a pre-existing account someone was merely granted share access to
-# (never "managed", no matter what group it's in) and can't miss a
-# NASsie-created account that isn't currently in any group (e.g. made via
-# "Create User" but never assigned to a share). Mirrors uninstall_
-# cleanup_windows()'s Description-marker check on Windows.
-for u in w.list_users():
-    if u.get('managed') and w.delete_user(u['username']):
-        print(f"Deleted account '{u['username']}'.")
+    # Every account NASsie itself created (list_users()'s "managed" field
+    # - _configure_linux_user only sets the nologin shell this is keyed
+    # on when the account didn't already exist) - checked directly
+    # against every local account, not derived from group membership, so
+    # this can't sweep up a pre-existing account someone was merely
+    # granted share access to (never "managed", no matter what group
+    # it's in) and can't miss a NASsie-created account that isn't
+    # currently in any group (e.g. made via "Create User" but never
+    # assigned to a share). Mirrors uninstall_cleanup_windows()'s
+    # Description-marker check on Windows.
+    for u in w.list_users():
+        if u.get('managed') and w.delete_user(u['username']):
+            print(f"Deleted account '{u['username']}'.")
 
-for name in sorted(all_groups):
-    w.delete_group(name)
+    for name in sorted(all_groups):
+        w.delete_group(name)
 
 # The first-run tour marker lives outside the package too (~/.config/
 # nassie, or root's/the real sudo user's equivalent - see

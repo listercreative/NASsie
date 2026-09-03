@@ -17,7 +17,6 @@ from core import (
 from tour import GuiTour, tour_state, mark_tour_completed
 import nassie_ttk
 import window_corners
-import linux_titlebar
 
 
 def _patch_messagebox_front(messagebox_module, simpledialog_module):
@@ -175,6 +174,93 @@ class _Tooltip:
             except tk.TclError:
                 pass
             self.tip = None
+
+
+class _Toast(tk.Toplevel):
+    """A transient, non-modal "it worked" notice (share/user created,
+    attached, detached, deleted, removed - see GUIWizard._show_toast()).
+    These used to be tk.messagebox.showinfo() popups - modal, so each one
+    stopped the whole app cold just to acknowledge something that had
+    already finished succeeding. This floats in the parent window's own
+    bottom-right corner instead, never grabs focus or a modal grab, and
+    dismisses itself on its own after _TIMEOUT_MS - the ✕ (or just
+    waiting) are the only two ways to close it, since there's no decision
+    left for a real OK button to make.
+
+    on_close (if given) fires exactly once, whichever of those two paths
+    actually closes it - GUIWizard uses this to still gate the tour's own
+    "Confirmation" steps on the user actually acknowledging (or outlasting)
+    the toast, same as the blocking messagebox used to."""
+    _TIMEOUT_MS = 4000
+    _WIDTH = 280
+
+    def __init__(self, parent, title, text, on_close=None):
+        super().__init__(parent)
+        self.parent = parent
+        self._on_close = on_close
+        self._dismissed = False
+        # Withdrawn immediately - same reasoning as _Tooltip/_Callout: Tk
+        # maps a Toplevel the instant it exists, before its own content
+        # below is ever packed/measured, which would otherwise flash one
+        # frame at the wrong size before _place() ever runs.
+        self.withdraw()
+        self.overrideredirect(True)
+        # Pinned above every window on the desktop, not just NASsie's own -
+        # same tradeoff _Callout's own identical attribute makes (see its
+        # docstring): a toast that could end up buried behind whatever's
+        # in front the instant it appears would go entirely unseen.
+        self.attributes("-topmost", True)
+        self.configure(bg="#0e92ab", padx=1, pady=1)
+
+        inner = tk.Frame(self, bg=_ADD_ROW_BG)
+        inner.pack(fill="both", expand=True)
+
+        header = tk.Frame(inner, bg=_ADD_ROW_BG)
+        header.pack(fill="x", padx=(10, 6), pady=(8, 0))
+        if title:
+            ttk.Label(
+                header, text=title, font=("TkDefaultFont", 10, "bold"), background=_ADD_ROW_BG,
+            ).pack(side="left")
+        close = tk.Label(
+            header, text="✕", bg=_ADD_ROW_BG, fg="#555555", font=("TkDefaultFont", 9), cursor="hand2",
+        )
+        close.pack(side="right")
+        close.bind("<Button-1>", self._dismiss)
+
+        ttk.Label(
+            inner, text=text, background=_ADD_ROW_BG, wraplength=self._WIDTH, justify="left",
+        ).pack(anchor="w", padx=10, pady=(2, 10))
+
+        self.update_idletasks()
+        self._place()
+        self.deiconify()
+        self._timer = self.after(self._TIMEOUT_MS, self._dismiss)
+
+    def _place(self):
+        # Bottom-right corner of the parent window, not the screen -
+        # matches _Tooltip/_Callout's own "positioned relative to the
+        # thing it's about" convention rather than always landing in the
+        # same physical screen corner regardless of where NASsie itself
+        # is.
+        margin = 16
+        x = self.parent.winfo_rootx() + self.parent.winfo_width() - self.winfo_reqwidth() - margin
+        y = self.parent.winfo_rooty() + self.parent.winfo_height() - self.winfo_reqheight() - margin
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _dismiss(self, event=None):
+        if self._dismissed:
+            return
+        self._dismissed = True
+        try:
+            self.after_cancel(self._timer)
+        except (ValueError, tk.TclError):
+            pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        if self._on_close:
+            self._on_close()
 
 
 def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs):
@@ -356,6 +442,39 @@ class _SortableTree:
         item_id = self.pinned_first()
         if item_id and self.tree.exists(item_id):
             self.tree.move(item_id, "", 0)
+        self._restripe(item_id)
+
+    def _restripe(self, pinned_id):
+        # Alternates every data row - not just top-level ones, an expanded
+        # share's own user rows too (see shares_list's own nesting in
+        # _populate_shares_list()) - between the Treeview's own default
+        # background and the same light teal the pinned add-row uses
+        # ("stripe_row" tag, configured by the caller with
+        # background=_ADD_ROW_BG). One continuous count straight down the
+        # visible order, parents and children alike, not a count that
+        # resets inside each share's own children - starting with the
+        # DEFAULT background for the first data row, not teal, since the
+        # add-row directly above it already used teal - two teal rows back
+        # to back wouldn't read as alternating at all. Based on
+        # get_children()'s CURRENT (post-move/post-sort) order, not
+        # insertion order, so the stripe pattern stays correct after a
+        # column-heading sort reorders everything, not just on first load.
+        # Assigned once here regardless of whether a share is currently
+        # expanded or not - expand/collapse is a pure visibility toggle in
+        # ttk.Treeview, it doesn't change which rows exist, so a child row
+        # already carries the right tag the moment it's revealed rather
+        # than needing its own recompute on every <<TreeviewOpen>>.
+        self._restripe_index = 0
+        for item in self.tree.get_children(""):
+            if item == pinned_id:
+                continue
+            self._restripe_walk(item)
+
+    def _restripe_walk(self, item):
+        self.tree.item(item, tags=("stripe_row",) if self._restripe_index % 2 == 1 else ())
+        self._restripe_index += 1
+        for child in self.tree.get_children(item):
+            self._restripe_walk(child)
 
 
 # Matches tour.py's own _CALLOUT_BG - same light teal tint the tour's own
@@ -363,29 +482,111 @@ class _SortableTree:
 # other "here's something to notice" surfaces.
 _ADD_ROW_BG = "#eaf6f8"
 
-# The visual gap _pack_users_panel()/_pack_log_panel() pack between a
-# side panel and the shares list (padx=(0, _PANEL_GUTTER)/(​_PANEL_GUTTER, 0)) - shared
-# with GUIWizard.__init__'s own panel-width measurement so the two can
-# never drift apart. They have to agree exactly: _animate_root_width() grows
-# the window by the measured width to keep everything already on screen
-# in place (see its own docstring), and if that measurement silently
-# left the gutter out, the window would grow a few pixels short and the
-# shares list would visibly creep instead of staying put (confirmed
-# live - the whole point of this constant).
+# The visual gap between a side panel and the shares list - pack()'s
+# padx for the Users panel (_pack_users_panel()), place()'s own width
+# math for the Log panel (_place_log_steady()/_place_log_glide()) -
+# shared with GUIWizard.__init__'s own panel-width measurement so the
+# two can never drift apart. They have to agree exactly:
+# _animate_root_width() grows the window by the measured width to keep
+# everything already on screen in place (see its own docstring), and if
+# that measurement silently left the gutter out, the window would grow
+# a few pixels short and the shares list would visibly creep instead of
+# staying put (confirmed live - the whole point of this constant).
 _PANEL_GUTTER = 8
 
 
+class _AddRowFeedback:
+    """Hover + click feedback for a Treeview's pinned "add row" (New Share
+    / New User - see _SortableTree's pinned_first). It's a real button in
+    disguise, but a bare Treeview row gives none of a button's usual
+    affordances on its own: no cursor change on hover, and no visible
+    click response either, since nassie_ttk's Treeview -background
+    selected style (see light.tcl/dark.tcl) happens to be this exact same
+    teal (_ADD_ROW_BG) - selecting the row doesn't change how it looks at
+    all. Drives the "add_row" tag's own background through three states
+    (idle/hover/pressed) instead, and swaps the cursor to hand2 while
+    hovering it, matching every other clickable control in the app.
+
+    row_id_fn() must return the CURRENT add-row's item id - it's deleted
+    and reinserted from scratch on every refresh (see
+    _add_share_row_id/_add_user_row_id), so this can't just cache it
+    once up front."""
+    _HOVER_BG = "#d7eef2"
+    _PRESSED_BG = "#c2e6ec"
+
+    def __init__(self, tree, row_id_fn):
+        self.tree = tree
+        self.row_id_fn = row_id_fn
+        self._hovering = False
+        # anchor="center" - the add-row's own text is now just the "➕"
+        # glyph (the "New Share"/"New User" label next to it was dropped),
+        # and a single glyph left at the tree column's default "w" anchor
+        # sat flush against the left edge/indent instead of reading as a
+        # centered action icon. Set on this tag only, not tree.column("#0",
+        # anchor=...) - that would re-center every OTHER row's own text
+        # too (share names, usernames), which is real left-to-right data,
+        # not a lone centered icon.
+        tree.tag_configure("add_row", background=_ADD_ROW_BG, foreground="#0e92ab", anchor="center")
+        tree.bind("<Motion>", self._on_motion, add="+")
+        tree.bind("<Leave>", self._on_leave, add="+")
+        # Bound directly on the tree (its instance bindtag), not just
+        # relying on <<TreeviewSelect>> - instance bindings run BEFORE
+        # the built-in class bindings that ttk::Treeview's own click-to-
+        # select behavior lives on (default Tk bindtag order is
+        # (widget, class, toplevel, all)), so the pressed color is
+        # already on screen by the time selection changes and the
+        # caller's own <<TreeviewSelect>> handler opens the dialog.
+        tree.bind("<ButtonPress-1>", self._on_press, add="+")
+
+    def _row_under(self, event):
+        row_id = self.row_id_fn()
+        return row_id if row_id and self.tree.identify_row(event.y) == row_id else None
+
+    def _on_motion(self, event):
+        over = self._row_under(event) is not None
+        if over == self._hovering:
+            return
+        self._hovering = over
+        self.tree.configure(cursor="hand2" if over else "")
+        self.tree.tag_configure("add_row", background=self._HOVER_BG if over else _ADD_ROW_BG)
+
+    def _on_leave(self, event=None):
+        if not self._hovering:
+            return
+        self._hovering = False
+        self.tree.configure(cursor="")
+        self.tree.tag_configure("add_row", background=_ADD_ROW_BG)
+
+    def _on_press(self, event):
+        if self._row_under(event) is not None:
+            self.tree.tag_configure("add_row", background=self._PRESSED_BG)
+            self.tree.update_idletasks()
+
+    def reset(self):
+        # Called at the top of every refresh(), right before the add-row
+        # is deleted and reinserted - the "add_row" tag's colors persist
+        # on the Treeview across refreshes (tag_configure only runs once,
+        # here), so a press/hover shade left over from the click that
+        # triggered this very refresh would otherwise carry straight into
+        # the freshly rebuilt row instead of starting idle.
+        self._hovering = False
+        self.tree.configure(cursor="")
+        self.tree.tag_configure("add_row", background=_ADD_ROW_BG)
+
+
 class _ToggleButton:
-    """A toolbar icon button that stays visually "pressed" (a solid teal
-    fill, matching the app's own highlight color - see tour.py's own
-    _HIGHLIGHT_COLOR) for as long as its panel is open, instead of the
-    momentary press-then-release look a plain button gives - see
+    """A toolbar icon button that stays visually "pressed" (a solid fill)
+    for as long as its panel is open, instead of the momentary
+    press-then-release look a plain button gives - see
     GUIWizard._toggle_users_panel()/_toggle_log_panel(). Plain tk.Label-
     based rather than a ttk style, for the same reason _icon_button
-    (shadow=True)/linux_titlebar.py's own titlebar buttons are:
-    nassie_ttk's buttons are image-rendered, so a ttk style swap has no
-    guaranteed visible effect to build a reliable toggle look on."""
-    _PRESSED_BG = "#0e92ab"
+    (shadow=True) is: nassie_ttk's buttons are image-rendered, so a ttk
+    style swap has no guaranteed visible effect to build a reliable
+    toggle look on."""
+    # A dark blue-grey, not the app's own teal accent (used for the
+    # add-row/stripe_row tint elsewhere) - reported live as reading too
+    # close to the Users button's own 👤 icon color when pressed.
+    _PRESSED_BG = "#37474f"
     _SIZE = 34
 
     def __init__(self, parent, icon, tooltip, command, idle_bg):
@@ -398,7 +599,18 @@ class _ToggleButton:
         # this frame at exactly _SIZE regardless of what its child needs,
         # and the Label fills it completely, so both buttons end up
         # pixel-identical no matter which glyph is inside.
-        self.frame = tk.Frame(parent, width=self._SIZE, height=self._SIZE, bg=idle_bg)
+        # borderwidth+relief give this an actual raised/sunken 3D edge,
+        # not just a flat color swap - a color shade alone doesn't read
+        # as "pressed" (reported live: "just looks like it's shaded a
+        # different color"). raised (idle) vs sunken (pressed) is the
+        # standard Tk button look; relief is drawn in the frame's OWN
+        # border region, outside where the label (packed fill=both,
+        # expand=True, i.e. confined to the frame's interior) ever
+        # paints, so it stays visible under the label with no extra
+        # padding needed.
+        self.frame = tk.Frame(
+            parent, width=self._SIZE, height=self._SIZE, bg=idle_bg, relief="raised", borderwidth=1,
+        )
         self.frame.pack_propagate(False)
         self.label = tk.Label(
             self.frame, text=icon, font=("TkDefaultFont", 12), bg=idle_bg, fg="#333333", cursor="hand2",
@@ -415,7 +627,7 @@ class _ToggleButton:
         self.pressed = pressed
         bg = self._PRESSED_BG if pressed else self.idle_bg
         fg = "white" if pressed else "#333333"
-        self.frame.configure(bg=bg)
+        self.frame.configure(bg=bg, relief="sunken" if pressed else "raised")
         self.label.configure(bg=bg, fg=fg)
 
 
@@ -430,15 +642,6 @@ class AddUserDialog(tk.Toplevel):
     pick a name from a list was more than that one choice needed anyway."""
     def __init__(self, parent, existing_usernames=(), show_access_level=True, app=None):
         super().__init__(parent)
-        if platform.system() == "Linux":
-            # Withdrawn immediately, before anything below ever gets a
-            # chance to map it - matches GUIWizard.__init__'s own
-            # withdraw()/linux_titlebar.apply_to_window() sequencing (see
-            # its comment there for why): decorations get stripped and
-            # the custom titlebar built further down, before this dialog
-            # is ever shown, so there's no native-decorated-then-stripped
-            # flash.
-            self.withdraw()
         self.existing_usernames = set(existing_usernames)
         self._app = app
         self.title("New User")
@@ -449,19 +652,6 @@ class AddUserDialog(tk.Toplevel):
         # then close it" steps (see tour.py) need to know it was actually
         # dismissed either way, not just via the button.
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
-        if platform.system() == "Linux":
-            # Before body below, so the titlebar packs first/on top - see
-            # its own module docstring. Tk also can't mix pack() (what
-            # the titlebar uses) and grid() (what body's own content
-            # below uses) on the SAME parent, which is the other reason
-            # body exists at all now (confirmed live: "cannot use
-            # geometry manager pack inside .!adduserdialog which already
-            # has slaves managed by grid" the first time this ran without
-            # it) - self itself now only ever has pack()ed children.
-            linux_titlebar.apply_to_window(
-                self, "New User", self._on_cancel,
-                icon_image=getattr(self._app, "_icon_image", None), resizable=False,
-            )
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
 
@@ -589,18 +779,10 @@ class ChoiceDialog(tk.Toplevel):
     share to change a password on)."""
     def __init__(self, parent, title, prompt, choices, ok_label="OK"):
         super().__init__(parent)
-        if platform.system() == "Linux":
-            self.withdraw()
         self.title(title)
         self.resizable(False, False)
         self.transient(parent)
         self.result = None
-        if platform.system() == "Linux":
-            # Before body below - see AddUserDialog's identical comment:
-            # Tk can't mix pack() (the titlebar) and grid() (body's own
-            # content) on the same parent, so self itself now only ever
-            # has pack()ed children.
-            linux_titlebar.apply_to_window(self, title, self.destroy, resizable=False)
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
 
@@ -678,8 +860,6 @@ class QrCodeDialog(tk.Toplevel):
                  "on screen or let anyone photograph it who shouldn't have access.",
             foreground="#b00000", justify="center", padding=8,
         ).pack()
-        if platform.system() == "Linux":
-            linux_titlebar.apply_to_window(self, self.title(), self.destroy, resizable=False)
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
         self.grab_set()
@@ -701,8 +881,6 @@ class CreateShareDialog(tk.Toplevel):
     nicer-looking trigger for this dialog than a toolbar button was."""
     def __init__(self, app):
         super().__init__(app.root)
-        if platform.system() == "Linux":
-            self.withdraw()
         self.app = app
         self.wizard = app.wizard
         self._working = False
@@ -710,15 +888,6 @@ class CreateShareDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(app.root)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        if platform.system() == "Linux":
-            # Before the two pages below, so the titlebar row packs
-            # first/on top - stays there across _show_name_page()/
-            # _confirm_name()'s pack_forget()+pack() page swaps since
-            # those only ever touch name_page/path_page, never this.
-            linux_titlebar.apply_to_window(
-                self, "Create Share", self._on_close,
-                icon_image=getattr(app, "_icon_image", None), resizable=False,
-            )
 
         # Two pages, shown one at a time - a name, THEN (only if the
         # suggested default isn't fine as-is) a folder - rather than both
@@ -935,24 +1104,21 @@ class CreateShareDialog(tk.Toplevel):
             self.app._append_log(log_output)
         self.app._refresh_all_lists()
         if success:
-            # Release this dialog's modal grab before the follow-on
-            # messagebox rather than nesting a new grab underneath it.
+            # Release this dialog's modal grab before the follow-on toast
+            # rather than nesting a new grab underneath it.
             self.destroy()
-            self.app._notify_tour("share_created")
-            messagebox.showinfo(
-                "Share Creation Succeeded",
+            # Toast created BEFORE notifying "share_created" - that event
+            # is what advances the tour onto its own "Confirmation" step,
+            # and this toast's on_close is what that step now waits on
+            # (see _Toast's own docstring), so it has to already exist by
+            # the time that step is shown.
+            self.app._show_toast(
+                "Share Creation",
                 "Configuration attempt finished — see the log for details.\n\n"
                 "Add users from the shares list (New User / Attach User) whenever you're ready.",
+                on_close=lambda: self.app._notify_tour("share_apply_confirmed"),
             )
-            # _patch_messagebox_front's own -topmost toggle drops back to
-            # False the instant this returns (its finally block, right as
-            # OK is clicked) - some window managers read that as "no
-            # longer wants focus" and drop the main window behind
-            # whatever else is on screen. Explicitly re-raising it here
-            # closes that gap rather than counting on the NEXT tour
-            # step's own _bring_to_front() to happen fast enough.
-            _bring_window_to_front(self.app.root)
-            self.app._notify_tour("share_apply_confirmed")
+            self.app._notify_tour("share_created")
         else:
             self.create_button.button.configure(state="normal")
             messagebox.showerror(
@@ -965,12 +1131,14 @@ class CreateShareDialog(tk.Toplevel):
 class LogPanel:
     """Raw stdout output from every action (share/user create, delete,
     grant/revoke access, ...) collects here - a docked panel on the main
-    window's right edge (toggled via the toolbar's Log button), not a
+    window's left edge (toggled via the toolbar's Log button), not a
     separate popup window - see this session's redesign away from popups
     (GUIWizard._toggle_log_panel()) for why. Built once and left alive for
-    the app's whole lifetime; toggling only packs/unpacks self.frame, so
-    the accumulated log text survives across show/hide same as the old
-    popup version did across its own show/withdraw."""
+    the app's whole lifetime; toggling only place()s/place_forget()s
+    self.frame (see GUIWizard._place_log_glide()/_place_log_steady() -
+    the left side needs place(), not pack(), unlike the Users panel on
+    the right), so the accumulated log text survives across show/hide
+    same as the old popup version did across its own show/withdraw."""
     def __init__(self, root):
         self.frame = ttk.Frame(root)
         self.log_text = ScrolledText(self.frame, state="disabled", width=48)
@@ -987,19 +1155,20 @@ class LogPanel:
 class UserManagementPanel:
     """Account-level user management, decoupled from any specific share -
     Create User, Change Password, Delete User. A docked panel on the main
-    window's left edge (toggled via the toolbar's Users button), not a
+    window's right edge (toggled via the toolbar's Users button), not a
     separate popup window - see this session's redesign away from popups
     (GUIWizard._toggle_users_panel()) for why. Built once and left alive
     for the app's whole lifetime, same as LogPanel; toggling only packs/
-    unpacks self.frame."""
+    unpacks self.frame (see GUIWizard._pack_users_panel() - the right
+    side can use plain pack(), unlike the Log panel on the left)."""
     def __init__(self, app, parent):
         self.app = app
         self.wizard = app.wizard
         self.frame = ttk.Frame(parent)
 
-        # Kept on self (not local-only) so GUIWizard can pack_forget()
-        # both of these before an open/close width animation and re-pack
-        # them only once it's done - see GUIWizard._toggle_users_panel().
+        # Kept on self (not local-only) so other code can reach into
+        # this panel's own header/body - e.g. the tour pointing a step
+        # at a specific field inside it.
         self.header = header = ttk.Frame(self.frame)
         header.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(header, text="Manage Users", font=("TkDefaultFont", 11, "bold")).pack(side="left")
@@ -1026,8 +1195,14 @@ class UserManagementPanel:
         # "New User" is row #1 of this same list (see refresh()'s own
         # insert of it), not a separate widget above it - matches the
         # shares list's own "New Share" row exactly (see
-        # _build_shares_page()'s identical tag).
-        self.users_list.tag_configure("add_row", background=_ADD_ROW_BG, foreground="#0e92ab")
+        # _build_shares_page()'s identical tag). _AddRowFeedback owns the
+        # tag's colors from here on (idle/hover/pressed) - no separate
+        # tag_configure needed alongside it.
+        self._add_row_feedback = _AddRowFeedback(self.users_list, lambda: self._add_user_row_id)
+        # Alternates every OTHER data row with the same teal, starting
+        # one row below the add-row (see _SortableTree._restripe()) -
+        # requested live, matching the shares list's identical tag.
+        self.users_list.tag_configure("stripe_row", background=_ADD_ROW_BG)
         vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.users_list.yview)
         vscroll.grid(row=0, column=1, sticky="ns")
         self.users_list.configure(yscrollcommand=vscroll.set)
@@ -1077,11 +1252,12 @@ class UserManagementPanel:
     def refresh(self):
         selected = self._selected_username()
         users = self.wizard.list_users()
+        self._add_row_feedback.reset()
         for item in self.users_list.get_children():
             self.users_list.delete(item)
         # Row #1, always - see _add_share_row_id's identical reasoning in
         # _populate_shares_list().
-        self._add_user_row_id = self.users_list.insert("", 0, text="➕  New User", tags=("add_row",))
+        self._add_user_row_id = self.users_list.insert("", 0, text="➕", tags=("add_row",))
         for u in users:
             # list_users() returns every OS-level account on the machine
             # (it has to, so "Attach User" pickers can offer an existing
@@ -1221,16 +1397,6 @@ class GUIWizard:
         # icon (set below) looks right.
         self.root = tk.Tk(className="NASsie")
         self.root.title("NASsie")
-        if platform.system() == "Linux":
-            # Withdrawn immediately, before anything below ever gets a
-            # chance to map it - linux_titlebar.install() further down
-            # strips native decorations, which would otherwise show
-            # briefly with them before losing them a moment later. This
-            # stays withdrawn until _bring_to_front()'s deiconify() at
-            # the very end of this method, the same "measure/build fully
-            # before ever showing it" approach this method already uses
-            # for its own sizing (see the block below _build_shares_page).
-            self.root.withdraw()
         # NASsie's own recolored fork of the Sun Valley ttk theme (see
         # nassie_ttk/__init__.py) - applied before the Icon.TButton/
         # Treeview style tweaks below so those layer on top of it rather
@@ -1273,66 +1439,49 @@ class GUIWizard:
         # rather than anywhere near the middle of the display.
         self._load_icon_image()
         self._set_window_icon()
-        if platform.system() == "Linux":
-            # Needs the icon image above (reused at titlebar size) and
-            # must run before _build_header() packs anything, so the
-            # titlebar row it builds ends up on top - see
-            # linux_titlebar.py's own docstring for why this exists at
-            # all (rounded corners need Mutter to stop drawing a frame
-            # around this window) rather than being Windows/macOS's
-            # window_corners.apply() call below, which is enough on its
-            # own on those platforms.
-            linux_titlebar.install(self)
         self._build_header()
         self._build_shares_page()
 
-        # Both docked panels on self._content_row (built above, alongside
-        # the shares list itself), hidden until toggled open - see
+        # The Users panel is docked inside self._content_row itself
+        # (packed side="right" - unaffected by anything below). The Log
+        # panel is NOT - it's a sibling of self._content_row inside
+        # self._main_area instead, since it needs place() (see
+        # _place_log_steady()/_place_log_glide()), not pack() - see
         # _toggle_users_panel()/_toggle_log_panel() and their own class
         # docstrings for why these are panels, not separate windows.
-        self._log_panel = LogPanel(self._content_row)
+        #
+        # Users is the pack()-based, always-smooth side (matching what
+        # Log used to be) and Log is the place()-based, jump+scrim side
+        # (matching what Users used to be) - swapped from the original
+        # left/right assignment per explicit request, since the
+        # place()-based side is measurably heavier for the WM to
+        # animate regardless of which panel it's carrying (confirmed
+        # live, repeatedly - see git history) - making the FAR more
+        # frequently used panel (Users) the side that's cheap, and the
+        # rarely-opened one (Log) the side that pays that cost, was a
+        # direct, explicit tradeoff, not a technical requirement.
+        self._log_panel = LogPanel(self._main_area)
         self._user_mgmt_panel = UserManagementPanel(self, self._content_row)
+        # A plain, childless frame placed on top of the Log panel during
+        # its open/close animation - see _toggle_log_panel()'s own
+        # comment for why this, not a per-frame root resize, is what
+        # actually animates now. Themed (ttk, not tk) so it matches
+        # whatever's normally visible there with no color to hand-tune.
+        self._log_scrim = ttk.Frame(self._main_area)
         self._users_panel_open = False
         self._log_panel_open = False
         # Measured once, unpacked - see _toggle_users_panel()/
         # _toggle_log_panel() for why the window has to grow/shrink by
         # exactly this much rather than a guessed constant.
         self.root.update_idletasks()
-        # The Users panel frame's OWN width (no gutter) - _pack_users_
-        # panel() packs it with before=self._shares_body so it's visually
-        # left of the shares list, but that also makes it the FIRST slave
-        # Tk's packer carves cavity for on that side, not the last. A
-        # side="left" widget packed first always gets its full requested
-        # width immediately (there's always cavity for it, since nothing
-        # claimed any yet) - unlike the Log panel (packed side="right"
-        # with no before=, so it's LAST in cavity order and naturally
-        # gets clipped to whatever's left as the window grows). That
-        # meant opening the Users panel packed it at full width right
-        # away and squeezed shares_body down to whatever cavity
-        # remained, un-squeezing it frame by frame as the window grew to
-        # catch up - reported live as "the right side is the stuttery
-        # side when opening user management." _animate_root_width()
-        # below fixes this by explicitly growing/shrinking the panel
-        # frame's OWN width in lockstep with the window, via
-        # pack_propagate(False) + configure(width=...), instead of
-        # relying on the packer's cavity-order side effects the way the
-        # Log panel gets to. See _toggle_users_panel().
-        self._users_panel_frame_width = self._user_mgmt_panel.frame.winfo_reqwidth()
-        self._user_mgmt_panel.frame.configure(
-            width=self._users_panel_frame_width, height=self._user_mgmt_panel.frame.winfo_reqheight()
-        )
-        self._user_mgmt_panel.frame.pack_propagate(False)
-        self._users_panel_width = self._users_panel_frame_width + _PANEL_GUTTER
+        self._users_panel_width = self._user_mgmt_panel.frame.winfo_reqwidth() + _PANEL_GUTTER
         self._log_panel_width = self._log_panel.frame.winfo_reqwidth() + _PANEL_GUTTER
-        # None until the first time _resize_root_to() actually needs to
-        # reposition root (grow_left=True - the Users panel) - see its
-        # own docstring for what this ends up measuring and why it can
-        # only be measured against a real, already-mapped, already-
-        # decorations-stripped root, not calibrated eagerly here (tried
-        # that: a withdrawn root, or a standalone probe window, both
-        # measured a drift of 0 - confirmed live, neither reproduces
-        # whatever the WM actually does once root is the real, focused,
-        # on-screen window).
+        self._place_log_steady()
+        # None until the first time _animate_root_width() actually needs
+        # to reposition root (grow_left=True - the Users panel) - see
+        # its own docstring for what this ends up measuring and why it
+        # can only be measured against a real, already-mapped, already-
+        # decorations-stripped root, not calibrated eagerly here.
         self._wm_reposition_drift = None
 
         self._refresh_all_lists()
@@ -1451,18 +1600,21 @@ class GUIWizard:
             self.root.iconphoto(True, self._icon_image)
 
     def _build_header(self):
-        # The real logo, front and center - not the TUI's ASCII rendition -
-        # so the app's branding is obvious the moment the window opens, not
-        # just in the titlebar/taskbar.
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=12, pady=(12, 0))
 
+        # The logo alone, no "NASsie" text label alongside it - the window's
+        # own titlebar already carries the name (see __init__'s root.title()),
+        # so repeating it here was pure redundancy. expand=True (rather than
+        # a plain side="left") is what actually centers it: pack's default
+        # anchor is "center", and expand=True grows this label's own cavity
+        # to fill whatever space isn't claimed by the busy bar's side="right"
+        # packing in _busy_start() below, so the icon centers in whatever
+        # room is left rather than sitting flush against the window's edge.
         if self._icon_image:
             scale = max(1, self._icon_image.width() // 56)
             self._header_icon_image = self._icon_image.subsample(scale, scale)
-            ttk.Label(header, image=self._header_icon_image).pack(side="left", padx=(0, 10))
-
-        ttk.Label(header, text="NASsie", font=("TkDefaultFont", 18, "bold")).pack(side="left")
+            ttk.Label(header, image=self._header_icon_image).pack(side="left", expand=True)
         # Indeterminate progress bar doubling as a busy spinner - packed
         # only while at least one background action is running (see
         # _busy_start/_busy_stop), not a fixed part of the layout, so it
@@ -1483,6 +1635,22 @@ class GUIWizard:
         if self._busy_count == 0:
             self._busy_bar.stop()
             self._busy_bar.pack_forget()
+
+    def _show_toast(self, title, text, parent=None, on_close=None):
+        # Single slot, not a stack - a new toast (e.g. a second action
+        # finishing while the first one's still showing) replaces
+        # whatever's currently up rather than piling notices on top of
+        # each other. _dismiss() is safe to call on an already-dismissed
+        # toast (it no-ops), and firing its on_close early here is
+        # deliberate, not just a side effect - see _Toast's own docstring
+        # for why the tour relies on this callback to gate its
+        # "Confirmation" steps; leaving a stale one to fire on its own
+        # timeout later would double-advance the tour out from under
+        # whatever step is showing by then.
+        existing = getattr(self, "_active_toast", None)
+        if existing is not None:
+            existing._dismiss()
+        self._active_toast = _Toast(parent or self.root, title, text, on_close=on_close)
 
     def _notify_tour(self, event, window=None):
         # The active GuiTour (if any) advances itself on real actions
@@ -1564,8 +1732,8 @@ class GUIWizard:
         # entirely this way, since the share is already known from
         # whichever row is selected.
         #
-        # Toolbar now only holds the Users/Log toggle buttons (far left/
-        # right) - "New Share" moved into the shares list itself, as row
+        # Toolbar now only holds the Users/Log toggle buttons (far right/
+        # left) - "New Share" moved into the shares list itself, as row
         # #1 of the Treeview (see the "add_row" tag/self._add_share_row_id
         # below - a real row of the list, not a separate widget floating
         # above it, per what was actually asked for after an earlier
@@ -1578,22 +1746,40 @@ class GUIWizard:
         self._users_toggle_btn = _ToggleButton(
             toolbar, "👤", "Manage Users", self._toggle_users_panel, toolbar_bg,
         )
-        self._users_toggle_btn.pack(side="left")
+        self._users_toggle_btn.pack(side="right")
         self._log_toggle_btn = _ToggleButton(
             # 📋 (clipboard) reads as "notes/tasks", not "log" - 📜
             # (scroll) is the more common "history/log" convention.
             toolbar, "📜", "View Log", self._toggle_log_panel, toolbar_bg,
         )
-        self._log_toggle_btn.pack(side="right")
+        # Not packed - the Log panel is the one that has to sit on the
+        # left (see _toggle_log_panel()'s own docstring for why that
+        # side can't avoid moving the window), which requested-live
+        # confirmed is a visible glitch on this system with no
+        # available fix. Hiding the only way to reach it rather than
+        # shipping a feature with a known, unfixable rough edge. The
+        # button, self._log_panel, and _toggle_log_panel() itself are
+        # all still fully intact - .pack(side="left") is the one line
+        # to restore if this ever needs to come back (e.g. this glitch
+        # may be Linux/Mutter-specific - untested on Windows/macOS).
+        # Log CAPTURE itself (self._log_panel.append(), called
+        # throughout for every action) is untouched either way - only
+        # the ability to actually open and look at it is gone.
 
-        # Holds, left to right: the Users panel (hidden until toggled),
-        # the shares list itself (always visible), the Log panel (hidden
-        # until toggled) - see _toggle_users_panel()/_toggle_log_panel()
-        # and _pack_users_panel()'s own before=self._shares_body for how
-        # a panel toggling never has to touch the shares list's own
-        # packing to stay correctly ordered.
-        self._content_row = ttk.Frame(self.root)
-        self._content_row.pack(fill="both", expand=True, padx=8, pady=8)
+        # _main_area holds two PLACE()-managed children (not packed) -
+        # self._content_row (the shares list + Users panel, unchanged
+        # internally) and, once built below, the Log panel - see
+        # _place_log_steady()/_place_log_glide()'s own docstrings for
+        # why the Log panel needs place() instead of pack() here, and
+        # git history for the two pack()-based designs (a lockstep
+        # per-frame configure(width=...), then a "no x movement at all"
+        # version) that came before it and were both reported live as
+        # visibly wrong - back when Users, not Log, was on this side.
+        self._main_area = ttk.Frame(self.root)
+        self._main_area.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self._content_row = ttk.Frame(self._main_area)
+        self._content_row.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
 
         self._shares_body = ttk.Frame(self._content_row)
         # Set for real in _populate_shares_list() (the only place the
@@ -1628,7 +1814,13 @@ class GUIWizard:
         # add_row_id's docstring there) - styled via a real Treeview tag
         # so it's the exact same row height/font as every other row,
         # just tinted to read as an action rather than data.
-        self.shares_list.tag_configure("add_row", background=_ADD_ROW_BG, foreground="#0e92ab")
+        # _AddRowFeedback owns the tag's colors from here on
+        # (idle/hover/pressed) - matches the users list's identical use.
+        self._add_row_feedback = _AddRowFeedback(self.shares_list, lambda: self._add_share_row_id)
+        # Alternates every OTHER data row with the same teal, starting
+        # one row below the add-row (see _SortableTree._restripe()) -
+        # requested live, matching the users list's identical tag.
+        self.shares_list.tag_configure("stripe_row", background=_ADD_ROW_BG)
 
         shares_vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.shares_list.yview)
         shares_vscroll.grid(row=0, column=1, sticky="ns")
@@ -1660,53 +1852,128 @@ class GUIWizard:
             return
         self._notify_tour("share_selected")
 
-    def _pack_users_panel(self):
-        # before=self._shares_body - NOT a pack_forget()+repack of
-        # shares_body itself (an earlier version of this did that, on
-        # EVERY toggle of EITHER panel, unconditionally, to keep left-to-
-        # right ordering correct - see git history). before= inserts this
-        # panel immediately to shares_body's left directly, so the
-        # shares list (a real Treeview with real rows, plus its own
-        # scrollbars) never gets torn down and rebuilt by the geometry
-        # manager just because a SIBLING toggled - confirmed live as a
-        # real, separate contributor to the reported flash, on top of
-        # the window-repositioning one _resize_root_to() already
-        # compensates for.
-        self._user_mgmt_panel.frame.pack(side="left", fill="y", padx=(0, _PANEL_GUTTER), before=self._shares_body)
+    def _log_reservation(self):
+        # How much of self._main_area's width is CURRENTLY committed to
+        # the Log panel (its own width plus the gutter after it) when
+        # nothing is actively animating - 0 when closed, the full cached
+        # width when open. Used to freeze that footprint in place while
+        # the Users panel (unrelated) is toggled - see
+        # _place_log_steady()'s own docstring.
+        return self._log_panel_width if self._log_panel_open else 0
 
-    def _pack_log_panel(self):
+    def _place_log_steady(self):
+        # The STEADY-STATE placement (nothing currently mid-glide) for
+        # self._content_row and the Log panel, both PLACE()-managed
+        # children of self._main_area (see its own comment in __init__
+        # for why place(), not pack()). content_row TRACKS
+        # self._main_area's live width here (relwidth=1.0), offset by
+        # whatever the Log panel currently reserves - this is what lets
+        # _toggle_users_panel()'s own _animate_root_width() calls keep
+        # working exactly as before: growing/shrinking root grows/
+        # shrinks self._main_area (plain pack fill=both/expand=True,
+        # untouched), and content_row automatically follows that via
+        # place()'s own native relwidth tracking - no separate call
+        # needed for THAT, same as it never has been. The Log panel
+        # itself is pinned to self._main_area's left edge at whatever
+        # its current settled width is (0 or its full natural width),
+        # NOT tracking self._main_area live - it only needs to move
+        # during ITS OWN glide, handled by _place_log_glide() instead.
+        reservation = self._log_reservation()
+        self._log_panel.frame.place(
+            relx=0, x=0, rely=0, relheight=1.0,
+            relwidth=0, width=max(0, reservation - _PANEL_GUTTER),
+        )
+        self._content_row.place(relx=0, x=reservation, rely=0, relheight=1.0, relwidth=1.0, width=-reservation)
+
+    def _place_log_glide(self, base_width):
+        # The GLIDE placement, active only for the duration of a Log
+        # panel open/close animation - base_width is self._main_area's
+        # width with the Log panel fully CLOSED, captured once right
+        # before the glide starts (see _toggle_log_panel()), NOT
+        # re-measured per frame.
+        #
+        # content_row's WIDTH is pinned to that one fixed number
+        # (relwidth=0, width=base_width) - it does NOT track
+        # self._main_area's width during this glide, on purpose: it's
+        # main_area's width itself that's growing/shrinking (via
+        # _animate_root_width() below), and if content_row also grew
+        # with it, its own on-screen size interval would change every
+        # frame, right where the Log panel needs to be. Instead
+        # content_row's X (relx=1.0, x=-base_width - i.e. main_area's
+        # CURRENT width minus base_width, whatever that is at any given
+        # instant) is what tracks the glide, shifting it right by
+        # exactly however much main_area has grown past base_width -
+        # keeping content_row's own ON-SCREEN SIZE AND POSITION
+        # completely still, since window_x (see _animate_root_width's
+        # grow_left) shrinks by exactly the same amount this grows by.
+        # The Log panel mirrors this: pinned to x=0 (main_area's own
+        # left edge, which moves with window_x - that's what makes it
+        # look like it's opening on the left) with a width that tracks
+        # main_area's growth past base_width (minus the gutter).
+        #
+        # Both of these are native place() relx/relwidth bindings - Tk
+        # recomputes them AS PART OF processing self._main_area's own
+        # resize (itself an automatic, single-step consequence of
+        # root's geometry() call - see _main_area's plain pack(fill,
+        # expand) in __init__), not as a second, separately-timed
+        # widget operation the way an explicit per-frame
+        # configure(width=...) was - see git history for why THAT
+        # caused a real, reported oscillation. There is nothing further
+        # this method (or anything else) needs to call once per frame.
+        self._log_panel.frame.place(
+            relx=0, x=0, rely=0, relheight=1.0, relwidth=1.0, width=-(base_width + _PANEL_GUTTER),
+        )
+        self._content_row.place(relx=1.0, x=-base_width, rely=0, relheight=1.0, relwidth=0, width=base_width)
+
+    def _pack_users_panel(self):
         # side="right" always claims space from the current right edge
         # of whatever's left in content_row regardless of pack() call
         # order relative to shares_body's own (expand=True) - confirmed
-        # live - so this needs no before=/after= at all, unlike the
-        # Users panel on the left (see _pack_users_panel()).
-        self._log_panel.frame.pack(side="right", fill="y", padx=(_PANEL_GUTTER, 0))
+        # live. The Log panel needs place(), not pack(), for the
+        # opposite (left) side instead - see _place_log_steady()/
+        # _place_log_glide().
+        self._user_mgmt_panel.frame.pack(side="right", fill="y", padx=(_PANEL_GUTTER, 0))
 
-    def _animate_root_width(self, delta_width, grow_left=False, on_complete=None, on_step=None):
+    def _animate_root_width(self, delta_width, grow_left=False, on_complete=None, steps=10):
         # Steps the window from its current width to the target width
         # over several real mainloop turns (via after()) instead of one
         # instant geometry() jump - see the earlier version of this
         # method (git history) for why an instant jump flashes at all.
+        # steps=1 collapses this to a single, immediate geometry() call
+        # instead (still going through the same code path, so the
+        # grow_left/minsize/drift-compensation logic below stays
+        # identical either way) - see _toggle_log_panel(), which now
+        # calls it that way. Confirmed live, repeatedly: moving root's
+        # OWN position (grow_left) is real work for the WM - repainting
+        # the window's entire content at a new screen location, not just
+        # resizing it - and stayed visibly heavier than a same-sized
+        # pure resize (which _toggle_users_panel() below has always
+        # used, untouched, still at steps=10) no matter how the app-
+        # level code moving it was restructured (lockstep per-frame
+        # configure(), then place()'s own native tracking, then forcing
+        # a flush every step - none of it changed the result, and none
+        # of it depended on which specific panel was doing the moving -
+        # see GUIWizard.__init__'s own comment on why Log, not Users,
+        # is the one that pays this cost now). Rather than pay that
+        # per-frame cost 10 times over a glide, _toggle_log_panel() now
+        # pays it exactly once - the window jumps straight to its
+        # target - and does the actual visible "the panel is opening"
+        # animation entirely afterward, via a scrim that only ever
+        # touches place(), never root's own geometry at all.
         #
-        # Reported live as "super stuttery" once this was actually an
-        # animation the user could watch closely: the first version of
-        # this re-read winfo_width()/winfo_x()/winfo_y() (each a
-        # synchronous X-server round trip) AND called minsize() (an
-        # ICCCM WM_NORMAL_HINTS property write, also a round trip) on
-        # EVERY single step. At a ~13ms step interval those round trips
-        # compete for the same event-loop turn as the WM actually
-        # painting the previous step, so steps land at irregular,
-        # unpredictable intervals even though after() itself fires
-        # evenly - which reads as stutter/jank rather than smooth
-        # motion, independent of step count or duration.
-        #
-        # Fixed by doing all the expensive work ONCE, up front: read
-        # the starting geometry a single time, precompute every step's
-        # width (and, for grow_left, x) as plain arithmetic with no
-        # further widget queries, and defer minsize() to the final step
-        # only (it's a hint for user-driven resizing, not something
-        # that needs to track an in-flight animation). Each step is then
-        # just one geometry() call and nothing else.
+        # grow_left: the Log panel needs the window's LEFT edge to move
+        # (opening "to the left"), while self._content_row's own
+        # on-screen size/position stays fixed - achieved by moving
+        # root's x by the exact same amount its width changes, in the
+        # SAME single geometry() call (one Tk/X11 operation, width and
+        # position together, not two separately-timed ones).
+        # GUIWizard._place_log_glide() sets up a place() binding,
+        # before this is ever called, that tracks self._main_area's
+        # (and so root's) resize automatically - the same native
+        # mechanism that's always made the Users panel below work with
+        # nothing but a single geometry() call - so moving root's x and
+        # width together in ONE call, right here, is what keeps
+        # content_row in place.
         self.root.update_idletasks()
         old_width = self.root.winfo_width()
         old_x = self.root.winfo_x()
@@ -1719,8 +1986,22 @@ class GUIWizard:
             if on_complete:
                 on_complete()
             return
+        if actual_delta < 0:
+            # Shrinking - drop the floor to the target BEFORE the first
+            # step, not the last. minsize() is a hard floor the WM
+            # enforces; a previous grow (of either panel) left it set to
+            # the CURRENT (larger) width. Deferring the update to the
+            # final step - fine for growing, since every intermediate
+            # width during a grow is already >= the old, still-valid
+            # floor - silently clamps every intermediate SHRINK request
+            # back up to that stale floor instead: confirmed live via
+            # instrumented trace, closing right after an opening showed
+            # every single intermediate step reporting the OLD (fully
+            # open) width, with the window only actually moving on the
+            # very last step, all at once - not a jump, an entire
+            # animation collapsed into its own last frame.
+            self.root.minsize(target_width, height)
 
-        steps = 10
         duration_ms = 160
         step_delay = max(1, duration_ms // steps)
         widths = [old_width + round(actual_delta * i / steps) for i in range(1, steps)] + [target_width]
@@ -1733,18 +2014,20 @@ class GUIWizard:
                     # First time ever repositioning root - measure
                     # Mutter's own quirk here rather than guessing it up
                     # front: this exact window, explicitly repositioned
-                    # via geometry(), consistently lands a fixed number
+                    # via geometry(), consistently landed a fixed number
                     # of pixels below wherever it was actually asked to
-                    # go (confirmed live - looks like the WM still
-                    # reserving room for a titlebar it isn't actually
-                    # drawing on this Motif-hint-undecorated window -
-                    # see linux_titlebar.py). Measuring this eagerly at
-                    # startup (an earlier version of this) didn't work:
-                    # a withdrawn root, and a standalone probe window,
-                    # both measured a drift of 0. This costs one extra
-                    # round trip, but only once, ever, across the
-                    # program's whole lifetime - every animation after
-                    # the very first Users-panel toggle skips it.
+                    # go (confirmed live, back when root's decorations
+                    # were being stripped via Motif hints - root now
+                    # keeps its native titlebar, see git history, so this
+                    # may measure 0 from here on, but it's cheap and
+                    # self-calibrating either way, so it's left in place
+                    # rather than assumed away). Measuring this eagerly
+                    # at startup didn't work: a withdrawn root, and a
+                    # standalone probe window, both measured a drift of
+                    # 0 - it has to be measured against an actual
+                    # repositioning of root itself, the first time one
+                    # happens. Costs one extra round trip, but only
+                    # once, ever, across the program's whole lifetime.
                     self.root.geometry(f"{w}x{height}+{xs[i]}+{old_y}")
                     self.root.update_idletasks()
                     self._wm_reposition_drift = self.root.winfo_y() - old_y
@@ -1754,20 +2037,6 @@ class GUIWizard:
                     self.root.geometry(f"{w}x{height}+{xs[i]}+{old_y - self._wm_reposition_drift}")
             else:
                 self.root.geometry(f"{w}x{height}")
-            if on_step:
-                # The actual, already-rounded pixel delta the window has
-                # moved so far this animation (signed - negative while
-                # shrinking) - NOT a separately-rounded i/steps fraction.
-                # A caller deriving its own per-step width from a second,
-                # independent round() (an earlier version of this did
-                # exactly that) drifts by a pixel or two against this
-                # width's rounding, frame to frame - small individually,
-                # but visible as a slow wobble over the whole animation.
-                # Deriving everything from this one already-committed
-                # number keeps a caller's own animated width (see
-                # _toggle_users_panel()) in exact lockstep with what's
-                # actually on screen.
-                on_step(w - old_width)
             if i == steps - 1:
                 self.root.minsize(w, height)
                 if on_complete:
@@ -1777,7 +2046,44 @@ class GUIWizard:
 
         step(0)
 
+    def _animate_log_scrim(self, opening, on_complete=None):
+        # Pure place()-level animation - no root.geometry() calls at all
+        # (see _animate_root_width()'s own comment on steps=1 for why
+        # root only ever jumps straight to its target now, before this
+        # ever runs). self._log_scrim is a plain, childless themed frame
+        # placed on top of the Log panel's own area, covering
+        # progressively less of it (opening) or more (closing). Its
+        # LEFT edge is what moves - the side nearest the toggle button
+        # that triggered this and self._main_area's own left edge - so
+        # opening reads as sliding out from there toward
+        # self._content_row, closing as retracting the same way in
+        # reverse.
+        panel_width = self._log_panel_width - _PANEL_GUTTER
+        steps = 10
+        duration_ms = 160
+        step_delay = max(1, duration_ms // steps)
+
+        def step(i):
+            revealed = i / steps if opening else 1 - i / steps
+            covered_width = max(0, round(panel_width * (1 - revealed)))
+            if covered_width <= 0:
+                self._log_scrim.place_forget()
+            else:
+                self._log_scrim.place(x=panel_width - covered_width, y=0, width=covered_width, relheight=1.0)
+                self._log_scrim.lift()
+            if i < steps:
+                self.root.after(step_delay, lambda: step(i + 1))
+            elif on_complete:
+                on_complete()
+
+        step(0)
+
     def _toggle_users_panel(self):
+        # The cheap, pack()-based side (see GUIWizard.__init__'s own
+        # comment on why Users, not Log, was moved here) - identical in
+        # shape to what this method looked like before the swap, just
+        # targeting self._user_mgmt_panel/self._users_panel_width/
+        # self._users_panel_open instead of the Log panel's equivalents.
         if self._users_panel_open:
             # See _tour_blocks_closing()'s docstring - lets the dedicated
             # "Close" step's own click-to-close-the-panel through as
@@ -1788,87 +2094,66 @@ class GUIWizard:
                 return
             self._users_panel_open = False
             self._users_toggle_btn.set_pressed(False)
-            # Shrink the panel's OWN width in lockstep with the window
-            # (on_step - see the comment on self._users_panel_frame_width
-            # in __init__ for why this can't just rely on the packer's
-            # cavity-clipping the way the Log panel does), reaching 0
-            # exactly as the window reaches its target width. pack_forget()
-            # only runs once that's done, as a cleanup that should be a
-            # visual no-op by then.
-            def _step(consumed):
-                # consumed is <= 0 here (shrinking), from 0 down to
-                # -self._users_panel_width - see _animate_root_width()'s
-                # own comment on on_step for why this (and not a second
-                # independent round()) is what this is derived from.
-                w = max(0, min(
-                    self._users_panel_frame_width, consumed + self._users_panel_frame_width + _PANEL_GUTTER
-                ))
-                self._user_mgmt_panel.frame.configure(width=w)
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
                 self._notify_tour("user_mgmt_closed")
-            self._animate_root_width(-self._users_panel_width, grow_left=True, on_complete=_done, on_step=_step)
+            self._animate_root_width(-self._users_panel_width, on_complete=_done)
         else:
             self._users_panel_open = True
             self._users_toggle_btn.set_pressed(True)
-            # Pack FIRST (at width 0 - see _step below), then grow both
-            # the window and the panel's own width together, step for
-            # step, so shares_body's share of the cavity never changes
-            # mid-animation. See self._users_panel_frame_width's comment
-            # in __init__ for why the window growing alone isn't enough.
-            #
-            # header/body (the Treeview, its scrollbar, and the action
-            # bar) are unpacked for the DURATION of the glide and only
-            # re-packed once it's done, in _done() - confirmed live via
-            # per-step timing that relaying THOSE out on every single
-            # width change (an earlier version of this did exactly that)
-            # is what was actually causing the reported stutter: one
-            # frame consistently took ~2x as long as the rest (~30ms vs
-            # ~16ms), every run, always at the same early point in the
-            # glide. Pre-warming the layout once at full width before
-            # starting (tried first) did NOT remove it - re-tested with
-            # the content unpacked instead, and the spike disappeared
-            # completely, confirming it's real per-frame relayout cost
-            # of that specific widget tree, not a one-time cache-miss.
-            # An empty frame costs nothing to resize regardless of width,
-            # which is what keeps the glide itself cheap and even. Only
-            # applied to opening - closing was already measured clean
-            # (no spike) without this, so it's left as it was rather
-            # than trade a real glitch (content visibly vanishing right
-            # as you click to close) for no benefit.
-            self._user_mgmt_panel.header.pack_forget()
-            self._user_mgmt_panel.body.pack_forget()
-            self._user_mgmt_panel.frame.configure(width=0)
             self._pack_users_panel()
             self._user_mgmt_panel.refresh()
-            def _step(consumed):
-                # consumed is >= 0 here (growing), from 0 up to
-                # self._users_panel_width - see _animate_root_width()'s
-                # own comment on on_step for why this (and not a second
-                # independent round()) is what this is derived from.
-                w = max(0, min(self._users_panel_frame_width, consumed - _PANEL_GUTTER))
-                self._user_mgmt_panel.frame.configure(width=w)
             def _done():
-                self._user_mgmt_panel.header.pack(fill="x", padx=8, pady=(8, 0))
-                self._user_mgmt_panel.body.pack(fill="both", expand=True, padx=8, pady=8)
                 self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
-            self._animate_root_width(self._users_panel_width, grow_left=True, on_complete=_done, on_step=_step)
+            self._animate_root_width(self._users_panel_width, on_complete=_done)
 
     def _toggle_log_panel(self):
+        # The place()-based, jump+scrim side (see GUIWizard.__init__'s
+        # own comment on why Log, not Users, was moved here) - identical
+        # in shape to what _toggle_users_panel() looked like before the
+        # swap, just targeting self._log_panel/self._log_panel_width/
+        # self._log_panel_open instead of the Users panel's equivalents.
         # No tour step ever points at this one, so no _tour_blocks_closing
-        # guard needed - matches the old LogWindow's own _on_close, which
-        # never had one either.
+        # guard needed, and no .refresh() call - LogPanel.append() keeps
+        # its content current on its own, unlike UserManagementPanel's
+        # Treeview.
+        self.root.update_idletasks()
+        base_width = self._main_area.winfo_width() - self._log_reservation()
         if self._log_panel_open:
             self._log_panel_open = False
             self._log_toggle_btn.set_pressed(False)
-            self._animate_root_width(
-                -self._log_panel_width, grow_left=False, on_complete=self._log_panel.frame.pack_forget
-            )
+            # The scrim covers the panel FIRST, entirely via place() -
+            # no root.geometry() calls at all, see _animate_log_scrim()
+            # - and only once it's fully covered (nothing left on
+            # screen to disturb) does root actually shrink, in ONE
+            # single jump (steps=1) rather than an animated glide - see
+            # _animate_root_width()'s own comment on why. That jump
+            # happens entirely behind the now-opaque scrim, so it's
+            # never visible either way.
+            def _covered():
+                self._place_log_glide(base_width)
+                def _jumped():
+                    self._place_log_steady()
+                    self._log_scrim.place_forget()
+                self._animate_root_width(-self._log_panel_width, grow_left=True, on_complete=_jumped, steps=1)
+            self._animate_log_scrim(opening=False, on_complete=_covered)
         else:
             self._log_panel_open = True
             self._log_toggle_btn.set_pressed(True)
-            self._pack_log_panel()
-            self._animate_root_width(self._log_panel_width, grow_left=False)
+            panel_width = self._log_panel_width - _PANEL_GUTTER
+            # The scrim covers the panel's full FINAL area BEFORE root
+            # even jumps - using panel_width, the cached target (known
+            # in advance, no need to wait and measure it after the
+            # jump) - so the panel's real content (always packed, never
+            # hidden - see LogPanel.__init__) is never visible even for
+            # one frame before the scrim is there to cover it.
+            self._log_scrim.place(x=0, y=0, width=panel_width, relheight=1.0)
+            self._log_scrim.lift()
+            self._place_log_glide(base_width)
+            def _jumped():
+                self._place_log_steady()
+                self._animate_log_scrim(opening=True)
+            self._animate_root_width(self._log_panel_width, grow_left=True, on_complete=_jumped, steps=1)
 
     def _build_share_action_bar(self, container, item):
         # The add-row (see _populate_shares_list()) is a real Treeview
@@ -2036,6 +2321,7 @@ class GUIWizard:
         }
         selected_share, selected_user = self._selected_share_and_user()
 
+        self._add_row_feedback.reset()
         for item in self.shares_list.get_children():
             self.shares_list.delete(item)
 
@@ -2044,7 +2330,7 @@ class GUIWizard:
         # _shares_sort.reapply() below can never sort it out of first
         # place either - see the explicit move() after it).
         self._add_share_row_id = self.shares_list.insert(
-            "", 0, text="➕  New Share", values=("", ""), tags=("add_row",),
+            "", 0, text="➕", values=("", ""), tags=("add_row",),
         )
 
         for share in shares:
@@ -2137,6 +2423,12 @@ class GUIWizard:
             for u in candidates
         }
         self._share_action_bar.update()
+        # After update() above, not before - the combobox tour.py's own
+        # "Attach User" dropdown step points at (_build_inline_attach's
+        # combo, which _build_share_action_bar's item == self._attaching_
+        # item branch just built) has to actually exist for that step's
+        # own place_near() to have something real to position against.
+        self._notify_tour("attach_dropdown_opened")
 
     def _commit_inline_attach(self, username):
         share_name = self._attaching_share
@@ -2222,14 +2514,14 @@ class GUIWizard:
             self._notify_tour("user_detach_dialog_opened")
             messagebox.showinfo(
                 "Detach",
-                f"This removes '{username}''s access to '{share_name}'. Skipped here so your "
+                f"This removes {username}'s access to '{share_name}'. Skipped here so your "
                 "example share keeps its attached user.",
                 parent=self.root,
             )
             self._notify_tour("user_detach_dialog_cancelled")
             return
         if not messagebox.askyesno(
-            "Detach", f"Remove '{username}''s access to '{share_name}'?"
+            "Detach", f"Remove {username}'s access to '{share_name}'?"
         ):
             return
         threading.Thread(
@@ -2377,7 +2669,7 @@ class GUIWizard:
             # but a FAILURE still needs to interrupt: the row silently
             # not changing could otherwise look identical to "there was
             # nothing to change."
-            messagebox.showerror("Failed", f"Could not change '{username}''s access level — see log.")
+            messagebox.showerror("Failed", f"Could not change {username}'s access level — see log.")
         self._refresh_all_lists()
 
     def _grant_access_worker(self, share_name, username, password, read_only=False, confirm_qr=True, parent_window=None):
@@ -2412,12 +2704,12 @@ class GUIWizard:
         target = parent_window or self.root
         if added:
             self._notify_tour("user_attached")
-            messagebox.showinfo("Added", f"Added '{username}' to share '{share_name}'.", parent=target)
-            # See _apply_done's identical call for why this is needed
-            # right here, not left to the next tour step's own
-            # _bring_to_front().
-            _bring_window_to_front(target)
-            self._notify_tour("attach_apply_confirmed")
+            # Toast created BEFORE "attach_apply_confirmed" would ever
+            # need to fire - see _apply_done's identical ordering comment.
+            self._show_toast(
+                "Added", f"Added '{username}' to share '{share_name}'.", parent=target,
+                on_close=lambda: self._notify_tour("attach_apply_confirmed"),
+            )
             # password is None for an existing, unmanaged Windows account
             # NASsie deliberately left untouched (see
             # _add_user_to_share_windows) - there's no password to encode,
@@ -2446,7 +2738,7 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if revoked:
-            messagebox.showinfo("Detached", f"Removed '{username}''s access to '{share_name}'.")
+            self._show_toast("Detached", f"Removed {username}'s access to '{share_name}'.")
         else:
             messagebox.showerror("Failed", f"Could not remove access — see log.")
         self._refresh_all_lists()
@@ -2467,7 +2759,7 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if deleted:
-            messagebox.showinfo("Deleted", f"Deleted user '{username}'.", parent=self.root)
+            self._show_toast("Deleted", f"Deleted user '{username}'.", parent=self.root)
         else:
             messagebox.showerror(
                 "Failed", f"Could not delete user '{username}' — see log.", parent=self.root
@@ -2490,10 +2782,13 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if created:
+            # Toast created BEFORE notifying "user_created" - see
+            # _apply_done's identical ordering comment.
+            self._show_toast(
+                "User Creation", f"'{username}' has been created.", parent=self.root,
+                on_close=lambda: self._notify_tour("user_apply_confirmed"),
+            )
             self._notify_tour("user_created")
-            messagebox.showinfo("User Created", f"'{username}' has been created.", parent=self.root)
-            _bring_window_to_front(self.root)
-            self._notify_tour("user_apply_confirmed")
         else:
             messagebox.showerror(
                 "Failed", f"Could not set up user '{username}' — see log.", parent=self.root
@@ -2551,7 +2846,7 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if removed:
-            messagebox.showinfo(
+            self._show_toast(
                 "Removed", f"Removed share: {name}" + (" (folder deleted too)" if delete_folder else "")
             )
         else:
