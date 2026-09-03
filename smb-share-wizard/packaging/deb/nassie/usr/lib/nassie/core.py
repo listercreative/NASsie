@@ -1291,6 +1291,28 @@ class SMBWizard:
         except Exception:
             pass
 
+        # The tour's own "has this been seen before" marker
+        # (tour.py's _first_run_marker_path(), %APPDATA%\NASsie\tour_seen
+        # on Windows) is per-user profile data - nothing in nassie.wxs's
+        # own Directory/Component tree touches it, since it lives outside
+        # INSTALLFOLDER entirely and survives an uninstall on its own.
+        # Left alone, a reinstall on a machine that had NASsie before
+        # (even one that never got past the tour, so no share/group
+        # signal for this uninstall's other cleanup to key off of) would
+        # find that stale marker and offer to resume a tour instead of
+        # just starting it fresh - wrong for a genuinely new install.
+        # Deleted here (this action's own interactive-user session, not
+        # uninstall_cleanup_windows()'s deferred SYSTEM one - see that
+        # function's docstring on why SYSTEM's profile isn't the real
+        # user's %APPDATA%) unconditionally, before the shares check
+        # below, so it still runs even for someone who never created a
+        # share.
+        try:
+            import tour
+            os.remove(tour._first_run_marker_path())
+        except Exception:
+            pass
+
         try:
             wizard = SMBWizard()
             shares = [s for s in wizard.list_shares() if s.get("group") and s.get("path")]
@@ -1386,24 +1408,32 @@ foreach ($shareName in {share_list_ps}) {{
 # 'NASsie*' (no underscore) so this also catches NASsieGroup_* - the
 # admin-created access-control groups (New Group), distinct from the
 # per-share ownership groups (NASsie_<share>) but equally NASsie's to
-# clean up on a genuine uninstall.
-$nassieGroups = Get-LocalGroup | Where-Object {{ $_.Name -like 'NASsie*' }}
-
-$affectedUsers = @{{}}
-foreach ($g in $nassieGroups) {{
-    Get-LocalGroupMember -Group $g.Name -ErrorAction SilentlyContinue | ForEach-Object {{
-        $name = $_.Name.Split('\\')[-1]
-        $affectedUsers[$name] = $true
-    }}
-    Remove-LocalGroup -Name $g.Name -ErrorAction SilentlyContinue
+# clean up on a genuine uninstall. Group removal doesn't drive which
+# users get deleted below (see that comment for why) - just clean up
+# every NASsie-created group unconditionally.
+Get-LocalGroup | Where-Object {{ $_.Name -like 'NASsie*' }} | ForEach-Object {{
+    Remove-LocalGroup -Name $_.Name -ErrorAction SilentlyContinue
 }}
-foreach ($username in $affectedUsers.Keys) {{
-    $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-    if ($user -and $user.Description -eq '{marker}') {{
-        Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
-        $regPath = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\SpecialAccounts\\UserList'
-        Remove-ItemProperty -Path $regPath -Name $username -ErrorAction SilentlyContinue
-    }}
+
+# Every account NASsie itself created, found by its own Description
+# marker directly - NOT by walking current group membership (an earlier
+# version of this script did, collecting Get-LocalGroupMember results
+# across the groups above into the delete list). That was a real bug:
+# _remove_user_from_share_windows() (the "Revoke Access" flow) removes a
+# user from a share's group the moment access is revoked, without
+# deleting the account - so a NASsie-managed user revoked from their
+# only share (still shown in the Users panel, Description marker still
+# intact) was left in no group at all by uninstall time and silently
+# survived. The Description marker is the authoritative "NASsie made
+# this account" signal - it's what _list_regular_accounts() itself uses
+# for "managed" - and unlike group membership, nothing else ever clears
+# it, so checking it directly here is correct regardless of what share/
+# group state the account is currently in.
+Get-LocalUser | Where-Object {{ $_.Description -eq '{marker}' }} | ForEach-Object {{
+    $username = $_.Name
+    Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+    $regPath = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\SpecialAccounts\\UserList'
+    Remove-ItemProperty -Path $regPath -Name $username -ErrorAction SilentlyContinue
 }}
 """
         proc = wizard._run_ps_script(script, capture_output=True, text=True)
