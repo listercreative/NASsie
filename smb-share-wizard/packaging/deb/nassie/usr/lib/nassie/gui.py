@@ -2399,6 +2399,24 @@ class GUIWizard:
         # shape to what this method looked like before the swap, just
         # targeting self._user_mgmt_panel/self._users_panel_width/
         # self._users_panel_open instead of the Log panel's equivalents.
+        #
+        # steps=1 on Windows only - _animate_root_width()'s own comment
+        # already documents that a glide's per-frame geometry() call is
+        # "real work for the WM", expensive enough that grow_left (the
+        # Log panel) had to stop doing it at all; a PURE resize (no
+        # reposition, what this panel has always used) was believed cheap
+        # enough to keep animating there, and on Linux/X11 that holds up
+        # fine - confirmed live, smooth. Windows' DWM is a different
+        # story: each intermediate geometry() call there is a full
+        # WM_SIZE/WM_PAINT round trip repainting every child widget,
+        # including ones nowhere near the panel edge - reported live as
+        # visibly choppy opening this panel, with the header's own logo
+        # Label specifically flickering/redrawing on every one of those
+        # 10 frames. steps=1 collapses the same code path (per its own
+        # comment) to a single geometry() call - one repaint instead of
+        # ten - trading the glide for an instant jump on Windows only,
+        # where the glide was never actually smooth to begin with.
+        steps = 1 if platform.system() == "Windows" else 10
         if self._users_panel_open:
             # See _tour_blocks_closing()'s docstring - lets the dedicated
             # "Close" step's own click-to-close-the-panel through as
@@ -2417,7 +2435,7 @@ class GUIWizard:
                 # alone can't be trusted to leave the bottom corners
                 # correctly shaped once a resize like this one finishes.
                 self._reapply_corners()
-            self._animate_root_width(-self._users_panel_width, on_complete=_done)
+            self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=steps)
         else:
             self._users_panel_open = True
             self._users_toggle_btn.set_pressed(True)
@@ -2426,7 +2444,7 @@ class GUIWizard:
             def _done():
                 self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
                 self._reapply_corners()
-            self._animate_root_width(self._users_panel_width, on_complete=_done)
+            self._animate_root_width(self._users_panel_width, on_complete=_done, steps=steps)
 
     def _toggle_log_panel(self):
         # The place()-based, jump+scrim side (see GUIWizard.__init__'s
