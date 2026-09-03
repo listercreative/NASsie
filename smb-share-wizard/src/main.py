@@ -63,7 +63,16 @@ Usage:
     }
 
     try:
-        if len(sys.argv) >= 2 and sys.argv[1] == "--uninstall-folder-prompt":
+        if len(sys.argv) >= 2 and sys.argv[1] == "--uninstall-delete-tour-marker":
+            # Internal only - invoked by the MSI's uninstall sequence as a
+            # separate, deliberately headless immediate custom action
+            # (see nassie.wxs and core.py's delete_tour_marker_windows()
+            # for why this isn't folded into --uninstall-folder-prompt
+            # below, despite both being immediate/interactive-session
+            # actions for the same %APPDATA% reason). Not user-facing.
+            from core import SMBWizard
+            SMBWizard.delete_tour_marker_windows()
+        elif len(sys.argv) >= 2 and sys.argv[1] == "--uninstall-folder-prompt":
             # Internal only - invoked by the MSI's uninstall sequence as an
             # immediate (interactive-session) custom action, before
             # --uninstall-cleanup below runs deferred as SYSTEM and can't

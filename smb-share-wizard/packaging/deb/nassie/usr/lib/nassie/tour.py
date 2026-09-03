@@ -1036,7 +1036,7 @@ class GuiTour:
              "user_detach_dialog_cancelled"),
         ]
 
-    def _step_resolves(self, index):
+    def _step_resolves(self, index, check_widget=False):
         # True if this step's own container currently exists and is a
         # real, live widget - False for both container_fn() returning
         # None outright (see _show_step()'s own use of this) AND the
@@ -1058,6 +1058,29 @@ class GuiTour:
                 return False
         except tk.TclError:
             return False
+        # check_widget - only True from _resolve_resume_index() below, NOT
+        # from _show_step()'s own (pre-existing, container-only) call.
+        # Container-only is correct there: this same method doubles as
+        # _show_step()'s guard on EVERY live step transition of a normal,
+        # in-progress tour, not just a resumed one, and widget_fn() isn't
+        # always safe to call speculatively there - e.g. the "Add User"/
+        # "New User" steps reference a Treeview add-row id
+        # (UserManagementPanel._add_user_row_id) that a just-opened
+        # panel's own refresh() sets asynchronously (fetches list_users()
+        # in a background thread, applies once it lands - see refresh()'s
+        # own comment); calling widget_fn() here to "just check" during
+        # ordinary forward progress could observe it mid-flight, before
+        # that attribute even exists yet, and wrongly conclude the step
+        # doesn't resolve. Reported live, both platforms: an in-progress
+        # tour dying right after the step that opens Users/attaches a
+        # user, nothing to do with any stale resume state - exactly that.
+        # check_widget=True is safe (and needed) ONLY when walking back
+        # through a stale, previous-process resume_index below, since
+        # nothing there is "about to become valid a moment later" the way
+        # a same-process async refresh is - it's either real right now or
+        # it's from a process that's gone.
+        if not check_widget:
+            return True
         # Container-only used to be the whole check - correct for most
         # steps, but not the ones whose widget_fn depends on session state
         # the container itself says nothing about (a specific Treeview row
@@ -1083,7 +1106,6 @@ class GuiTour:
                 if widget is not None:
                     target = widget.widget if isinstance(widget, (_PointAtOnly, _HighlightWholeDialog)) else widget
                     if target is not None:
-                        target.update_idletasks()
                         target.winfo_rootx()
             except (tk.TclError, AttributeError, IndexError):
                 return False
@@ -1098,7 +1120,7 @@ class GuiTour:
         # landing on one that doesn't (gui.root itself, at worst, index
         # 0 - always resolves).
         index = max(0, min(index, len(self.steps) - 1))
-        while index > 0 and not self._step_resolves(index):
+        while index > 0 and not self._step_resolves(index, check_widget=True):
             index -= 1
         return index
 

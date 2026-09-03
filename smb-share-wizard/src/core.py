@@ -1257,6 +1257,37 @@ class SMBWizard:
     _UNINSTALL_FOLDERS_RESULT_FILE = "nassie_uninstall_folders.json"
 
     @staticmethod
+    def delete_tour_marker_windows():
+        # Split out from prompt_uninstall_folders_windows() (which also
+        # deletes this marker - see its own comment) after a real,
+        # verbose-logged uninstall showed that function's tk.Tk() call
+        # failing outright under this specific execution context (an
+        # IMMEDIATE custom action, elevated via UAC, deep inside
+        # msiexec.exe's own process tree) with MSI error 1721 - "a
+        # program required for this install to complete could not be
+        # run". Confirmed via that same log that invoking NASsie.exe from
+        # a custom action in general is NOT the problem:
+        # uninstall_cleanup_windows() (headless, no GUI) ran the very
+        # next action and succeeded cleanly. The failure is specific to
+        # creating a real Tk window there - plausibly a hard, non-
+        # Python-catchable failure at the Tcl/Tk C level (no window
+        # station/display access in that context) rather than something
+        # try/except around tk.Tk() could ever have caught, which is why
+        # prompt_uninstall_folders_windows()'s own broad try/except
+        # didn't save it. This method is deliberately kept 100% headless
+        # - no tkinter import, nothing that could hang or crash the
+        # interpreter the way that one apparently can - so it can't be
+        # taken down by that same failure mode. Still an IMMEDIATE (not
+        # deferred) action - see prompt_uninstall_folders_windows()'s own
+        # comment on why that's what makes %APPDATA% resolve to the real
+        # interactive user rather than SYSTEM's own profile.
+        try:
+            import tour
+            os.remove(tour._first_run_marker_path())
+        except Exception:
+            pass
+
+    @staticmethod
     def prompt_uninstall_folders_windows():
         # Runs as an IMMEDIATE custom action (see nassie.wxs), in the same
         # session as the interactive install/uninstall itself - unlike
@@ -1285,31 +1316,17 @@ class SMBWizard:
         # "delete nothing," never the reverse. A confirmation prompt that
         # might not always work is acceptable; folders vanishing without
         # one is not.
+        # The tour's own "has this been seen before" marker gets deleted
+        # by the separate, headless delete_tour_marker_windows() action
+        # instead of here - see its own comment for why: this function's
+        # tk.Tk() call is unreliable under the execution context an
+        # uninstall's immediate custom actions run in, confirmed (via a
+        # verbose MSI log) to fail outright before ever reaching a user-
+        # visible dialog. Nothing marker-related belongs in this function
+        # since anything here can be taken down by that same failure.
         result_path = os.path.join(tempfile.gettempdir(), SMBWizard._UNINSTALL_FOLDERS_RESULT_FILE)
         try:
             os.remove(result_path)
-        except Exception:
-            pass
-
-        # The tour's own "has this been seen before" marker
-        # (tour.py's _first_run_marker_path(), %APPDATA%\NASsie\tour_seen
-        # on Windows) is per-user profile data - nothing in nassie.wxs's
-        # own Directory/Component tree touches it, since it lives outside
-        # INSTALLFOLDER entirely and survives an uninstall on its own.
-        # Left alone, a reinstall on a machine that had NASsie before
-        # (even one that never got past the tour, so no share/group
-        # signal for this uninstall's other cleanup to key off of) would
-        # find that stale marker and offer to resume a tour instead of
-        # just starting it fresh - wrong for a genuinely new install.
-        # Deleted here (this action's own interactive-user session, not
-        # uninstall_cleanup_windows()'s deferred SYSTEM one - see that
-        # function's docstring on why SYSTEM's profile isn't the real
-        # user's %APPDATA%) unconditionally, before the shares check
-        # below, so it still runs even for someone who never created a
-        # share.
-        try:
-            import tour
-            os.remove(tour._first_run_marker_path())
         except Exception:
             pass
 
