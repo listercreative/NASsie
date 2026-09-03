@@ -213,6 +213,24 @@
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
       <Publish Dialog="NASsieExitDialog" Control="Finish" Event="DoAction" Value="NASsieCreateDesktopShortcut"
                Condition="NASSIE_DESKTOP_SHORTCUT = 1 and NOT Installed" />
+      <!-- Stock ExitDialog.wxs's own "Finish" Control has no nested
+           EndDialog Publish either - that binding comes entirely from a
+           separate top-level rule in WixUI_InstallDir.wxs:
+           `<Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog"
+           Value="Return" Order="999" />`. That's the exact line the
+           WixUI_NASsieInstallDir Fragment (bottom of this file)
+           intentionally omits, since it's what pulled the stock,
+           non-overridable ExitDialog into the link. Omitting it there
+           without adding an equivalent rule HERE, targeting
+           NASsieExitDialog, meant Finish did its DoAction(s) and then
+           nothing ever told the dialog to close - the installer sat open
+           forever, and since Finish has Cancel="yes" above (matching
+           stock exactly - there's nothing left to "cancel" once install
+           has succeeded), the window's native [X] close button triggers
+           the exact same stuck behavior. Order="999" (matching upstream)
+           keeps this after the DoAction rules above, so the app/shortcut
+           actions still fire before the dialog tears itself down. -->
+      <Publish Dialog="NASsieExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
     </UI>
 
   </Package>
