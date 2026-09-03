@@ -3,7 +3,7 @@
 
   <Package Name="NASsie"
            Manufacturer="Lister Creative Enterprise LLC"
-           Version="0.1.7.0"
+           Version="0.1.8.0"
            UpgradeCode="4c2e7f0a-9b1d-4e3a-8c6f-2a1b5d7e9f30"
            Compressed="yes">
 
@@ -220,19 +220,28 @@
   <!-- Our own fork of the stock WixUI_InstallDir dialog-sequence wiring -
        see NASsieExitDialog's own comment (in Package, above) for why this
        has to exist at all rather than just using
-       "<ui:WixUI Id="WixUI_InstallDir" />" directly. This is a verbatim
-       copy of the real upstream source (wixtoolset/wix,
+       "<ui:WixUI Id="WixUI_InstallDir" />" directly. This is based on the
+       real upstream source pinned to the exact WiX version build.ps1
+       installs - wixtoolset/wix tag v5.0.2,
        src/ext/UI/wixlib/WixUI_InstallDir.wxs, the plain non-arch-specific
-       "file WixUI_InstallDir" fragment - not the WIXUIARCH-templated
+       "file WixUI_InstallDir" fragment (not the WIXUIARCH-templated
        variants above it in that file, which this project's own
-       <ui:WixUI Id="WixUI_InstallDir" /> never used either) with exactly
-       one line removed: the
+       <ui:WixUI Id="WixUI_InstallDir" /> never used either). An earlier
+       version of this Fragment was copied from that file's DEFAULT-BRANCH
+       content instead of the v5.0.2 tag, which turned out to differ
+       enough (different Order values, a different BrowseDlg/InstallDirDlg
+       rule set) to cause two real bugs: a WIX0130 duplicate-ControlEvent
+       build failure (see the InstallDirDlg/BrowseDlg comment below) and,
+       separately, an InstallDirDlg "Next" that would have set the target
+       path and then never actually advanced to VerifyReadyDlg. Relative
+       to the real v5.0.2 "file WixUI_InstallDir" fragment, two things
+       differ here: the
        `<Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog"
-       Value="Return" Order="999" />` that pulls the stock, non-overridable
-       ExitDialog fragment into the link. Every other Publish rule below -
-       Welcome/License/InstallDir/VerifyReady/Maintenance navigation - is
-       unchanged, so Back/Next behavior through the rest of the installer
-       matches stock WixUI_InstallDir exactly. -->
+       Value="Return" Order="999" />` line is removed (it's what pulls the
+       stock, non-overridable ExitDialog fragment into the link), and
+       WIXUI_DONTVALIDATEPATH="1" is added (see below). Every other
+       Publish rule - Welcome/License/InstallDir/VerifyReady/Maintenance
+       navigation - matches stock WixUI_InstallDir v5.0.2 exactly. -->
   <Fragment>
     <UI Id="WixUI_NASsieInstallDir">
       <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
@@ -258,13 +267,45 @@
       <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
       <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Condition="LicenseAccepted = &quot;1&quot;" />
 
+      <!-- This block is a verbatim copy of the *plain, non-arch-specific*
+           InstallDirDlg/BrowseDlg wiring from the real v5.0.2-tagged
+           upstream source (confirmed via `gh api ...?ref=v5.0.2`, which
+           differs from the default-branch copy this Fragment was
+           originally, incorrectly, based on). Two things had to change
+           from the naive "copy every Publish rule" approach:
+
+           1. BrowseDlg's own "OK" button already declares its
+              SetTargetPath/EndDialog Publish rules as nested children of
+              <Control Id="OK"> inside BrowseDlg.wxs itself (part of the
+              stock DialogRef we pull in above). Re-declaring them here as
+              top-level <Publish Dialog="BrowseDlg" Control="OK" .../>
+              rules - as an earlier version of this fragment did - creates
+              an exact duplicate ControlEvent row and fails the build with
+              WIX0130. So they're intentionally omitted here.
+
+           2. Upstream's InstallDirDlg/Next "actually advance to
+              VerifyReadyDlg" rule is conditioned on
+              WIXUI_INSTALLDIR_VALID, which only gets set by a
+              WixUIValidatePath_$(WIXUIARCH) custom action wired up in the
+              arch-specific WixUI_InstallDir_X86/X64/A64 Fragments (not
+              part of the plain fragment we're forking, and not something
+              we reference). Without wiring that CA in, Next would set the
+              path and then do nothing. We sidestep the whole optional
+              validation feature via WIXUI_DONTVALIDATEPATH="1" below,
+              which is upstream's own documented knob for skipping it -
+              this makes the Order="4" NewDialog rule unconditional in
+              practice, matching stock WixUI_InstallDir's default-off
+              validation behavior rather than a half-wired one. -->
       <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="3" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SpawnDialog" Value="InvalidDirDlg" Order="3" Condition="NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID&lt;&gt;&quot;1&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4" Condition="WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
 
-      <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="[_BrowseProperty]" Order="3" />
-      <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="4" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SpawnDialog" Value="InvalidDirDlg" Order="4" Condition="NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID&lt;&gt;&quot;1&quot;" />
+
+      <Property Id="WIXUI_DONTVALIDATEPATH" Value="1" />
 
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1" Condition="NOT Installed" />
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
