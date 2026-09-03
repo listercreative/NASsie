@@ -496,16 +496,39 @@ _PANEL_GUTTER = 8
 
 
 class _AddRowFeedback:
-    """Hover + click feedback for a Treeview's pinned "add row" (New Share
-    / New User - see _SortableTree's pinned_first). It's a real button in
-    disguise, but a bare Treeview row gives none of a button's usual
-    affordances on its own: no cursor change on hover, and no visible
-    click response either, since nassie_ttk's Treeview -background
-    selected style (see light.tcl/dark.tcl) happens to be this exact same
-    teal (_ADD_ROW_BG) - selecting the row doesn't change how it looks at
-    all. Drives the "add_row" tag's own background through three states
-    (idle/hover/pressed) instead, and swaps the cursor to hand2 while
-    hovering it, matching every other clickable control in the app.
+    """Hover + click feedback, AND full-row centering, for a Treeview's
+    pinned "add row" (New Share / New User - see _SortableTree's
+    pinned_first). It's a real button in disguise, but a bare Treeview
+    row gives none of a button's usual affordances on its own: no cursor
+    change on hover, no visible click response (nassie_ttk's Treeview
+    -background selected style, see light.tcl/dark.tcl, happens to be
+    this exact same teal (_ADD_ROW_BG) - selecting the row doesn't even
+    look different), and no way to center a lone "➕" glyph across every
+    column at once - a tag's anchor="center" only centers within the
+    tree's own #0 column, which for a multi-column tree (the shares
+    list's Share Name + Path) left the glyph noticeably off-center
+    relative to the WHOLE row, not centered on it - reported live
+    ("justify center... including both columns").
+
+    Solves all three by floating a real Label on top of the row instead
+    of relying on the Treeview's own text/tag rendering for it - a
+    place()d child of the tree itself (same technique _RowActionBar uses
+    to float its own icon buttons over a row), sized and positioned to
+    the row's FULL bbox (tree.bbox(item) with no column argument covers
+    every visible column combined, confirmed live, not just #0) on every
+    refresh/resize/scroll. Callers must give the row itself blank #0 text
+    (see _add_share_row_id/_add_user_row_id's own insert() calls) - this
+    label is what actually shows "➕" now, and it fully covers the
+    underlying cell.
+
+    Covering the row like this also means the Treeview's own built-in
+    click-to-select handling never actually sees a click land there
+    anymore (Tk delivers the event to this label, the topmost widget
+    under the pointer, not the tree underneath it) - _on_release() below
+    replaces that by calling tree.selection_set() directly, which fires
+    the exact same <<TreeviewSelect>> a native click would have, so the
+    existing _on_shares_list_select()/_on_users_list_select() handlers
+    open the real dialog exactly as before.
 
     row_id_fn() must return the CURRENT add-row's item id - it's deleted
     and reinserted from scratch on every refresh (see
@@ -517,61 +540,77 @@ class _AddRowFeedback:
     def __init__(self, tree, row_id_fn):
         self.tree = tree
         self.row_id_fn = row_id_fn
-        self._hovering = False
-        # anchor="center" - the add-row's own text is now just the "➕"
-        # glyph (the "New Share"/"New User" label next to it was dropped),
-        # and a single glyph left at the tree column's default "w" anchor
-        # sat flush against the left edge/indent instead of reading as a
-        # centered action icon. Set on this tag only, not tree.column("#0",
-        # anchor=...) - that would re-center every OTHER row's own text
-        # too (share names, usernames), which is real left-to-right data,
-        # not a lone centered icon.
-        tree.tag_configure("add_row", background=_ADD_ROW_BG, foreground="#0e92ab", anchor="center")
-        tree.bind("<Motion>", self._on_motion, add="+")
-        tree.bind("<Leave>", self._on_leave, add="+")
-        # Bound directly on the tree (its instance bindtag), not just
-        # relying on <<TreeviewSelect>> - instance bindings run BEFORE
-        # the built-in class bindings that ttk::Treeview's own click-to-
-        # select behavior lives on (default Tk bindtag order is
-        # (widget, class, toplevel, all)), so the pressed color is
-        # already on screen by the time selection changes and the
-        # caller's own <<TreeviewSelect>> handler opens the dialog.
-        tree.bind("<ButtonPress-1>", self._on_press, add="+")
+        # Fallback only - the icon Label below fully covers the row's own
+        # bbox once reposition() has run once, so this tag's own
+        # background is only ever actually visible for one frame, before
+        # that first placement lands.
+        tree.tag_configure("add_row", background=_ADD_ROW_BG)
+        self.icon = tk.Label(
+            tree, text="➕", bg=_ADD_ROW_BG, fg="#0e92ab", font=("TkDefaultFont", 11), cursor="hand2",
+        )
+        self.icon.bind("<Enter>", self._on_enter, add="+")
+        self.icon.bind("<Leave>", self._on_leave, add="+")
+        self.icon.bind("<ButtonPress-1>", self._on_press, add="+")
+        self.icon.bind("<ButtonRelease-1>", self._on_release, add="+")
+        # Same reasoning as _RowActionBar's own identical bindings -
+        # scrolling/resizing moves or hides the row without firing
+        # <<TreeviewSelect>> or anything else this could otherwise hook,
+        # so this has to explicitly reposition (or hide) on each of them
+        # to stay glued to the row's own current bbox.
+        tree.bind("<Configure>", lambda e: self.reposition(), add="+")
+        tree.bind("<MouseWheel>", lambda e: tree.after_idle(self.reposition), add="+")
+        tree.bind("<Button-4>", lambda e: tree.after_idle(self.reposition), add="+")
+        tree.bind("<Button-5>", lambda e: tree.after_idle(self.reposition), add="+")
 
-    def _row_under(self, event):
+    def reposition(self):
         row_id = self.row_id_fn()
-        return row_id if row_id and self.tree.identify_row(event.y) == row_id else None
-
-    def _on_motion(self, event):
-        over = self._row_under(event) is not None
-        if over == self._hovering:
+        if not row_id or not self.tree.exists(row_id):
+            self.icon.place_forget()
             return
-        self._hovering = over
-        self.tree.configure(cursor="hand2" if over else "")
-        self.tree.tag_configure("add_row", background=self._HOVER_BG if over else _ADD_ROW_BG)
+        bbox = self.tree.bbox(row_id)
+        if not bbox:
+            # Scrolled out of view (or the tree hasn't finished laying
+            # out yet right after a refresh) - nothing to overlay right
+            # now.
+            self.icon.place_forget()
+            return
+        x, y, w, h = bbox
+        self.icon.place(x=x, y=y, width=w, height=h)
+        self.icon.lift()
+
+    def _on_enter(self, event=None):
+        self.icon.configure(bg=self._HOVER_BG)
 
     def _on_leave(self, event=None):
-        if not self._hovering:
-            return
-        self._hovering = False
-        self.tree.configure(cursor="")
-        self.tree.tag_configure("add_row", background=_ADD_ROW_BG)
+        self.icon.configure(bg=_ADD_ROW_BG)
 
-    def _on_press(self, event):
-        if self._row_under(event) is not None:
-            self.tree.tag_configure("add_row", background=self._PRESSED_BG)
-            self.tree.update_idletasks()
+    def _on_press(self, event=None):
+        self.icon.configure(bg=self._PRESSED_BG)
+        self.icon.update_idletasks()
+
+    def _on_release(self, event):
+        # event.x/y are relative to this label itself - inside its own
+        # current bounds means a genuine click (mouse released without
+        # first dragging off the icon), not a press-then-drag-away.
+        if 0 <= event.x < self.icon.winfo_width() and 0 <= event.y < self.icon.winfo_height():
+            row_id = self.row_id_fn()
+            if row_id and self.tree.exists(row_id):
+                self.tree.selection_set(row_id)
+            self.icon.configure(bg=self._HOVER_BG)
+        else:
+            self.icon.configure(bg=_ADD_ROW_BG)
 
     def reset(self):
         # Called at the top of every refresh(), right before the add-row
-        # is deleted and reinserted - the "add_row" tag's colors persist
-        # on the Treeview across refreshes (tag_configure only runs once,
-        # here), so a press/hover shade left over from the click that
-        # triggered this very refresh would otherwise carry straight into
-        # the freshly rebuilt row instead of starting idle.
-        self._hovering = False
-        self.tree.configure(cursor="")
-        self.tree.tag_configure("add_row", background=_ADD_ROW_BG)
+        # is deleted and reinserted - self.icon persists across refreshes
+        # (unlike the row itself), so a press/hover shade left over from
+        # the click that triggered this very refresh would otherwise
+        # carry straight into the freshly rebuilt row instead of starting
+        # idle. reposition() is the caller's job, once the new row
+        # actually exists (see _add_share_row_id/_add_user_row_id's own
+        # insert() call sites) - this can't do it yet, the old id this
+        # still refers to is about to be deleted.
+        self.icon.configure(bg=_ADD_ROW_BG)
 
 
 class _ToggleButton:
@@ -1257,7 +1296,9 @@ class UserManagementPanel:
             self.users_list.delete(item)
         # Row #1, always - see _add_share_row_id's identical reasoning in
         # _populate_shares_list().
-        self._add_user_row_id = self.users_list.insert("", 0, text="➕", tags=("add_row",))
+        # Blank text - _AddRowFeedback's own floating icon Label shows the
+        # "➕", not this cell (see its own docstring for why).
+        self._add_user_row_id = self.users_list.insert("", 0, text="", tags=("add_row",))
         for u in users:
             # list_users() returns every OS-level account on the machine
             # (it has to, so "Attach User" pickers can offer an existing
@@ -1275,6 +1316,10 @@ class UserManagementPanel:
         # pinned_first) regardless of whatever sort is currently active.
         self._sort.reapply()
         self._action_bar.update()
+        # Only now - the row this needs to overlay was just deleted and
+        # reinserted above under a brand new id (reset() couldn't do this
+        # itself; see its own comment).
+        self._add_row_feedback.reposition()
 
     def _selected_username(self):
         selection = self.users_list.selection()
@@ -1533,7 +1578,7 @@ class GUIWizard:
         # on macOS) already round the window everywhere BUT this - see
         # window_corners.py for why the bottom two corners specifically
         # need it and every other platform doesn't.
-        window_corners.apply(self.root)
+        self._reapply_corners = window_corners.apply(self.root)
         self._bring_to_front()
 
         # Deferred via after() either way, so the window is fully mapped
@@ -2097,6 +2142,11 @@ class GUIWizard:
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
                 self._notify_tour("user_mgmt_closed")
+                # Root just settled at its new (narrower) width - see
+                # window_corners.apply()'s own comment on why <Configure>
+                # alone can't be trusted to leave the bottom corners
+                # correctly shaped once a resize like this one finishes.
+                self._reapply_corners()
             self._animate_root_width(-self._users_panel_width, on_complete=_done)
         else:
             self._users_panel_open = True
@@ -2105,6 +2155,7 @@ class GUIWizard:
             self._user_mgmt_panel.refresh()
             def _done():
                 self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+                self._reapply_corners()
             self._animate_root_width(self._users_panel_width, on_complete=_done)
 
     def _toggle_log_panel(self):
@@ -2135,6 +2186,8 @@ class GUIWizard:
                 def _jumped():
                     self._place_log_steady()
                     self._log_scrim.place_forget()
+                    # See _toggle_users_panel()'s identical call for why.
+                    self._reapply_corners()
                 self._animate_root_width(-self._log_panel_width, grow_left=True, on_complete=_jumped, steps=1)
             self._animate_log_scrim(opening=False, on_complete=_covered)
         else:
@@ -2153,6 +2206,8 @@ class GUIWizard:
             def _jumped():
                 self._place_log_steady()
                 self._animate_log_scrim(opening=True)
+                # See _toggle_users_panel()'s identical call for why.
+                self._reapply_corners()
             self._animate_root_width(self._log_panel_width, grow_left=True, on_complete=_jumped, steps=1)
 
     def _build_share_action_bar(self, container, item):
@@ -2329,8 +2384,10 @@ class GUIWizard:
         # to guarantee it survives the delete-everything above, and
         # _shares_sort.reapply() below can never sort it out of first
         # place either - see the explicit move() after it).
+        # Blank text - _AddRowFeedback's own floating icon Label shows the
+        # "➕", not this cell (see its own docstring for why).
         self._add_share_row_id = self.shares_list.insert(
-            "", 0, text="➕", values=("", ""), tags=("add_row",),
+            "", 0, text="", values=("", ""), tags=("add_row",),
         )
 
         for share in shares:
@@ -2370,6 +2427,10 @@ class GUIWizard:
         # pinned_first) regardless of whatever sort is currently active.
         self._shares_sort.reapply()
         self._share_action_bar.update()
+        # Only now - the row this needs to overlay was just deleted and
+        # reinserted above under a brand new id (reset() couldn't do this
+        # itself; see its own comment).
+        self._add_row_feedback.reposition()
 
     def _new_user_for_selected_share(self):
         share_name, _ = self._selected_share_and_user()

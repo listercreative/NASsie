@@ -26,13 +26,20 @@ import tkinter as tk
 def apply(window, radius=8):
     """Best-effort - silently does nothing if the platform, the extension,
     or the shared library it needs isn't there. Never worth failing the
-    app over a rounded corner."""
+    app over a rounded corner.
+
+    Returns a zero-argument callable the caller can invoke later to force
+    an immediate reapplication (Linux only - a no-op elsewhere) - see
+    _round_linux_bottom()'s own return value for why GUIWizard's own
+    panel-toggle animations (_toggle_users_panel()/_toggle_log_panel())
+    need this on top of the <Configure> binding already set up below."""
     system = platform.system()
     if system == "Windows":
         _round_windows(window)
     elif system == "Linux":
-        _round_linux_bottom(window, radius)
+        return _round_linux_bottom(window, radius)
     # macOS: already rounded natively.
+    return lambda: None
 
 
 def _round_windows(window):
@@ -137,13 +144,13 @@ def _round_linux_bottom(window, radius):
         xlib = ctypes.CDLL("libX11.so.6")
         xext = ctypes.CDLL("libXext.so.6")
     except OSError:
-        return
+        return lambda: None
 
     xlib.XOpenDisplay.restype = ctypes.c_void_p
     xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
     dpy = xlib.XOpenDisplay(None)
     if not dpy:
-        return
+        return lambda: None
 
     xext.XShapeQueryExtension.restype = ctypes.c_int
     xext.XShapeQueryExtension.argtypes = [
@@ -153,7 +160,7 @@ def _round_linux_bottom(window, radius):
     error_base = ctypes.c_int()
     if not xext.XShapeQueryExtension(dpy, ctypes.byref(event_base), ctypes.byref(error_base)):
         xlib.XCloseDisplay(dpy)
-        return
+        return lambda: None
 
     xext.XShapeCombineRectangles.restype = None
     xext.XShapeCombineRectangles.argtypes = [
@@ -162,6 +169,18 @@ def _round_linux_bottom(window, radius):
     ]
     xlib.XFlush.argtypes = [ctypes.c_void_p]
     xlib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    xlib.XQueryTree.restype = ctypes.c_int
+    xlib.XQueryTree.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint),
+    ]
+    xlib.XGetGeometry.restype = ctypes.c_int
+    xlib.XGetGeometry.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+    ]
+    xlib.XFree.argtypes = [ctypes.c_void_p]
 
     SHAPE_BOUNDING, SHAPE_SET, UNSORTED = 0, 0, 0
 
@@ -174,14 +193,67 @@ def _round_linux_bottom(window, radius):
     # place for as long as `handler` itself does, below.
     handler, _restore = install_scoped_x_error_handler(xlib, dpy)
 
+    def _target_window(client_id):
+        # Shaping the Tk CLIENT window itself (winfo_id()) only rounds
+        # its own corners - fine when that client IS the whole visible
+        # window (an overrideredirect()'d Toplevel with no WM
+        # decorations, e.g. this app's own dialogs/callouts), but root
+        # here keeps its native titlebar (see git history - the old
+        # custom linux_titlebar.py this replaced ran overrideredirect
+        # instead). A reparenting WM (Mutter included) wraps a decorated
+        # window in its OWN separate frame window (confirmed live via
+        # `xwininfo -root -tree`: a "mutter-x11-frames" window containing
+        # the "NASsie" client as its child, with the client inset by the
+        # frame's own titlebar/border on every side, bottom included) -
+        # THAT frame is what the user actually sees the square-cornered
+        # bottom edge of, since it extends past the client on every side.
+        # Shaping the client alone rounds a corner that then sits
+        # entirely inside the frame's own unshaped border, invisible
+        # regardless of how correct the math is - reported live ("clearly
+        # we aren't rounding the bottom"). XQueryTree's own parent is
+        # that frame when one exists; falls back to the client id itself
+        # (the pre-existing behavior) when the parent IS the root window
+        # - no reparenting, e.g. a WM that isn't compositing this way, or
+        # none running at all.
+        root_ret = ctypes.c_ulong()
+        parent_ret = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        nchildren = ctypes.c_uint()
+        ok = xlib.XQueryTree(
+            dpy, client_id, ctypes.byref(root_ret), ctypes.byref(parent_ret),
+            ctypes.byref(children), ctypes.byref(nchildren),
+        )
+        if children:
+            xlib.XFree(children)
+        if not ok or parent_ret.value in (0, root_ret.value):
+            return client_id
+        return parent_ret.value
+
     def _apply(event=None):
         try:
             window.update_idletasks()
-            w = window.winfo_width()
-            h = window.winfo_height()
+            client_id = window.winfo_id()
         except tk.TclError:
             # Window's already been destroyed - nothing left to shape.
             return
+        target_id = _target_window(client_id)
+        # The TARGET window's own live geometry, not window.winfo_width()/
+        # height() - those report the Tk CLIENT's size, which is smaller
+        # than the WM frame being shaped here whenever one was found
+        # above (inset by the frame's own titlebar/border on every side).
+        root_ret = ctypes.c_ulong()
+        x = ctypes.c_int()
+        y = ctypes.c_int()
+        w = ctypes.c_uint()
+        h = ctypes.c_uint()
+        border_width = ctypes.c_uint()
+        depth = ctypes.c_uint()
+        if not xlib.XGetGeometry(
+            dpy, target_id, ctypes.byref(root_ret), ctypes.byref(x), ctypes.byref(y),
+            ctypes.byref(w), ctypes.byref(h), ctypes.byref(border_width), ctypes.byref(depth),
+        ):
+            return
+        w, h = w.value, h.value
         r = max(0, min(radius, w // 2, h // 2))
         if r <= 0 or w <= 0 or h <= 0:
             return
@@ -201,18 +273,24 @@ def _round_linux_bottom(window, radius):
             row_w = max(0, w - 2 * inset)
             rects.append(_XRectangle(inset, h - r + i, row_w, 1))
         rect_array = (_XRectangle * len(rects))(*rects)
-        try:
-            win_id = window.winfo_id()
-        except tk.TclError:
-            return
         xext.XShapeCombineRectangles(
-            dpy, win_id, SHAPE_BOUNDING, 0, 0,
+            dpy, target_id, SHAPE_BOUNDING, 0, 0,
             rect_array, len(rects), SHAPE_SET, UNSORTED,
         )
         xlib.XSync(dpy, 0)
 
     window.bind("<Configure>", _apply, add="+")
     window.after(50, _apply)
+    # A second, later reapplication on top of the <Configure> binding
+    # above and the caller's own on-demand reapply() (see GUIWizard's
+    # _toggle_users_panel()/_toggle_log_panel(), which call the returned
+    # function once their own resize animation's on_complete fires) -
+    # <Configure> can fire mid-resize, before the WM's own asynchronous
+    # redraw of its native titlebar/decorations for the NEW size has
+    # actually caught up, and that redraw can clobber whatever shape was
+    # already set. 250ms after the initial apply() call gives that a
+    # real chance to settle first.
+    window.after(250, _apply)
     # Kept alive on the window itself - both the ctypes callback and the
     # Display connection need to outlive this function call (the
     # callback can be invoked by libX11 at any later point, and a
@@ -220,3 +298,4 @@ def _round_linux_bottom(window, radius):
     # side), for as long as <Configure> can still fire.
     window._nassie_corner_handler = handler
     window._nassie_corner_display = dpy
+    return _apply
