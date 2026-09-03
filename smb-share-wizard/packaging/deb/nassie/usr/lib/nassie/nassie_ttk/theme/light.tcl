@@ -443,7 +443,17 @@ namespace eval ttk::theme::sv_light {
         -rowheight [expr {[font metrics SunValleyBodyFont -linespace] + 3}] \
         -font SunValleyBodyFont
 
-    ttk::style map Treeview -background {selected "#eaf6f8"} -foreground {selected "#191919"}
+    # #72af52 - the green from the NASsie logo itself (the loch/grass
+    # element, not the serpent's own teal body - that teal, #0e92ab, is
+    # already this app's own accent color for add-rows/stripes/tour
+    # callouts elsewhere, so a SELECTED row in that same teal read as
+    # indistinguishable from those, not as "selected" - requested live).
+    # Foreground is white - requested live, overriding an earlier version
+    # of this that kept the original dark #191919 on a strict WCAG
+    # relative-luminance contrast calculation (dark actually scores
+    # higher against this specific green, ~6.7:1 vs white's ~2.6:1) -
+    # the live, on-screen look was the deciding factor here regardless.
+    ttk::style map Treeview -background {selected "#72af52"} -foreground {selected "#ffffff"}
 
     ttk::style element create Treeview.field image $I(card) -border 5 -width 0 -height 0
     ttk::style element create Treeheading.cell image \

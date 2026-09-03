@@ -14,7 +14,7 @@ from core import (
     SHARE_NAME_MAX_LEN, SHARE_NAME_RE,
     USERNAME_MAX_LEN, USERNAME_RE,
 )
-from tour import GuiTour, tour_state, mark_tour_completed
+from tour import GuiTour, tour_state, tour_progress_index, mark_tour_completed
 import nassie_ttk
 import window_corners
 
@@ -190,13 +190,26 @@ class _Toast(tk.Toplevel):
     on_close (if given) fires exactly once, whichever of those two paths
     actually closes it - GUIWizard uses this to still gate the tour's own
     "Confirmation" steps on the user actually acknowledging (or outlasting)
-    the toast, same as the blocking messagebox used to."""
-    _TIMEOUT_MS = 4000
-    _WIDTH = 280
+    the toast, same as the blocking messagebox used to.
 
-    def __init__(self, parent, title, text, on_close=None):
+    anchor (defaults to parent) is the widget this spans - the FULL
+    width of it, not just centered at its own compact natural size, and
+    positioned near its bottom edge. GUIWizard._show_toast() passes the
+    shares list specifically ("the main pane, using the width of both
+    columns" - requested live), not root's own full width, which would
+    otherwise drift the toast off its actual content whenever a side
+    panel is open and root is wider than just the shares list."""
+    _TIMEOUT_MS = 4000
+    _MARGIN = 16
+    # Only ever used as a fallback, when self.anchor hasn't been laid out
+    # to a real width yet (winfo_width() still reporting 1, the Tk
+    # not-yet-mapped default) - see _place()'s own guard.
+    _FALLBACK_WIDTH = 280
+
+    def __init__(self, parent, title, text, on_close=None, anchor=None):
         super().__init__(parent)
         self.parent = parent
+        self.anchor = anchor if anchor is not None else parent
         self._on_close = on_close
         self._dismissed = False
         # Withdrawn immediately - same reasoning as _Tooltip/_Callout: Tk
@@ -227,9 +240,15 @@ class _Toast(tk.Toplevel):
         close.pack(side="right")
         close.bind("<Button-1>", self._dismiss)
 
-        ttk.Label(
-            inner, text=text, background=_ADD_ROW_BG, wraplength=self._WIDTH, justify="left",
-        ).pack(anchor="w", padx=10, pady=(2, 10))
+        # fill="x" (not just anchor="w") - this needs to actually stretch
+        # to the window's own forced width (see _place()), not sit at
+        # whatever narrower width its own text naturally needs. Kept on
+        # self so _place() can retarget wraplength to match, since the
+        # window's real final width isn't known until then.
+        self.text_label = ttk.Label(
+            inner, text=text, background=_ADD_ROW_BG, justify="left",
+        )
+        self.text_label.pack(fill="x", anchor="w", padx=10, pady=(2, 10))
 
         self.update_idletasks()
         self._place()
@@ -237,15 +256,26 @@ class _Toast(tk.Toplevel):
         self._timer = self.after(self._TIMEOUT_MS, self._dismiss)
 
     def _place(self):
-        # Bottom-right corner of the parent window, not the screen -
-        # matches _Tooltip/_Callout's own "positioned relative to the
-        # thing it's about" convention rather than always landing in the
-        # same physical screen corner regardless of where NASsie itself
-        # is.
-        margin = 16
-        x = self.parent.winfo_rootx() + self.parent.winfo_width() - self.winfo_reqwidth() - margin
-        y = self.parent.winfo_rooty() + self.parent.winfo_height() - self.winfo_reqheight() - margin
-        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        # Spans self.anchor's own FULL width (the shares list, both its
+        # columns - see this class's own docstring), inset by _MARGIN on
+        # each side - not just centered at its own compact natural size -
+        # positioned near ITS bottom edge, not the screen, matching
+        # _Tooltip/_Callout's own "positioned relative to the thing it's
+        # about" convention rather than always landing in the same
+        # physical screen corner regardless of where NASsie itself is.
+        aw = self.anchor.winfo_width()
+        ah = self.anchor.winfo_height()
+        width = max(1, (aw if aw > 1 else self._FALLBACK_WIDTH) - 2 * self._MARGIN)
+        # Re-wrap the text to the real target width (minus this label's
+        # own left/right padding) now that it's known, then remeasure -
+        # a wraplength fixed at construction time (this class's own
+        # earlier version) couldn't adapt to the anchor's actual width.
+        self.text_label.configure(wraplength=max(1, width - 20))
+        self.update_idletasks()
+        height = self.winfo_reqheight()
+        x = self.anchor.winfo_rootx() + self._MARGIN
+        y = self.anchor.winfo_rooty() + ah - height - self._MARGIN
+        self.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
 
     def _dismiss(self, event=None):
         if self._dismissed:
@@ -261,6 +291,19 @@ class _Toast(tk.Toplevel):
             pass
         if self._on_close:
             self._on_close()
+
+
+def _deselect_on_blank_click(tree, event):
+    # Clicking BELOW the last row (or otherwise on the tree's own empty
+    # background) is a real, common way to say "I'm done with that row" -
+    # ttk.Treeview's own built-in click handling only ever acts when a
+    # row IS under the cursor, so without this, the previously-selected
+    # row (and its own floating _RowActionBar) just stayed selected and
+    # highlighted indefinitely after clicking away from it (requested
+    # live, for both the shares list and the Users panel's own list).
+    # identify_row() returns "" for exactly this "no row here" case.
+    if not tree.identify_row(event.y):
+        tree.selection_remove(*tree.selection())
 
 
 def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs):
@@ -318,15 +361,20 @@ class _RowActionBar:
         self.bar = ttk.Frame(tree)
         tree.bind("<<TreeviewSelect>>", lambda e: self.update(), add="+")
         tree.bind("<Configure>", lambda e: self.update(), add="+")
-        # Scrolling doesn't fire either of the above - reposition (or hide,
-        # if the selected row scrolled out of view) after the fact, once
-        # the scroll itself has actually been applied.
-        tree.bind("<MouseWheel>", lambda e: tree.after_idle(self.update), add="+")
-        tree.bind("<Button-4>", lambda e: tree.after_idle(self.update), add="+")
-        tree.bind("<Button-5>", lambda e: tree.after_idle(self.update), add="+")
+        # Scrolling doesn't fire either of the above, but it also doesn't
+        # change WHICH row is selected or that row's own state - only
+        # reposition() (place() the ALREADY-built buttons at the row's
+        # new on-screen position), not a full update() (destroy every
+        # button and rebuild from scratch), which visibly flickered on
+        # every scroll notch/scrollbar-drag tick (reported live) for no
+        # reason: the exact same buttons were about to be rebuilt right
+        # back anyway.
+        tree.bind("<MouseWheel>", lambda e: tree.after_idle(self.reposition), add="+")
+        tree.bind("<Button-4>", lambda e: tree.after_idle(self.reposition), add="+")
+        tree.bind("<Button-5>", lambda e: tree.after_idle(self.reposition), add="+")
         if scrollbar is not None:
-            scrollbar.bind("<B1-Motion>", lambda e: tree.after_idle(self.update), add="+")
-            scrollbar.bind("<ButtonRelease-1>", lambda e: tree.after_idle(self.update), add="+")
+            scrollbar.bind("<B1-Motion>", lambda e: tree.after_idle(self.reposition), add="+")
+            scrollbar.bind("<ButtonRelease-1>", lambda e: tree.after_idle(self.reposition), add="+")
 
     def update(self):
         for child in self.bar.winfo_children():
@@ -345,6 +393,28 @@ class _RowActionBar:
         if not self.build_fn(self.bar, item):
             self.bar.place_forget()
             return
+        self._place(bbox)
+
+    def reposition(self):
+        # No destroy/rebuild - see __init__'s own comment for why. A
+        # no-op (not an error) if nothing's currently selected/built -
+        # scroll events fire this unconditionally regardless of selection.
+        if not self.bar.winfo_children():
+            return
+        selection = self.tree.selection()
+        if not selection:
+            self.bar.place_forget()
+            return
+        bbox = self.tree.bbox(selection[0])
+        if not bbox:
+            # Scrolled out of view - hidden, not destroyed, so scrolling
+            # it back into view can go straight to placing it again with
+            # no rebuild either.
+            self.bar.place_forget()
+            return
+        self._place(bbox)
+
+    def _place(self, bbox):
         self.bar.update_idletasks()
         x, y, _w, h = bbox
         bar_w = self.bar.winfo_reqwidth()
@@ -403,13 +473,21 @@ class _SortableTree:
     by clicking a heading (confirmed live: sorting by Share Name knocked
     the add-row to wherever "➕" happened to collate to instead of leaving
     it first)."""
-    def __init__(self, tree, columns, key_fn, pinned_first=None):
+    def __init__(self, tree, columns, key_fn, pinned_first=None, top_level_tag="stripe_row"):
         # columns: [(column_id, heading_label), ...] - column_id "#0" is
         # the tree's own hierarchy column. key_fn(item_id, column_id) -> str
         self.tree = tree
         self.columns = columns
         self.key_fn = key_fn
         self.pinned_first = pinned_first
+        # Which tag TOP-LEVEL rows alternate with - "stripe_row" (gray,
+        # the default) for a flat list with no children (the Users
+        # panel's own users_list), "share_stripe" (the add-row's own
+        # teal/blue) for shares_list, whose top-level rows are shares,
+        # not users - see _restripe()'s own comment for why these two
+        # need to be visually distinct colors, not just two instances of
+        # the same one.
+        self.top_level_tag = top_level_tag
         self.sort_col = None
         self.reverse = False
         for col_id, label in columns:
@@ -445,42 +523,66 @@ class _SortableTree:
         self._restripe(item_id)
 
     def _restripe(self, pinned_id):
-        # Alternates every data row - not just top-level ones, an expanded
-        # share's own user rows too (see shares_list's own nesting in
-        # _populate_shares_list()) - between the Treeview's own default
-        # background and the same light teal the pinned add-row uses
-        # ("stripe_row" tag, configured by the caller with
-        # background=_ADD_ROW_BG). One continuous count straight down the
-        # visible order, parents and children alike, not a count that
-        # resets inside each share's own children - starting with the
-        # DEFAULT background for the first data row, not teal, since the
-        # add-row directly above it already used teal - two teal rows back
-        # to back wouldn't read as alternating at all. Based on
-        # get_children()'s CURRENT (post-move/post-sort) order, not
-        # insertion order, so the stripe pattern stays correct after a
-        # column-heading sort reorders everything, not just on first load.
-        # Assigned once here regardless of whether a share is currently
-        # expanded or not - expand/collapse is a pure visibility toggle in
-        # ttk.Treeview, it doesn't change which rows exist, so a child row
-        # already carries the right tag the moment it's revealed rather
-        # than needing its own recompute on every <<TreeviewOpen>>.
-        self._restripe_index = 0
+        # Two INDEPENDENT alternations, not one continuous count down the
+        # whole visible order (an earlier version of this) - requested
+        # live, with a concrete example ("test1 should be blue... test 2
+        # [should be] white... and so on") once a share with zero users
+        # (breaking a single flat count's own parity) made that version's
+        # actual result stop matching what a share-only count would give:
+        #
+        # - Top-level (share) rows alternate on their OWN position among
+        #   OTHER SHARES only, via self.top_level_tag - how many users
+        #   any of them happen to have never shifts a later share's own
+        #   color. Starts on the DEFAULT background (not the tag), since
+        #   the pinned add-row right above the first one already reads as
+        #   its own distinct color - two tinted rows back to back
+        #   wouldn't read as alternating at all.
+        # - Each share's own user rows alternate on their position WITHIN
+        #   that one share specifically, via "stripe_row" (gray) - reset
+        #   to a fresh count for every share, not carried over from the
+        #   last one. Starts ON "stripe_row" (gray) this time, not the
+        #   default background - unlike the top-level count, there's no
+        #   pinned row directly above the first user row already using
+        #   that same color to avoid butting up against.
+        #
+        # Both based on get_children()'s CURRENT (post-move/post-sort)
+        # order, not insertion order, so the pattern stays correct after
+        # a column-heading sort reorders everything, not just on first
+        # load. Assigned once here regardless of whether a share is
+        # currently expanded or not - expand/collapse is a pure
+        # visibility toggle in ttk.Treeview, it doesn't change which rows
+        # exist, so a child row already carries the right tag the moment
+        # it's revealed rather than needing its own recompute on every
+        # <<TreeviewOpen>>.
+        top_index = 0
         for item in self.tree.get_children(""):
             if item == pinned_id:
                 continue
-            self._restripe_walk(item)
-
-    def _restripe_walk(self, item):
-        self.tree.item(item, tags=("stripe_row",) if self._restripe_index % 2 == 1 else ())
-        self._restripe_index += 1
-        for child in self.tree.get_children(item):
-            self._restripe_walk(child)
+            self.tree.item(item, tags=(self.top_level_tag,) if top_index % 2 == 1 else ())
+            top_index += 1
+            child_index = 0
+            for child in self.tree.get_children(item):
+                self.tree.item(child, tags=("stripe_row",) if child_index % 2 == 0 else ())
+                child_index += 1
 
 
 # Matches tour.py's own _CALLOUT_BG - same light teal tint the tour's own
 # callout bubble uses, reused here for visual consistency across the app's
 # other "here's something to notice" surfaces.
 _ADD_ROW_BG = "#eaf6f8"
+
+# A plain neutral gray for the "stripe_row" tag specifically - NOT
+# _ADD_ROW_BG, even though an earlier version of this used the exact same
+# teal for both. That coincidentally matches nassie_ttk's own Treeview
+# -background selected style (light.tcl/dark.tcl: {selected "#eaf6f8"}),
+# so a selected row with no stripe of its own (an even-index share row,
+# say) rendered the identical color a stripe_row-tagged row does - read
+# as "the alternating pattern is broken here" (reported live, with a
+# concrete example: a share row selected mid-sequence looked exactly
+# like its own striped neighbor instead of looking selected). Gray reads
+# unambiguously as "just a stripe" against that same blue "selected"
+# highlight, and can't be confused with it as _ADD_ROW_BG was.
+_STRIPE_BG = "#f2f2f2"
 
 # The visual gap between a side panel and the shares list - pack()'s
 # padx for the Users panel (_pack_users_panel()), place()'s own width
@@ -847,6 +949,72 @@ class ChoiceDialog(tk.Toplevel):
         self.destroy()
 
 
+class PasswordPromptDialog(tk.Toplevel):
+    """Asks for one password, styled to match every other NASsie dialog
+    (✔/✖ icon buttons - see AddUserDialog/ChoiceDialog) instead of the
+    stdlib tkinter.simpledialog.askstring()'s plain OK/Cancel text
+    buttons - reused everywhere a current or new password needs asking
+    for (QR code generation, password resets, granting access to an
+    existing account, ...), which were the only prompts left still using
+    that plain stdlib look instead of NASsie's own (requested live:
+    "we've also used check marks and x everywhere else"). result is the
+    entered password, or None if cancelled - same contract as
+    simpledialog.askstring() itself, so this drops straight in wherever
+    that was used before.
+
+    on_shown (optional) fires with this dialog once it's fully built and
+    positioned, right before the modal grab - the one caller that needs
+    it (QR code's own tour step, see tour.py) uses it to notify the tour
+    this dialog just opened, same as CreateShareDialog/AddUserDialog do
+    from inside their own __init__ - but as an opt-in callback here
+    instead of hardcoded into this class, since the other three callers
+    of this same dialog have nothing to do with that specific tour step."""
+    def __init__(self, parent, title, prompt, on_shown=None):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.result = None
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text=prompt, wraplength=280, justify="left").grid(
+            row=0, column=0, columnspan=2, padx=8, pady=(8, 4), sticky="w"
+        )
+        self.password_var = tk.StringVar()
+        entry = ttk.Entry(body, textvariable=self.password_var, show="*", width=32)
+        entry.grid(row=1, column=0, columnspan=2, padx=8, pady=4)
+        entry.focus_set()
+        # Return-to-confirm - a password field is the one place in this
+        # dialog where typing then reaching for the mouse just to click
+        # the checkmark reads as an unnecessary extra step.
+        entry.bind("<Return>", lambda e: self._on_ok())
+
+        # Cancel first (left), primary action second (right) - see
+        # AddUserDialog's identical btn_frame for the same convention.
+        btn_frame = ttk.Frame(body)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        # Kept on self (not local-only) - see AddUserDialog's identical
+        # self.cancel_button for why: the tour's own "click Cancel" step
+        # (see tour.py) needs a real widget handle to point at, the last
+        # control at the BOTTOM of this stacked prompt/entry/buttons
+        # layout.
+        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self.destroy, shadow=True)
+        self.cancel_button.pack(side="left", padx=4)
+        _icon_button(btn_frame, "✔", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
+
+        _center_over_parent(self, parent)
+        _bring_window_to_front(self)
+        if on_shown is not None:
+            on_shown(self)
+        self.grab_set()
+        self.wait_window(self)
+
+    def _on_ok(self):
+        self.result = self.password_var.get()
+        self.destroy()
+
+
 class QrCodeDialog(tk.Toplevel):
     """Shows a LockNAS bridge QR code for one just-created (or just-granted)
     user. Only ever constructible with a payload already in hand - NASsie
@@ -1146,23 +1314,17 @@ class CreateShareDialog(tk.Toplevel):
             # Release this dialog's modal grab before the follow-on toast
             # rather than nesting a new grab underneath it.
             self.destroy()
-            # Toast created BEFORE notifying "share_created" - that event
-            # is what advances the tour onto its own "Confirmation" step,
-            # and this toast's on_close is what that step now waits on
-            # (see _Toast's own docstring), so it has to already exist by
-            # the time that step is shown.
             self.app._show_toast(
                 "Share Creation",
-                "Configuration attempt finished — see the log for details.\n\n"
+                f"Share '{self.wizard.share_name}' created.\n\n"
                 "Add users from the shares list (New User / Attach User) whenever you're ready.",
-                on_close=lambda: self.app._notify_tour("share_apply_confirmed"),
             )
             self.app._notify_tour("share_created")
         else:
             self.create_button.button.configure(state="normal")
             messagebox.showerror(
                 "Share Creation Failed",
-                "Configuration attempt failed — see the log for details.",
+                "Configuration attempt failed.",
                 parent=self,
             )
 
@@ -1205,15 +1367,18 @@ class UserManagementPanel:
         self.wizard = app.wizard
         self.frame = ttk.Frame(parent)
 
+        # No "Manage Users" title above this anymore, and no top padding
+        # on body either (below) - both dropped together so this panel's
+        # own tree starts at the exact same y as the shares list's tree
+        # (_shares_body's tree_frame, packed with zero padding of its
+        # own - see _build_shares_page()) instead of sitting lower by
+        # whatever the title label plus its own top inset used to cost.
+        #
         # Kept on self (not local-only) so other code can reach into
-        # this panel's own header/body - e.g. the tour pointing a step
-        # at a specific field inside it.
-        self.header = header = ttk.Frame(self.frame)
-        header.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(header, text="Manage Users", font=("TkDefaultFont", 11, "bold")).pack(side="left")
-
+        # this panel's own body - e.g. the tour pointing a step at a
+        # specific field inside it.
         self.body = body = ttk.Frame(self.frame)
-        body.pack(fill="both", expand=True, padx=8, pady=8)
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         # Set for real in refresh() (the only place the actual row gets
         # (re)created) - see _add_share_row_id's identical reasoning in
@@ -1228,6 +1393,13 @@ class UserManagementPanel:
         self._sort = _SortableTree(
             self.users_list, [("#0", "Username")], key_fn=lambda k, c: self.users_list.item(k, "text"),
             pinned_first=lambda: self._add_user_row_id,
+            # This panel's own rows are ACCOUNTS, the same kind of
+            # top-level thing shares_list's own share rows are - not
+            # ATTACHED users (a share's own nested rows there), which is
+            # what gray/"stripe_row" is reserved for now (requested
+            # live). "share_stripe" (the add-row's own teal) matches the
+            # shares list's identical top-level alternation instead.
+            top_level_tag="share_stripe",
         )
         self.users_list.column("#0", width=220, stretch=True)
         self.users_list.grid(row=0, column=0, sticky="nsew")
@@ -1238,10 +1410,15 @@ class UserManagementPanel:
         # tag's colors from here on (idle/hover/pressed) - no separate
         # tag_configure needed alongside it.
         self._add_row_feedback = _AddRowFeedback(self.users_list, lambda: self._add_user_row_id)
-        # Alternates every OTHER data row with the same teal, starting
-        # one row below the add-row (see _SortableTree._restripe()) -
-        # requested live, matching the shares list's identical tag.
-        self.users_list.tag_configure("stripe_row", background=_ADD_ROW_BG)
+        # Alternates every OTHER account row with the add-row's own teal,
+        # starting one row below the add-row (see
+        # _SortableTree._restripe()) - matches the shares list's own
+        # top-level alternation ("share_stripe" - see that tag's
+        # identical use there). No "stripe_row" (gray) tag_configure here
+        # any more - this list's own rows are never nested under
+        # anything, so that tag (reserved for a share's own ATTACHED
+        # user rows specifically) would never actually get applied here.
+        self.users_list.tag_configure("share_stripe", background=_ADD_ROW_BG)
         vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.users_list.yview)
         vscroll.grid(row=0, column=1, sticky="ns")
         self.users_list.configure(yscrollcommand=vscroll.set)
@@ -1254,6 +1431,7 @@ class UserManagementPanel:
         # the add-row, not binding order).
         self._action_bar = _RowActionBar(self.users_list, vscroll, self._build_action_bar)
         self.users_list.bind("<<TreeviewSelect>>", self._on_users_list_select, add="+")
+        self.users_list.bind("<Button-1>", lambda e: _deselect_on_blank_click(self.users_list, e), add="+")
 
     def _on_users_list_select(self, event=None):
         # Selecting the add-row (see refresh()) opens the real dialog
@@ -1373,10 +1551,9 @@ class UserManagementPanel:
                 return
             share_name = dialog.result
 
-        password = simpledialog.askstring(
-            "New password", f"New password for '{username}' (replaces their current one):",
-            show="*", parent=self.app.root,
-        )
+        password = PasswordPromptDialog(
+            self.app.root, "New password", f"New password for '{username}' (replaces their current one):",
+        ).result
         if not password:
             return
 
@@ -1531,6 +1708,23 @@ class GUIWizard:
 
         self._refresh_all_lists()
 
+        # Clears whichever row is currently selected (in either list) once
+        # the user clicks away to a totally different application -
+        # requested live, same idea as _deselect_on_blank_click() but for
+        # leaving the window entirely rather than clicking its own empty
+        # background. <FocusOut> alone can't tell those apart from
+        # focus moving to one of NASsie's OWN dialogs (AddUserDialog,
+        # CreateShareDialog, ...), which ALSO fires it on root the moment
+        # one of them opens and steals focus - deselecting then would undo
+        # a selection those dialogs are actively acting on. focus_get()
+        # right after distinguishes the two: it returns whichever widget
+        # currently holds focus among ALL of this application's own
+        # windows (Tk tracks that across every Toplevel in the same
+        # interpreter, not just root), so it comes back non-None whenever
+        # focus only moved to one of those, and None only once it's left
+        # every NASsie window there is.
+        self.root.bind("<FocusOut>", self._on_root_focus_out, add="+")
+
         # Tk has no built-in "center on screen" - left alone, the window
         # manager decides placement, which is commonly the top-left corner
         # rather than anywhere near the middle of the display.
@@ -1650,22 +1844,52 @@ class GUIWizard:
 
         # The logo alone, no "NASsie" text label alongside it - the window's
         # own titlebar already carries the name (see __init__'s root.title()),
-        # so repeating it here was pure redundancy. expand=True (rather than
-        # a plain side="left") is what actually centers it: pack's default
-        # anchor is "center", and expand=True grows this label's own cavity
-        # to fill whatever space isn't claimed by the busy bar's side="right"
-        # packing in _busy_start() below, so the icon centers in whatever
-        # room is left rather than sitting flush against the window's edge.
+        # so repeating it here was pure redundancy. place(), not
+        # pack(side="left", expand=True) (an earlier version of this) - a
+        # packed sibling recenters within whatever cavity is LEFT once
+        # something else claims space in the same frame, so the busy
+        # bar's own side="right" packing in _busy_start() below visibly
+        # shifted the logo left every time it appeared/disappeared
+        # (reported live). place(relx=0.5, anchor="n") centers against
+        # this frame's own full, constant width instead - the busy bar
+        # (a plain sibling place() coexists fine with, unlike a second
+        # pack() geometry manager on the same parent) can come and go
+        # with zero effect on where the logo sits horizontally.
+        icon_label = None
         if self._icon_image:
             scale = max(1, self._icon_image.width() // 56)
             self._header_icon_image = self._icon_image.subsample(scale, scale)
-            ttk.Label(header, image=self._header_icon_image).pack(side="left", expand=True)
+            icon_label = ttk.Label(header, image=self._header_icon_image)
+
         # Indeterminate progress bar doubling as a busy spinner - packed
         # only while at least one background action is running (see
         # _busy_start/_busy_stop), not a fixed part of the layout, so it
         # doesn't take up space or draw the eye when nothing is happening.
         self._busy_bar = ttk.Progressbar(header, mode="indeterminate", length=100)
         self._busy_count = 0
+
+        # Fixes header's own height, so the logo doesn't shift VERTICALLY
+        # either - place()'d children (the logo, above) don't contribute
+        # to a frame's own natural size the way pack()'d ones do, and the
+        # busy bar is shorter than the logo, so without this, header's
+        # own height would just follow whichever of the two happens to be
+        # packed at the time (nothing, when idle - collapsing header to
+        # near zero) rather than staying constant. Measured against both
+        # candidates directly instead of a guessed constant - packs the
+        # busy bar just long enough to read its own real height, then
+        # unpacks it again; _busy_start() below repacks it for real once
+        # a background action actually starts.
+        header.update_idletasks()
+        icon_h = icon_label.winfo_reqheight() if icon_label else 0
+        self._busy_bar.pack(side="right", padx=(0, 10))
+        header.update_idletasks()
+        busy_h = self._busy_bar.winfo_reqheight()
+        self._busy_bar.pack_forget()
+        header.configure(height=max(icon_h, busy_h))
+        header.pack_propagate(False)
+
+        if icon_label is not None:
+            icon_label.place(relx=0.5, y=0, anchor="n")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=8, pady=(10, 0))
 
@@ -1695,7 +1919,15 @@ class GUIWizard:
         existing = getattr(self, "_active_toast", None)
         if existing is not None:
             existing._dismiss()
-        self._active_toast = _Toast(parent or self.root, title, text, on_close=on_close)
+        # anchor=self.shares_list, always - every one of these actions
+        # (share/user created, attached, detached, deleted, removed) is
+        # about the main pane's own content regardless of which window
+        # `parent` happens to be, and centering on root's own full width
+        # instead would drift off-center from the actual shares list
+        # whenever a side panel is open and root is wider than it.
+        self._active_toast = _Toast(
+            parent or self.root, title, text, on_close=on_close, anchor=self.shares_list,
+        )
 
     def _notify_tour(self, event, window=None):
         # The active GuiTour (if any) advances itself on real actions
@@ -1748,26 +1980,30 @@ class GUIWizard:
             tour.show_name_error(message)
 
     def _offer_tour_resume(self):
-        # Restarts from step one, not literally mid-step - there's no
-        # meaningful way to resume mid-action-driven-flow across a
-        # process restart anyway (the exact dialog/step state it
-        # interrupted on is gone with the old process), so "continue"
-        # and "redo" are the same operation here: run the tour again.
+        # Picks back up at (close to) the furthest step actually reached
+        # last time (tour_progress_index()), not necessarily literally -
+        # a step that only resolves against a dialog from the OLD process
+        # can't be resumed exactly, so GuiTour.start()'s own
+        # _resolve_resume_index() steps back to the nearest one that can
+        # (see its comment). Still real progress kept either way, not a
+        # full restart from step one every time - the whole reason this
+        # tracks a step index at all, not just a bare "started" flag.
         if messagebox.askyesno(
             "Resume Tour",
             "It looks like the guided tour didn't finish last time.\n\n"
-            "Continue it now?",
+            "Continue where you left off?",
         ):
-            self._start_tour()
+            self._start_tour(resume_index=tour_progress_index())
         else:
             mark_tour_completed()
 
-    def _start_tour(self):
-        # Rebuilt each time rather than cached - a stale GuiTour with a
-        # half-run index would otherwise resume mid-tour instead of
-        # restarting from step one on the next click.
+    def _start_tour(self, resume_index=0):
+        # Rebuilt each time rather than cached - a stale in-memory GuiTour
+        # from earlier this same process would otherwise carry its own
+        # leftover index/state into a fresh run instead of starting clean
+        # at exactly resume_index.
         self._tour = GuiTour(self)
-        self._tour.start()
+        self._tour.start(resume_index=resume_index)
 
     def _build_shares_page(self):
         # The only page - see the shares/users restructuring discussion:
@@ -1850,6 +2086,11 @@ class GUIWizard:
             self.shares_list, [("#0", "Share Name"), ("path", "Path")],
             key_fn=lambda k, c: self.shares_list.item(k, "text") if c == "#0" else self.shares_list.set(k, c),
             pinned_first=lambda: self._add_share_row_id,
+            # Top-level rows here are SHARES, not users - "share_stripe"
+            # (the add-row's own teal), not "stripe_row" (gray, used for
+            # each share's own nested user rows instead - see
+            # _restripe()'s own comment for the full two-tier scheme).
+            top_level_tag="share_stripe",
         )
         self.shares_list.column("#0", width=220, stretch=False)
         self.shares_list.column("path", width=320, stretch=True)
@@ -1862,10 +2103,13 @@ class GUIWizard:
         # _AddRowFeedback owns the tag's colors from here on
         # (idle/hover/pressed) - matches the users list's identical use.
         self._add_row_feedback = _AddRowFeedback(self.shares_list, lambda: self._add_share_row_id)
-        # Alternates every OTHER data row with the same teal, starting
-        # one row below the add-row (see _SortableTree._restripe()) -
-        # requested live, matching the users list's identical tag.
-        self.shares_list.tag_configure("stripe_row", background=_ADD_ROW_BG)
+        # Two independent alternations now, not one shared tag - see
+        # _SortableTree._restripe()'s own comment for the full scheme.
+        # "share_stripe" (the add-row's own teal) alternates each OTHER
+        # share row; "stripe_row" (gray) alternates each share's own
+        # nested user rows, on their position within just that share.
+        self.shares_list.tag_configure("share_stripe", background=_ADD_ROW_BG)
+        self.shares_list.tag_configure("stripe_row", background=_STRIPE_BG)
 
         shares_vscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.shares_list.yview)
         shares_vscroll.grid(row=0, column=1, sticky="ns")
@@ -1881,6 +2125,7 @@ class GUIWizard:
         # keeps the bar hidden for it, not binding order.
         self._share_action_bar = _RowActionBar(self.shares_list, shares_vscroll, self._build_share_action_bar)
         self.shares_list.bind("<<TreeviewSelect>>", self._on_shares_list_select, add="+")
+        self.shares_list.bind("<Button-1>", lambda e: _deselect_on_blank_click(self.shares_list, e), add="+")
 
         self._shares_body.pack(side="left", fill="both", expand=True)
 
@@ -2331,6 +2576,20 @@ class GUIWizard:
             return self.shares_list.item(parent, "text"), self.shares_list.set(item, "username") or None
         return self.shares_list.item(item, "text"), None
 
+    def _on_root_focus_out(self, event=None):
+        # See __init__'s own comment on this binding for why focus_get()
+        # is what actually distinguishes "clicked away to another
+        # application" from "focus moved to one of NASsie's own dialogs".
+        try:
+            if self.root.focus_get() is not None:
+                return
+            self.shares_list.selection_remove(*self.shares_list.selection())
+            self._user_mgmt_panel.users_list.selection_remove(*self._user_mgmt_panel.users_list.selection())
+        except tk.TclError:
+            # Root (or one of these lists) mid-teardown - this can fire
+            # during final window close, nothing left worth clearing.
+            pass
+
     def _refresh_all_lists(self):
         # Called after every mutating action, so nothing ever needs a
         # manual refresh. list_shares/list_groups each shell out
@@ -2357,6 +2616,17 @@ class GUIWizard:
 
     def _append_log(self, text):
         self._log_panel.append(text)
+
+    def _failure_text(self, summary, log_output):
+        # Surfaces the actual captured command output/error inline,
+        # rather than just pointing at the Log panel - it's hidden by
+        # default (a docked panel the user has to explicitly toggle open,
+        # see LogPanel's own docstring), so a bare "see log" left the
+        # real reason (e.g. "Permission denied" - the command wasn't run
+        # with raised/elevated permissions) invisible unless the user
+        # already knew to go open that panel first.
+        detail = log_output.strip()
+        return summary if not detail else f"{summary}\n\n{detail}"
 
     def _populate_shares_list(self, shares, overrides=None):
         # list_shares() only reflects live share config (Get-SmbShare /
@@ -2507,9 +2777,10 @@ class GUIWizard:
         # Harmless most of the time (the next _refresh_all_lists() papers
         # over it once the worker finishes) but a real gap right after
         # this call returns - e.g. the tour's own "Delete Share" step
-        # (see tour.py), reached via the "attach_apply_confirmed" event
-        # this same attach fires, needs the row's real 3rd button to
-        # exist THEN, not just eventually once refresh catches up.
+        # (see tour.py), reached via the "user_attached" event
+        # _grant_access_done() fires once this same attach succeeds,
+        # needs the row's real 3rd button to exist THEN, not just
+        # eventually once refresh catches up.
         self._share_action_bar.update()
         if not username:
             return
@@ -2533,9 +2804,9 @@ class GUIWizard:
         password = None
         if not already_has_password:
             self._notify_tour("attach_password_needed")
-            password = simpledialog.askstring(
-                "Password", f"Set a password for '{username}' on this share:", show="*", parent=self.root,
-            )
+            password = PasswordPromptDialog(
+                self.root, "Password", f"Set a password for '{username}' on this share:",
+            ).result
             if not password:
                 self._share_action_bar.update()
                 return
@@ -2601,10 +2872,10 @@ class GUIWizard:
         if not share_name or not username:
             messagebox.showinfo("Show QR Code", "Select a user under a share first.")
             return
-        password = simpledialog.askstring(
-            "Show QR Code", f"Enter '{username}'s current password to show their QR code:",
-            show="*", parent=self.root,
-        )
+        password = PasswordPromptDialog(
+            self.root, "Show QR Code", f"Enter '{username}'s current password to show their QR code:",
+            on_shown=lambda dlg: self._notify_tour("qr_dialog_opened", window=dlg),
+        ).result
         if not password:
             # Harmless no-op outside the tour - see on_event()'s own
             # guard - but during the tour's own "QR Code" step this IS
@@ -2641,10 +2912,9 @@ class GUIWizard:
             return
         if not messagebox.askokcancel("Change Password", QR_PASSWORD_RESET_NOTE, parent=self.root):
             return
-        password = simpledialog.askstring(
-            "New password", f"New password for '{username}' (replaces their current one):",
-            show="*", parent=self.root,
-        )
+        password = PasswordPromptDialog(
+            self.root, "New password", f"New password for '{username}' (replaces their current one):",
+        ).result
         if not password:
             return
         share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
@@ -2730,7 +3000,9 @@ class GUIWizard:
             # but a FAILURE still needs to interrupt: the row silently
             # not changing could otherwise look identical to "there was
             # nothing to change."
-            messagebox.showerror("Failed", f"Could not change {username}'s access level — see log.")
+            messagebox.showerror(
+                "Failed", self._failure_text(f"Could not change {username}'s access level.", log_output)
+            )
         self._refresh_all_lists()
 
     def _grant_access_worker(self, share_name, username, password, read_only=False, confirm_qr=True, parent_window=None):
@@ -2765,12 +3037,7 @@ class GUIWizard:
         target = parent_window or self.root
         if added:
             self._notify_tour("user_attached")
-            # Toast created BEFORE "attach_apply_confirmed" would ever
-            # need to fire - see _apply_done's identical ordering comment.
-            self._show_toast(
-                "Added", f"Added '{username}' to share '{share_name}'.", parent=target,
-                on_close=lambda: self._notify_tour("attach_apply_confirmed"),
-            )
+            self._show_toast("Added", f"Added '{username}' to share '{share_name}'.", parent=target)
             # password is None for an existing, unmanaged Windows account
             # NASsie deliberately left untouched (see
             # _add_user_to_share_windows) - there's no password to encode,
@@ -2779,7 +3046,9 @@ class GUIWizard:
                 self._offer_qr_codes(share_name, [{"username": username, "password": password}], confirm=confirm_qr)
         else:
             messagebox.showerror(
-                "Failed", f"Could not add '{username}' to share '{share_name}' — see log.", parent=target
+                "Failed",
+                self._failure_text(f"Could not add '{username}' to share '{share_name}'.", log_output),
+                parent=target,
             )
         self._refresh_all_lists()
 
@@ -2801,7 +3070,7 @@ class GUIWizard:
         if revoked:
             self._show_toast("Detached", f"Removed {username}'s access to '{share_name}'.")
         else:
-            messagebox.showerror("Failed", f"Could not remove access — see log.")
+            messagebox.showerror("Failed", self._failure_text("Could not remove access.", log_output))
         self._refresh_all_lists()
 
     def _delete_user_worker(self, username):
@@ -2823,7 +3092,7 @@ class GUIWizard:
             self._show_toast("Deleted", f"Deleted user '{username}'.", parent=self.root)
         else:
             messagebox.showerror(
-                "Failed", f"Could not delete user '{username}' — see log.", parent=self.root
+                "Failed", self._failure_text(f"Could not delete user '{username}'.", log_output), parent=self.root
             )
         self._refresh_all_lists()
 
@@ -2843,16 +3112,11 @@ class GUIWizard:
         if log_output.strip():
             self._append_log(log_output)
         if created:
-            # Toast created BEFORE notifying "user_created" - see
-            # _apply_done's identical ordering comment.
-            self._show_toast(
-                "User Creation", f"'{username}' has been created.", parent=self.root,
-                on_close=lambda: self._notify_tour("user_apply_confirmed"),
-            )
+            self._show_toast("User Creation", f"'{username}' has been created.", parent=self.root)
             self._notify_tour("user_created")
         else:
             messagebox.showerror(
-                "Failed", f"Could not set up user '{username}' — see log.", parent=self.root
+                "Failed", self._failure_text(f"Could not set up user '{username}'.", log_output), parent=self.root
             )
         self._refresh_all_lists()
 
@@ -2911,7 +3175,7 @@ class GUIWizard:
                 "Removed", f"Removed share: {name}" + (" (folder deleted too)" if delete_folder else "")
             )
         else:
-            messagebox.showerror("Failed", f"Could not remove share '{name}' — see log.")
+            messagebox.showerror("Failed", self._failure_text(f"Could not remove share '{name}'.", log_output))
         self._refresh_all_lists()
 
     def _offer_qr_codes(self, share_name, users, confirm=True):
