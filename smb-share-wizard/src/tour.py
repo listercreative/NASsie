@@ -1,7 +1,7 @@
 import os
 import platform
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
 # Matches the app icon's teal (the serpent body/water) - a light tint of the
 # same hue for the callout background, rather than an unrelated color, so
@@ -154,12 +154,40 @@ def tour_state():
     return "completed" if content == "completed" else "interrupted"
 
 
-def mark_tour_started():
-    _write_tour_state("started")
+def mark_tour_started(index=0):
+    # index - the current step (see GuiTour.index) - rides along in the
+    # same "started" marker as "started:<index>", rather than a separate
+    # file, so there's only ever one source of truth for "is a tour in
+    # flight, and if so where". Read back by tour_progress_index() on the
+    # next launch (see GUIWizard._offer_tour_resume()) to pick the
+    # walkthrough back up close to where it left off instead of forcing a
+    # full restart from step one.
+    _write_tour_state(f"started:{index}")
 
 
 def mark_tour_completed():
     _write_tour_state("completed")
+
+
+def tour_progress_index():
+    # The furthest step index a previous, interrupted run reached (see
+    # mark_tour_started()'s own comment) - 0 if there's no marker, it's
+    # already "completed", or it predates this field ever existing (a
+    # bare "started" with no ":<index>", from an older NASsie version -
+    # falls back to a plain restart from step one, same as before this
+    # existed, rather than erroring on it).
+    path = _first_run_marker_path()
+    try:
+        with open(path) as f:
+            content = f.read().strip()
+    except OSError:
+        return 0
+    if not content.startswith("started:"):
+        return 0
+    try:
+        return max(0, int(content.split(":", 1)[1]))
+    except ValueError:
+        return 0
 
 
 def _write_tour_state(state):
@@ -328,9 +356,16 @@ class _Callout(tk.Toplevel):
     # track it explicitly instead - see GuiTour._track_container(). No
     # Next/Back buttons - see GuiTour's docstring for why each step
     # advances itself once its real action actually happens, rather than
-    # being paced by clicks through a narrated slideshow. Skip is the one
-    # manual escape hatch throughout (relabeled "Close" for the final,
-    # non-gated step).
+    # being paced by clicks through a narrated slideshow. (An earlier
+    # version of this session tried adding them - abandoned: several
+    # steps' own dialogs hold a real Tk grab, which blocks mouse clicks on
+    # this separate Toplevel entirely, and no reliable app-level
+    # workaround was ever found for that. See GUIWizard._offer_tour_resume()
+    # instead - closing NASsie mid-tour and reopening it picks the tour
+    # back up close to where it left off, which covers the same underlying
+    # need without requiring in-session back/forward navigation at all.)
+    # Skip is the one manual escape hatch throughout (relabeled "Close"
+    # for the final, non-gated step).
     def __init__(self, parent_window, title, text, on_skip, skip_label="Skip Tour"):
         super().__init__(parent_window)
         # Withdrawn immediately, before anything below is even built -
@@ -407,15 +442,16 @@ class _Callout(tk.Toplevel):
 
     def pause_relift(self):
         # For the ONE case this recurring lift() actively fights instead
-        # of helps: the Skip Tour confirmation (see GuiTour._confirm_and_
-        # stop()) is a modal messagebox spawned by a button ON this very
-        # callout - Tk still services other after() callbacks during a
-        # modal tk_messageBox's own nested event loop, so left running,
-        # this timer kept winning the stacking race against a dialog IT
-        # ITSELF triggered, burying the confirmation the user just opened
-        # underneath the callout that opened it (reported live). Callers
-        # must pair this with resume_relift() once the modal call
-        # returns.
+        # of helps: GuiTour._confirm_and_stop() opens its own confirmation
+        # dialog (see _ConfirmDialog) from a button ON this very callout,
+        # and ALSO sets that dialog "-topmost" (needed against every
+        # OTHER always-on-top NASsie window - see _ConfirmDialog's own
+        # docstring). Between two topmost windows, stacking order still
+        # just follows whichever was raised most recently - Tk keeps
+        # servicing other after() callbacks during that dialog's own
+        # wait_window() loop, so left running, this timer would
+        # eventually re-win and bury the very dialog it opened. Callers
+        # must pair this with resume_relift() once the dialog closes.
         self._cancel_relift()
 
     def resume_relift(self):
@@ -645,6 +681,102 @@ class _Callout(tk.Toplevel):
         self.lift()
 
 
+class _ConfirmDialog(tk.Toplevel):
+    """A small Yes/No confirmation, built as another tour window - same
+    borderless, overrideredirect, teal-bordered look every other tour
+    step's own _Callout has - rather than a native OS dialog. Used in
+    place of tkinter.messagebox.askyesno() for the Skip Tour confirmation
+    specifically (see GuiTour._confirm_and_stop()). Two things read wrong
+    with an OS-chrome popup here, both confirmed live, first with a plain
+    tk_messageBox and then with a normal decorated Toplevel: it looked
+    out of place next to every other tour surface (all borderless
+    callouts, no titlebar), and - the more important one - it never
+    reliably stacked to the front either way. That second part traces
+    back to the exact same reason _Callout's own docstring gives for why
+    IT uses "-topmost" instead of the stacking-order tricks used
+    elsewhere in this file: a WM-managed (decorated) window's stacking
+    under this Wayland/XWayland setup isn't reliably driven by
+    "-topmost" the way an overrideredirect window's is, since Mutter
+    isn't managing an overrideredirect window's stacking at all. Going
+    overrideredirect here isn't just cosmetic, in other words - it's
+    what actually fixes "doesn't go to the front" too."""
+    def __init__(self, parent, title, text):
+        super().__init__(parent)
+        self.withdraw()
+        self.transient(parent)
+        self.overrideredirect(True)
+        self.protocol("WM_DELETE_WINDOW", self._no)
+        self.result = False
+        # Same border/background recipe as _Callout - see its own
+        # comment on _HIGHLIGHT_COLOR/_CALLOUT_BG.
+        self.configure(bg=_HIGHLIGHT_COLOR, padx=2, pady=2)
+
+        inner = tk.Frame(self, bg=_CALLOUT_BG)
+        inner.pack(fill="both", expand=True)
+        ttk.Label(
+            inner, text=title, font=("TkDefaultFont", 11, "bold"), background=_CALLOUT_BG,
+        ).pack(anchor="w", padx=10, pady=(10, 2))
+        ttk.Label(
+            inner, text=text, background=_CALLOUT_BG, wraplength=260, justify="left",
+        ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        btn_row = tk.Frame(inner, bg=_CALLOUT_BG)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btn_row, text="No", command=self._no).pack(side="right")
+        ttk.Button(btn_row, text="Yes", command=self._yes).pack(side="right", padx=(0, 6))
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 2
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.deiconify()
+        # See _Callout's own identical attribute for why this is
+        # permanent, not toggled - every NASsie window (this one
+        # included) needs to stay above other applications for as long
+        # as it's open.
+        self.attributes("-topmost", True)
+        self.lift()
+        # A single -topmost/lift() right after a window is first created
+        # and mapped, confirmed live (bisected across a dozen runs, ~1 in
+        # 3 reproducing it), can still race the WM/X server actually
+        # processing it and land un-topmost regardless - not fixed by
+        # adding more update()/update_idletasks() calls here either, only
+        # by giving it more real wall-clock time to land. Reasserting on
+        # a short recurring timer (same technique _Callout's own
+        # _relift() uses) catches that within one tick instead of
+        # depending on a single call winning the race every time -
+        # cancelled on <Destroy> below.
+        self._relift_job = None
+        self.bind("<Destroy>", self._cancel_relift, add="+")
+        self._relift()
+        self.grab_set()
+        self.focus_set()
+
+    def _relift(self):
+        try:
+            self.attributes("-topmost", True)
+            self.lift()
+        except tk.TclError:
+            return
+        self._relift_job = self.after(150, self._relift)
+
+    def _cancel_relift(self, event=None):
+        if self._relift_job is not None:
+            try:
+                self.after_cancel(self._relift_job)
+            except tk.TclError:
+                pass
+            self._relift_job = None
+
+    def _yes(self):
+        self.result = True
+        self.destroy()
+
+    def _no(self):
+        self.result = False
+        self.destroy()
+
+
 class GuiTour:
     """A short, skippable tour that advances itself as the user actually
     completes each step's real action (open a dialog, create a share,
@@ -754,20 +886,15 @@ class GuiTour:
              "Folder",
              "Pick a folder for this share or use the provided default, then click OK.",
              "share_created"),
-            # No widget (None) - the "Share Creation" toast that follows
-            # (see GUIWizard._show_toast()) is a plain tk.Toplevel of its
-            # own, floating in root's own corner rather than sitting
-            # inside it, so there's nothing meaningful here for
-            # place_near() to point at (see _Callout.
-            # place_outside_container()). Container is gui.root, not
-            # _active_window - the CreateShareDialog that opened it is
-            # already destroyed by this point (same as every step after it).
-            # wait_event now fires from the toast's own on_close, not a
-            # blocking messagebox's OK click - see _apply_done().
-            (lambda: gui.root, None,
-             "Confirmation", "A confirmation toast appears in the corner - dismiss it (✕) or wait for "
-             "it to disappear.",
-             "share_apply_confirmed"),
+            # No separate "Confirmation" step after this one anymore - the
+            # "Share Creation" toast that follows (GUIWizard._show_toast())
+            # is self-explanatory on its own, and a callout ABOUT it ended
+            # up landing right on top of it (both center on the shares
+            # list's own bottom area now - see _Toast's own docstring),
+            # covering the very thing it was explaining (reported live).
+            # The next step just picks up once "share_created" fires,
+            # same as every other step whose own action doesn't need a
+            # separate acknowledgment.
 
             (lambda: gui.root, lambda: gui._users_toggle_btn.label,
              "Manage Users", "Open Manage Users to create and delete user accounts.",
@@ -783,12 +910,9 @@ class GuiTour:
             (lambda: self._active_window, lambda: _HighlightWholeDialog(self._active_window.username_entry),
              "Username and Password", "Type a username and password, then click OK.",
              "user_created"),
-            # See the identical "share_apply_confirmed" step above - same
-            # toast-based confirmation, same reasoning for widget=None.
-            (lambda: gui.root, None,
-             "Confirmation", "A confirmation toast appears in the corner - dismiss it (✕) or wait for "
-             "it to disappear.",
-             "user_apply_confirmed"),
+            # No separate "Confirmation" step after this one either - see
+            # the identical removal (and its own comment) right after
+            # "Folder" above.
             # Same toggle button as the "Manage Users" step above - closing
             # the panel is just clicking it again now, not a native
             # titlebar ✕ (there's no separate window left to have one -
@@ -821,32 +945,32 @@ class GuiTour:
              "Attach User",
              "Press Attach User.",
              "attach_dropdown_opened"),
-            (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[0],
+            # _PointAtOnly - the combobox itself still gets the usual
+            # highlight box, but place_near()'s normal "is there a
+            # sibling in the way" room check has no way to see the
+            # native dropdown LIST this combobox opens right underneath
+            # itself (see _build_inline_attach()'s own after() call) -
+            # that's not a real Tk sibling widget the geometry manager
+            # knows about, just an ephemeral popup, so the check found
+            # "room" there and placed the callout right on top of it
+            # (reported live, screenshotted: the callout covering "bob"/
+            # "existing account" in the open list). place_outside_
+            # container() (what _PointAtOnly falls back to) sits well
+            # clear of it instead.
+            (lambda: gui.root, lambda: _PointAtOnly(gui._share_action_bar.bar.winfo_children()[0]),
              "Attach User",
-             "This dropdown shows all available users to attach to the selected share, "
+             "The dropdown shows all available users to attach to the selected share, "
              "including ones not made by NASsie (indicated by \"existing account\"). Select "
              "the user that you just created.",
              "user_attached"),
-            # No widget (None) - same reasoning as the other
-            # "Confirmation" steps: this is a toast (see
-            # GUIWizard._show_toast()) floating in root's own corner,
-            # nothing meaningful for place_near() to point at. There's no
-            # separate password step here - the account just created via
-            # "New User" already got its Samba password at creation time
-            # (see GUIWizard._commit_inline_attach()'s comment), so
-            # attaching it to this first share never actually prompts for
-            # one. Has to sit right here, immediately after "Attach User",
-            # not further down the list with the rest of the share-row
-            # buttons - GUIWizard._grant_access_done() fires
-            # "attach_apply_confirmed" from the toast's own on_close (see
-            # _Toast's docstring), and on_event() only reacts to whichever
-            # step is current at that instant; any step in between would
-            # eat "user_attached" and leave this one waiting on an event
-            # that already came and went.
-            (lambda: gui.root, None,
-             "Confirmation", "A confirmation toast appears in the corner - dismiss it (✕) or wait for "
-             "it to disappear.",
-             "attach_apply_confirmed"),
+            # No separate "Confirmation" step after this one either - see
+            # the identical removal (and its own comment) after "Folder"
+            # earlier. Goes straight to "Delete Share" below once
+            # "user_attached" fires - there's no separate password step
+            # to wait through either: the account just created via "New
+            # User" already got its Samba password at creation time (see
+            # GUIWizard._commit_inline_attach()'s comment), so attaching
+            # it to this first share never actually prompts for one.
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
              "Delete Share",
              "Press the Delete share button.",
@@ -856,7 +980,7 @@ class GuiTour:
             # own guarded info box is a plain tk_messageBox, no Python
             # widget handle to attach a highlight to.
             (lambda: gui.root, None,
-             "Confirmation", "Press OK to return to the main window. Your share will NOT be deleted.",
+             "Delete Share", "Press OK to return to the main window. Your share will NOT be deleted.",
              "share_delete_dialog_cancelled"),
 
             (lambda: gui.root, lambda: self._newest_user_row(),
@@ -872,8 +996,11 @@ class GuiTour:
              "access_level_changed"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[1],
              "QR Code",
-             "Shows a scannable QR code for this user's login - click it, then click Cancel on "
-             "the password prompt to skip generating one right now.",
+             "Click the QR Code button.",
+             "qr_dialog_opened"),
+            (lambda: self._active_window, lambda: _PointAtOnly(self._active_window.cancel_button),
+             "QR Code",
+             "Enter the user password to generate a QR code. Click Cancel for now.",
              "qr_prompt_cancelled"),
             (lambda: gui.root, lambda: gui._share_action_bar.bar.winfo_children()[2],
              "Detach",
@@ -887,13 +1014,63 @@ class GuiTour:
             # own guarded info box is a plain tk_messageBox, no Python
             # widget handle to attach a highlight to.
             (lambda: gui.root, None,
-             "Confirmation", "Press OK to return to the main window. This user will NOT be detached.",
+             "Detach", "Press OK to return to the main window. This user will NOT be detached.",
              "user_detach_dialog_cancelled"),
         ]
 
-    def start(self):
-        mark_tour_started()
-        self.index = 0
+    def _step_resolves(self, index):
+        # True if this step's own container currently exists and is a
+        # real, live widget - False for both container_fn() returning
+        # None outright (see _show_step()'s own use of this) AND the
+        # sneakier case of a step whose container_fn is `lambda: self.
+        # _active_window` where that dialog has since been destroyed:
+        # closing it doesn't clear the reference, just the underlying Tk
+        # window, so container_fn() itself still returns a real (non-
+        # None) Python object - only winfo_exists() (safe to call on an
+        # already-destroyed widget; returns False rather than raising,
+        # unlike nearly everything else) actually catches that one.
+        try:
+            container = self.steps[index][0]()
+        except tk.TclError:
+            return False
+        if container is None:
+            return False
+        try:
+            return bool(container.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _resolve_resume_index(self, index):
+        # See start()'s own comment for why this exists at all. A fresh
+        # GuiTour's self._active_window is always None (nothing's been
+        # opened yet in THIS process), so any step whose container_fn is
+        # `lambda: self._active_window` resolves to None right now
+        # regardless of what index was asked for - walk backward until
+        # landing on one that doesn't (gui.root itself, at worst, index
+        # 0 - always resolves).
+        index = max(0, min(index, len(self.steps) - 1))
+        while index > 0 and not self._step_resolves(index):
+            index -= 1
+        return index
+
+    def start(self, resume_index=0):
+        # resume_index > 0 means GUIWizard._offer_tour_resume() is picking
+        # a previously-interrupted run back up (see tour_progress_index())
+        # rather than starting fresh - _resolve_resume_index() below is
+        # what actually makes that safe: several steps only resolve their
+        # own container against self._active_window (a dialog from the
+        # OLD process, long gone by the time a fresh one calls this), and
+        # container_fn() returning None for one of those is exactly what
+        # _show_step() already treats as "bail out, nothing to point at"
+        # (see its own comment) - so a raw resume_index landing on one of
+        # those would silently kill the tour again immediately, right
+        # back to square one. Walking back to the nearest step that
+        # currently resolves - always true for at least step 0, gui.root
+        # itself - lands on the "click to open X" step that leads back
+        # into it instead, which is the natural place to pick up: redo
+        # that one click and everything past it is real again.
+        self.index = self._resolve_resume_index(resume_index)
+        mark_tour_started(self.index)
         # Several steps' own dialogs (CreateShareDialog, AddUserDialog,
         # QrCodeDialog, ChoiceDialog, plus stdlib messagebox/simpledialog)
         # call grab_set() - a LOCAL grab restricted to this application,
@@ -912,6 +1089,13 @@ class GuiTour:
 
     def _show_step(self):
         self._teardown_current()
+        # Persisted every time this can change, not just once at start() -
+        # cheap (one small file write), and means a force-quit mid-step
+        # loses at most the current step, not the whole run since the
+        # last time _offer_tour_resume() happened to fire. See
+        # GUIWizard._offer_tour_resume() for where this gets read back on
+        # the next launch.
+        mark_tour_started(self.index)
         container_fn, widget_fn, title, text, wait_event = self.steps[self.index]
         # A step's text is usually a plain string, but the "Detach" step
         # needs the actual username/share name being demonstrated (see
@@ -922,7 +1106,18 @@ class GuiTour:
         if callable(text):
             text = text()
         container = container_fn()
-        if container is None:
+        # Not just "is None" - a step whose container_fn is `lambda: self.
+        # _active_window` still returns a real (non-None) Python object
+        # once that dialog has been destroyed (closing it doesn't clear
+        # the reference, just the underlying Tk window) - self._step_
+        # resolves() catches that case too via winfo_exists(), which is
+        # safe to call on an already-destroyed widget (returns False,
+        # doesn't raise), unlike nearly everything else below that DOES
+        # raise TclError on one. Reported live as an actual crash:
+        # Previous, clicked from a step or two past a completed dialog
+        # (its own window long since closed on success), landed back on
+        # one of these and blew up right here.
+        if container is None or not self._step_resolves(self.index):
             # The window this step depends on isn't around (the tour was
             # interrupted, or something closed out of order) - bail out
             # quietly rather than point at nothing. completed=False: this
@@ -1151,28 +1346,22 @@ class GuiTour:
         # container-vanished bailout also calls directly (not a user
         # choice to confirm at all).
         #
-        # _patch_messagebox_front (gui.py) already toggles the parent's
-        # own -topmost around a messagebox call to drag it to the front -
-        # not enough here, though: it only sets -topmost True, and root
-        # is already permanently True (see _bring_window_to_front()'s own
-        # docstring) by the time any tour step can run, so that alone is
-        # a no-op against whichever OTHER always-on-top NASsie window
-        # (UserManagementWindow, say) was raised more recently - reported
-        # live, the confirmation landing behind it. _bring_to_front()
-        # does the actual False->True re-trigger that forces a real
-        # restack, the same fix already relied on everywhere else in
-        # this file for the identical multi-window race.
+        # _bring_to_front() (the same False->True re-trigger fix relied on
+        # everywhere else in this file for the identical multi-window
+        # race) so root itself is in front before _ConfirmDialog centers
+        # itself over it below - see that class's own docstring for why a
+        # plain tk_messageBox was wrong for this specifically (positioning
+        # AND stacking, both confirmed live).
         _bring_to_front(self.root)
         # See _Callout.pause_relift()'s own docstring for why this has to
         # stop competing with the very dialog it's about to open.
         if self._callout is not None:
             self._callout.pause_relift()
-        answer = messagebox.askyesno(
-            "Skip Tour", "Skip the rest of the guided tour?", parent=self.root,
-        )
+        dialog = _ConfirmDialog(self.root, "Skip Tour", "Skip the rest of the guided tour?")
+        self.root.wait_window(dialog)
         if self._callout is not None:
             self._callout.resume_relift()
-        if answer:
+        if dialog.result:
             self.stop()
 
     def stop(self, completed=True):
