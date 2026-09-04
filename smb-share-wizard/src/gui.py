@@ -19,16 +19,31 @@ import nassie_ttk
 import window_corners
 
 
-def _patch_messagebox_front(messagebox_module, simpledialog_module):
-    # tkinter.messagebox/simpledialog build their own Toplevel internally -
-    # there's no hook to run _bring_window_to_front() on it directly the
-    # way every one of NASsie's own dialogs does. Same GNOME/Wayland
-    # focus-stealing-prevention issue as those, though: a plain showinfo()
-    # can open silently buried behind the main window. Toggling the
-    # PARENT's own -topmost around the (blocking) call achieves the same
-    # effect indirectly - a transient dialog stacks directly above
+def _patch_messagebox_front(messagebox_module, simpledialog_module, filedialog_module):
+    # tkinter.messagebox/simpledialog/filedialog build their own Toplevel
+    # (or, for filedialog on Windows/macOS, a genuine native OS dialog)
+    # internally - there's no hook to run _bring_window_to_front() on it
+    # directly the way every one of NASsie's own dialogs does. Same GNOME/
+    # Wayland focus-stealing-prevention issue as those, though: a plain
+    # showinfo() can open silently buried behind the main window. Toggling
+    # the PARENT's own -topmost around the (blocking) call achieves the
+    # same effect indirectly - a transient dialog stacks directly above
     # whatever it's transient-for, so a topmost parent drags its dialog
     # to the front along with it.
+    #
+    # filedialog.askdirectory (CreateShareDialog._browse_path()'s "Browse"
+    # button) was missing from this same patch entirely until reported
+    # live on Windows: the picker opened, but stayed stuck behind
+    # CreateShareDialog - a small, ordinary dialog that isn't itself
+    # -topmost, but IS a transient child of the main window, which per
+    # _bring_window_to_front() is permanently -topmost. Windows' own
+    # "always on top" z-order layer sits above ordinary windows as a
+    # whole, so a plain (non-topmost) native picker parented to a
+    # transient-of-topmost dialog can end up stuck below that whole
+    # topmost layer even though it's the window that's supposed to be
+    # frontmost right now - the exact same class of bug this function
+    # already exists to work around for messagebox/simpledialog, just
+    # never extended to filedialog.
     def _wrap(fn):
         def wrapper(*args, **kwargs):
             parent = kwargs.get("parent") or tk._default_root
@@ -58,9 +73,10 @@ def _patch_messagebox_front(messagebox_module, simpledialog_module):
     for name in ("showinfo", "showwarning", "showerror", "askyesno", "askokcancel", "askquestion"):
         setattr(messagebox_module, name, _wrap(getattr(messagebox_module, name)))
     simpledialog_module.askstring = _wrap(simpledialog_module.askstring)
+    filedialog_module.askdirectory = _wrap(filedialog_module.askdirectory)
 
 
-_patch_messagebox_front(messagebox, simpledialog)
+_patch_messagebox_front(messagebox, simpledialog, filedialog)
 
 
 def _center_over_parent(win, parent):
@@ -658,8 +674,22 @@ class _AddRowFeedback:
         # scrolling/resizing moves or hides the row without firing
         # <<TreeviewSelect>> or anything else this could otherwise hook,
         # so this has to explicitly reposition (or hide) on each of them
-        # to stay glued to the row's own current bbox.
-        tree.bind("<Configure>", lambda e: self.reposition(), add="+")
+        # to stay glued to the row's own current bbox. <Configure> in
+        # particular has to go through after_idle too, not call
+        # reposition() directly - a column that just grew via its own
+        # stretch=True (the shares list's "path" column, whenever the
+        # window or the Users panel resizes it) hasn't necessarily
+        # finished laying out yet at the moment <Configure> itself
+        # fires, so bbox() here could still return the PREVIOUS width,
+        # leaving the icon sized/positioned to a stale row and visibly
+        # off-center until some later event happened to trigger another
+        # reposition - reported live ("the + isn't centered", offset in
+        # different directions depending on whatever the tree's last
+        # layout pass had actually settled to). Deferring to after_idle
+        # runs this once Tk's own geometry management for the event has
+        # actually finished, so bbox() always reflects the row's real,
+        # current width.
+        tree.bind("<Configure>", lambda e: tree.after_idle(self.reposition), add="+")
         tree.bind("<MouseWheel>", lambda e: tree.after_idle(self.reposition), add="+")
         tree.bind("<Button-4>", lambda e: tree.after_idle(self.reposition), add="+")
         tree.bind("<Button-5>", lambda e: tree.after_idle(self.reposition), add="+")
@@ -1715,6 +1745,11 @@ class GUIWizard:
         # actually animates now. Themed (ttk, not tk) so it matches
         # whatever's normally visible there with no color to hand-tune.
         self._log_scrim = ttk.Frame(self._main_area)
+        # Same trick, for the Users panel's Windows-only path - see
+        # _animate_users_scrim()/_toggle_users_panel()'s own comments.
+        # Parented to self._content_row, not self._main_area, since
+        # that's what the Users panel itself is packed into.
+        self._users_scrim = ttk.Frame(self._content_row)
         self._users_panel_open = False
         self._log_panel_open = False
         # Measured once, unpacked - see _toggle_users_panel()/
@@ -2393,6 +2428,48 @@ class GUIWizard:
 
         step(0)
 
+    def _animate_users_scrim(self, opening, on_complete=None):
+        # The Users panel's own version of _animate_log_scrim() above -
+        # same reasoning, mirrored for the opposite edge: this panel
+        # sits at content_row's RIGHT edge (see _pack_users_panel()),
+        # not main_area's left, and (unlike the Log panel) never moves
+        # root's x - _toggle_users_panel() only ever calls
+        # _animate_root_width() here with grow_left=False, a pure
+        # resize - so relx=1.0 alone is enough to keep this pinned to
+        # content_row's live right edge with no drift-compensation of
+        # its own to worry about.
+        #
+        # The covered region's RIGHT edge stays pinned to content_row's
+        # own right edge throughout (relx=1.0), while its LEFT edge -
+        # the boundary nearest the shares list - is what moves,
+        # shrinking the covered width from the full panel down to
+        # nothing (opening) or growing it back up (closing). Reads as
+        # the panel wiping into view FROM the shares list outward, or
+        # retreating the same way in reverse - only ever a place()
+        # geometry change, never a root.geometry() call, so it stays
+        # cheap enough to animate on Windows even though the per-frame
+        # glide _toggle_users_panel() otherwise uses (steps=10, a real
+        # resize each frame) was reported live as choppy there.
+        panel_width = self._users_panel_width - _PANEL_GUTTER
+        steps = 10
+        duration_ms = 160
+        step_delay = max(1, duration_ms // steps)
+
+        def step(i):
+            revealed = i / steps if opening else 1 - i / steps
+            covered_width = max(0, round(panel_width * (1 - revealed)))
+            if covered_width <= 0:
+                self._users_scrim.place_forget()
+            else:
+                self._users_scrim.place(relx=1.0, x=-covered_width, y=0, width=covered_width, relheight=1.0)
+                self._users_scrim.lift()
+            if i < steps:
+                self.root.after(step_delay, lambda: step(i + 1))
+            elif on_complete:
+                on_complete()
+
+        step(0)
+
     def _toggle_users_panel(self):
         # The cheap, pack()-based side (see GUIWizard.__init__'s own
         # comment on why Users, not Log, was moved here) - identical in
@@ -2400,23 +2477,29 @@ class GUIWizard:
         # targeting self._user_mgmt_panel/self._users_panel_width/
         # self._users_panel_open instead of the Log panel's equivalents.
         #
-        # steps=1 on Windows only - _animate_root_width()'s own comment
-        # already documents that a glide's per-frame geometry() call is
-        # "real work for the WM", expensive enough that grow_left (the
-        # Log panel) had to stop doing it at all; a PURE resize (no
-        # reposition, what this panel has always used) was believed cheap
-        # enough to keep animating there, and on Linux/X11 that holds up
-        # fine - confirmed live, smooth. Windows' DWM is a different
+        # _animate_root_width()'s own comment already documents that a
+        # glide's per-frame geometry() call is "real work for the WM",
+        # expensive enough that grow_left (the Log panel) had to stop
+        # doing it at all; a PURE resize (no reposition, what this panel
+        # has always used) was believed cheap enough to keep animating
+        # there, and on Linux/X11 that holds up fine - confirmed live,
+        # smooth, still steps=10 below. Windows' DWM is a different
         # story: each intermediate geometry() call there is a full
         # WM_SIZE/WM_PAINT round trip repainting every child widget,
         # including ones nowhere near the panel edge - reported live as
         # visibly choppy opening this panel, with the header's own logo
         # Label specifically flickering/redrawing on every one of those
-        # 10 frames. steps=1 collapses the same code path (per its own
-        # comment) to a single geometry() call - one repaint instead of
-        # ten - trading the glide for an instant jump on Windows only,
-        # where the glide was never actually smooth to begin with.
-        steps = 1 if platform.system() == "Windows" else 10
+        # 10 frames. Rather than trade the glide for a plain instant
+        # jump there (steps=1, no animation at all - reported live in
+        # turn as feeling abrupt), this now does what
+        # _toggle_log_panel() already does for the exact same WM cost
+        # problem on ITS side: pay the WM's per-resize cost exactly
+        # once (steps=1, hidden behind an opaque scrim) and do the
+        # actual visible "opening"/"closing" motion entirely afterward
+        # via _animate_users_scrim() - a pure place() reveal/cover that
+        # never touches root's geometry at all, so it stays smooth on
+        # Windows too.
+        on_windows = platform.system() == "Windows"
         if self._users_panel_open:
             # See _tour_blocks_closing()'s docstring - lets the dedicated
             # "Close" step's own click-to-close-the-panel through as
@@ -2429,22 +2512,55 @@ class GUIWizard:
             self._users_toggle_btn.set_pressed(False)
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
+                self._users_scrim.place_forget()
                 self._notify_tour("user_mgmt_closed")
                 # Root just settled at its new (narrower) width - see
                 # window_corners.apply()'s own comment on why <Configure>
                 # alone can't be trusted to leave the bottom corners
                 # correctly shaped once a resize like this one finishes.
                 self._reapply_corners()
-            self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=steps)
+            if on_windows:
+                # Cover the panel FIRST, entirely via place(), while
+                # it's still fully packed and visible - only once it's
+                # fully covered (nothing left on screen to disturb)
+                # does root actually shrink, in one single jump
+                # (steps=1) rather than an animated glide. That jump
+                # happens entirely behind the now-opaque scrim, so it's
+                # never visible either way.
+                def _covered():
+                    self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=1)
+                self._animate_users_scrim(opening=False, on_complete=_covered)
+            else:
+                self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=10)
         else:
             self._users_panel_open = True
             self._users_toggle_btn.set_pressed(True)
-            self._pack_users_panel()
-            self._user_mgmt_panel.refresh()
-            def _done():
-                self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
-                self._reapply_corners()
-            self._animate_root_width(self._users_panel_width, on_complete=_done, steps=steps)
+            if on_windows:
+                # Cover the panel's full FINAL area BEFORE it's even
+                # packed - using panel_width, the cached target (known
+                # in advance, no need to wait and measure it after the
+                # jump) - so the panel's real content is never visible
+                # even for one frame before the scrim is there to cover
+                # it. See _animate_users_scrim()'s own comment for why
+                # relx=1.0 alone is enough to keep this pinned to
+                # content_row's live right edge through the jump below.
+                panel_width = self._users_panel_width - _PANEL_GUTTER
+                self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
+                self._users_scrim.lift()
+                self._pack_users_panel()
+                self._user_mgmt_panel.refresh()
+                def _jumped():
+                    self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+                    self._reapply_corners()
+                    self._animate_users_scrim(opening=True)
+                self._animate_root_width(self._users_panel_width, on_complete=_jumped, steps=1)
+            else:
+                self._pack_users_panel()
+                self._user_mgmt_panel.refresh()
+                def _done():
+                    self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+                    self._reapply_corners()
+                self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
 
     def _toggle_log_panel(self):
         # The place()-based, jump+scrim side (see GUIWizard.__init__'s
