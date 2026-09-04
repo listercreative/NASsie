@@ -41,26 +41,23 @@ ever told to stand down for the ~160ms NASsie's own glide is actually
 running - native minimize/restore keeps its normal animation the rest
 of the time.
 
-set_composited_resize() (below) is the same story again, for a THIRD
-Windows-only setting: WS_EX_COMPOSITED is the standard Win32 answer to
-a top-level window with many child controls each showing stale/
-uninitialized pixels for whatever a resize just exposed, until every
-individual one gets around to repainting - reported live, screen-
-recorded, as a ghosted scrollbar and a black flash right at the Users
-panel's own growing edge. A first version set this once, permanently,
-at startup, matching how _round_windows() below still handles corner
-rounding - and it visibly fixed that resize artifact, but broke real
-functionality elsewhere: CreateShareDialog's own "+" button, and
-GuiTour's own guidance callout taking far longer to first appear.
-Enabling compositing on a window's entire child tree has real, ongoing
-cost, not something to pay for the app's whole lifetime just to smooth
-over one 160ms glide. set_composited_resize() is the scoped version,
-same pattern as set_transitions_suppressed() above: GUIWizard.
-_animate_root_width() calls it (True) immediately before its own
-geometry() loop and (False) immediately after, so compositing is only
-ever active for the glide itself - neither the "+" button nor the
-tour's callout is ever shown DURING one, so neither should see it
-active at all.
+A WS_EX_COMPOSITED style was also tried here, twice, for the same
+resize artifact (a ghosted scrollbar and a black flash right at the
+Users panel's own growing edge): first set once, permanently, at
+startup, then - after that visibly broke CreateShareDialog's own "+"
+button and delayed GuiTour's own guidance callout - scoped to just the
+glide's own real duration, exactly like set_transitions_suppressed()
+above. The scoped version didn't just fail to help: it made the SAME
+artifact worse, screen-recorded live as a solid black rectangle
+sitting for the panel's own scrim's entire covered area, not a brief
+flicker - almost certainly the scrim's own themed background never
+actually getting painted before WS_EX_COMPOSITED's compositor took its
+first snapshot, and (unlike ordinary, uncomposited redraw) never
+catching up on its own for as long as compositing stayed active.
+Removed entirely after that, not re-attempted a third way - two
+different applications of the same Win32 setting each caused a new,
+different, real regression, which is a strong enough signal to stop
+here rather than keep guessing at a fourth shape for it.
 """
 from __future__ import annotations
 
@@ -128,53 +125,6 @@ def _round_windows(window):
         # Windows 10 and earlier don't have this attribute at all -
         # DwmSetWindowAttribute just errors instead of no-oping.
         pass
-
-
-def set_composited_resize(window, enabled):
-    """Windows only, no-op (returns False) elsewhere or on any failure -
-    same best-effort contract as set_transitions_suppressed(). Toggles
-    WS_EX_COMPOSITED on `window`'s real top-level HWND - the standard
-    Win32 answer to a top-level window with many child controls each
-    showing stale/uninitialized pixels for whatever a resize just
-    exposed, until every individual one gets around to repainting -
-    reported live, screen-recorded, as a ghosted scrollbar and a black
-    flash right at the Users panel's own growing edge during
-    GUIWizard._animate_root_width()'s own glide.
-
-    Scoped (True right before that glide's geometry() loop, False right
-    after - see that method's own call), NOT set once, permanently, at
-    startup, the way an earlier version of this did - reverted, live:
-    enabling compositing on the window's ENTIRE child tree has real,
-    ongoing cost (this app's own docstring history elsewhere makes the
-    same point about set_transitions_suppressed() staying on forever),
-    and left on for the app's whole lifetime it visibly broke real
-    functionality - CreateShareDialog's own "+" button, and GuiTour's
-    own guidance callout taking far longer to first appear. Scoping
-    this to just the ~160ms an actual glide runs, exactly like
-    set_transitions_suppressed() already does for a different Windows-
-    only setting, means neither of those - which don't happen DURING a
-    panel-toggle glide - should ever see it active at all."""
-    handle = _windows_dwm_handle(window)
-    if handle is None:
-        return False
-    _dwmapi, hwnd = handle
-    try:
-        user32 = ctypes.windll.user32
-    except (AttributeError, OSError):
-        return False
-    GWL_EXSTYLE = -20
-    WS_EX_COMPOSITED = 0x02000000
-    try:
-        user32.GetWindowLongPtrW.restype = ctypes.c_longlong
-        user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        user32.SetWindowLongPtrW.restype = ctypes.c_longlong
-        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
-        current = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-        new_style = (current | WS_EX_COMPOSITED) if enabled else (current & ~WS_EX_COMPOSITED)
-        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style)
-        return True
-    except (AttributeError, OSError):
-        return False
 
 
 def set_transitions_suppressed(window, suppressed):
