@@ -48,33 +48,72 @@ def _patch_messagebox_front(messagebox_module, simpledialog_module, filedialog_m
     def _wrap(fn):
         def wrapper(*args, **kwargs):
             parent = kwargs.get("parent") or tk._default_root
-            # Restored to whatever it was BEFORE this call, not
-            # unconditionally forced off - every NASsie window is
-            # permanently "-topmost" now (see _bring_window_to_front()),
-            # so blindly turning it off here would silently undo that the
-            # moment any messagebox/askstring call involving that window
-            # returns.
-            was_topmost = False
-            if parent is not None:
-                try:
-                    was_topmost = bool(parent.attributes("-topmost"))
-                    parent.attributes("-topmost", True)
-                except tk.TclError:
-                    parent = None
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                if parent is not None and not was_topmost:
-                    try:
-                        parent.attributes("-topmost", False)
-                    except tk.TclError:
-                        pass
+            return with_parent_topmost(parent, lambda: fn(*args, **kwargs))
         return wrapper
 
     for name in ("showinfo", "showwarning", "showerror", "askyesno", "askokcancel", "askquestion"):
         setattr(messagebox_module, name, _wrap(getattr(messagebox_module, name)))
     simpledialog_module.askstring = _wrap(simpledialog_module.askstring)
     filedialog_module.askdirectory = _wrap(filedialog_module.askdirectory)
+
+
+def with_parent_topmost(parent, fn):
+    """Runs fn() with `parent` (a NASsie Tk window) temporarily forced
+    -topmost, so a dialog or native OS picker IT spawns - but that isn't
+    itself raised by Tk's own transient-stacking, since it's either a
+    real separate OS-level window (tkinter.filedialog on Windows/macOS)
+    or, on Linux, a completely unrelated process's window (zenity/
+    kdialog - see core.pick_directory_native()) - doesn't get stuck
+    behind NASsie's own permanently-topmost window layer (every NASsie
+    window is "-topmost" forever - see _bring_window_to_front()). Used
+    by _patch_messagebox_front()'s own wrapper (above) AND directly by
+    CreateShareDialog._browse_path() for the zenity/kdialog path, which
+    calls pick_directory_native() straight from core.py rather than
+    through tkinter.filedialog, so _patch_messagebox_front() alone
+    never covered it - reported live on Linux, the picker opening
+    genuinely stuck behind CreateShareDialog with no way to reach it,
+    the exact same failure this function already existed to prevent for
+    filedialog.askdirectory (see that function's own docstring for the
+    ORIGINAL report, on Windows) - just never extended to this other
+    native-picker path.
+
+    Restores parent's PRIOR -topmost state afterward, not
+    unconditionally clearing it - every NASsie window is permanently
+    "-topmost", so blindly turning it off here would silently undo
+    that the moment this call returns.
+
+    A single attributes("-topmost", True) is enough on Windows (the
+    original askdirectory report/fix, see above) - SetWindowPos there
+    applies synchronously, no round trip needed. GNOME/Wayland (via
+    Xwayland - the zenity report this was extended for) is the case
+    _bring_window_to_front()'s own docstring already documents at
+    length: some window managers don't reliably apply "-topmost" from a
+    plain set alone, and need an actual FALSE->TRUE toggle (a real
+    z-order CHANGE, not just a state that happens to already read
+    "true") plus a synchronous update() in between to force the
+    request to actually reach the WM before whatever runs next. Skipping
+    that here would leave this call racing the fn() below (zenity/
+    kdialog's own subprocess.run() blocks the Tk main loop immediately
+    after - if the WM hasn't actually restacked yet by then, there's no
+    later update() to save it) - the exact failure mode reported live."""
+    was_topmost = False
+    if parent is not None:
+        try:
+            was_topmost = bool(parent.attributes("-topmost"))
+            parent.attributes("-topmost", False)
+            parent.update()
+            parent.attributes("-topmost", True)
+            parent.update()
+        except tk.TclError:
+            parent = None
+    try:
+        return fn()
+    finally:
+        if parent is not None and not was_topmost:
+            try:
+                parent.attributes("-topmost", False)
+            except tk.TclError:
+                pass
 
 
 _patch_messagebox_front(messagebox, simpledialog, filedialog)
@@ -1271,7 +1310,16 @@ class CreateShareDialog(tk.Toplevel):
         # real native picker (what this already amounts to on Windows/
         # macOS) has proper folder creation built in - no separate
         # NASsie-side "New Folder" flow needed alongside it.
-        handled, selected = pick_directory_native("Select Folder to Share")
+        #
+        # with_parent_topmost(self, ...) - pick_directory_native() calls
+        # zenity/kdialog directly (core.py, not tkinter.filedialog), so
+        # _patch_messagebox_front()'s own wrapper (which only patches
+        # filedialog.askdirectory itself) never covers this call - see
+        # with_parent_topmost()'s own docstring for the live report:
+        # zenity opening genuinely stuck behind this dialog, unreachable.
+        handled, selected = with_parent_topmost(
+            self, lambda: pick_directory_native("Select Folder to Share")
+        )
         if not handled:
             selected = filedialog.askdirectory(parent=self, title="Select Folder to Share")
         if selected:
@@ -2650,9 +2698,38 @@ class GUIWizard:
                 self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
                 self._window_scrim.lift()
                 self._pack_users_panel()
-                self._user_mgmt_panel.refresh()
+                # NOT called here - see _revealed()'s own comment for
+                # why refresh() has to wait until the reveal glide is
+                # actually done, not just started.
                 def _revealed():
                     self._users_panel_animating = False
+                    # refresh()'s own list_users() call runs on a
+                    # background thread (see its own docstring) so it
+                    # can't block the glide directly - but its
+                    # completion callback lands back on this SAME
+                    # single Tk event queue as _animate_users_scrim()'s
+                    # own after()-scheduled steps, via root.after(0,
+                    # apply). apply() itself does real synchronous work
+                    # (clearing and repopulating the whole Treeview) -
+                    # calling refresh() BEFORE the jump used to let that
+                    # collide with the glide's own steps whenever
+                    # apply() happened to land mid-reveal, stalling
+                    # whichever step came right after it by however
+                    # long apply() itself took to run. Confirmed via
+                    # anim_debug.log on a real Windows machine: a
+                    # remarkably consistent ~50-65ms gap between the
+                    # reveal's first two steps, present on every single
+                    # open, completely absent on close (which never
+                    # calls refresh() at all) - too consistent to be
+                    # ordinary scheduling jitter. Deferring the call to
+                    # here instead means apply() can only ever land
+                    # AFTER the glide's own steps are already done, so
+                    # the two can never contend for the event loop
+                    # again - the panel opens showing its PREVIOUS
+                    # contents (or nothing, the very first time) and
+                    # they update moments later, rather than the reveal
+                    # itself stalling.
+                    self._user_mgmt_panel.refresh()
                 def _jumped():
                     self._window_scrim.place_forget()
                     self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
@@ -2661,11 +2738,17 @@ class GUIWizard:
                 self._animate_root_width(self._users_panel_width, on_complete=_jumped, steps=1)
             else:
                 self._pack_users_panel()
-                self._user_mgmt_panel.refresh()
                 def _done():
                     self._users_panel_animating = False
                     self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
                     self._reapply_corners()
+                    # See the on_windows branch's _revealed() for why
+                    # this is deferred to here rather than called before
+                    # the glide starts - same reasoning, applied for
+                    # consistency even though this platform's own
+                    # steps=10 real glide didn't show the same
+                    # measured stall.
+                    self._user_mgmt_panel.refresh()
                 self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
 
     def _toggle_log_panel(self):

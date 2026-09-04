@@ -17,6 +17,7 @@ from core import (
 from tour import GuiTour, tour_state, tour_progress_index, mark_tour_completed
 import nassie_ttk
 import window_corners
+import anim_debug
 
 
 def _patch_messagebox_front(messagebox_module, simpledialog_module, filedialog_module):
@@ -1788,6 +1789,12 @@ class GUIWizard:
         # can only be measured against a real, already-mapped, already-
         # decorations-stripped root, not calibrated eagerly here.
         self._wm_reposition_drift = None
+        # Surfaced here, not just documented in anim_debug.py's own
+        # docstring, so a tester can find the panel-toggle diagnostics
+        # file (see that module) without already knowing this file's
+        # own conventions - the View Log panel is the one place every
+        # tester already knows to check.
+        self._append_log(f"Animation diagnostics: {anim_debug.path()}")
 
         self._refresh_all_lists()
 
@@ -2354,8 +2361,13 @@ class GUIWizard:
         height = self.root.winfo_height()
         target_width = max(self._base_width, min(old_width + delta_width, self.root.winfo_screenwidth()))
         actual_delta = target_width - old_width
+        anim_debug.log(
+            f"_animate_root_width start delta={delta_width} grow_left={grow_left} steps={steps} "
+            f"old_width={old_width} target_width={target_width} actual_delta={actual_delta}"
+        )
         if actual_delta == 0:
             self.root.minsize(target_width, height)
+            anim_debug.log("_animate_root_width no-op (actual_delta=0)")
             if on_complete:
                 on_complete()
             return
@@ -2393,10 +2405,14 @@ class GUIWizard:
         # set_transitions_suppressed()'s own docstring for why that
         # matters: native minimize/restore stays animated everywhere
         # else.
-        window_corners.set_transitions_suppressed(self.root, True)
+        suppressed_ok = window_corners.set_transitions_suppressed(self.root, True)
+        anim_debug.log(f"set_transitions_suppressed(True) -> {suppressed_ok}")
 
         def step(i):
             w = widths[i]
+            anim_debug.log(
+                f"step {i}/{steps - 1} requesting w={w} (pre-call winfo_width={self.root.winfo_width()})"
+            )
             if grow_left:
                 if self._wm_reposition_drift is None:
                     # First time ever repositioning root - measure
@@ -2425,9 +2441,14 @@ class GUIWizard:
                     self.root.geometry(f"{w}x{height}+{xs[i]}+{old_y - self._wm_reposition_drift}")
             else:
                 self.root.geometry(f"{w}x{height}")
+            anim_debug.log(f"step {i}/{steps - 1} post-call winfo_width={self.root.winfo_width()}")
             if i == steps - 1:
                 self.root.minsize(w, height)
-                window_corners.set_transitions_suppressed(self.root, False)
+                restored_ok = window_corners.set_transitions_suppressed(self.root, False)
+                anim_debug.log(
+                    f"_animate_root_width done, set_transitions_suppressed(False) -> {restored_ok}, "
+                    f"final winfo_width={self.root.winfo_width()}"
+                )
                 if on_complete:
                     on_complete()
             else:
@@ -2491,6 +2512,7 @@ class GUIWizard:
         steps = 10
         duration_ms = 160
         step_delay = max(1, duration_ms // steps)
+        anim_debug.log(f"_animate_users_scrim start opening={opening} panel_width={panel_width}")
 
         def step(i):
             revealed = i / steps if opening else 1 - i / steps
@@ -2500,6 +2522,7 @@ class GUIWizard:
             else:
                 self._users_scrim.place(relx=1.0, x=-covered_width, y=0, width=covered_width, relheight=1.0)
                 self._users_scrim.lift()
+            anim_debug.log(f"_animate_users_scrim step {i}/{steps} covered_width={covered_width}")
             if i < steps:
                 self.root.after(step_delay, lambda: step(i + 1))
             elif on_complete:
@@ -2544,6 +2567,10 @@ class GUIWizard:
         # Username column's own now-buttery-smooth reveal already uses,
         # which never touches root's geometry at all.
         on_windows = platform.system() == "Windows"
+        anim_debug.log(
+            f"_toggle_users_panel clicked, currently_open={self._users_panel_open} "
+            f"animating={self._users_panel_animating} on_windows={on_windows}"
+        )
         # Ignore a click that lands while a previous toggle's own
         # animation - either shape above - hasn't finished yet, rather
         # than starting a second, independent one racing it: see
@@ -2552,6 +2579,7 @@ class GUIWizard:
         # Reported live as rapid-fire open/close/open flicker from
         # nothing more than an eager double-click on the toolbar button.
         if self._users_panel_animating:
+            anim_debug.log("_toggle_users_panel ignored - already animating")
             return
         if self._users_panel_open:
             # See _tour_blocks_closing()'s docstring - lets the dedicated
@@ -2622,9 +2650,38 @@ class GUIWizard:
                 self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
                 self._window_scrim.lift()
                 self._pack_users_panel()
-                self._user_mgmt_panel.refresh()
+                # NOT called here - see _revealed()'s own comment for
+                # why refresh() has to wait until the reveal glide is
+                # actually done, not just started.
                 def _revealed():
                     self._users_panel_animating = False
+                    # refresh()'s own list_users() call runs on a
+                    # background thread (see its own docstring) so it
+                    # can't block the glide directly - but its
+                    # completion callback lands back on this SAME
+                    # single Tk event queue as _animate_users_scrim()'s
+                    # own after()-scheduled steps, via root.after(0,
+                    # apply). apply() itself does real synchronous work
+                    # (clearing and repopulating the whole Treeview) -
+                    # calling refresh() BEFORE the jump used to let that
+                    # collide with the glide's own steps whenever
+                    # apply() happened to land mid-reveal, stalling
+                    # whichever step came right after it by however
+                    # long apply() itself took to run. Confirmed via
+                    # anim_debug.log on a real Windows machine: a
+                    # remarkably consistent ~50-65ms gap between the
+                    # reveal's first two steps, present on every single
+                    # open, completely absent on close (which never
+                    # calls refresh() at all) - too consistent to be
+                    # ordinary scheduling jitter. Deferring the call to
+                    # here instead means apply() can only ever land
+                    # AFTER the glide's own steps are already done, so
+                    # the two can never contend for the event loop
+                    # again - the panel opens showing its PREVIOUS
+                    # contents (or nothing, the very first time) and
+                    # they update moments later, rather than the reveal
+                    # itself stalling.
+                    self._user_mgmt_panel.refresh()
                 def _jumped():
                     self._window_scrim.place_forget()
                     self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
@@ -2633,11 +2690,17 @@ class GUIWizard:
                 self._animate_root_width(self._users_panel_width, on_complete=_jumped, steps=1)
             else:
                 self._pack_users_panel()
-                self._user_mgmt_panel.refresh()
                 def _done():
                     self._users_panel_animating = False
                     self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
                     self._reapply_corners()
+                    # See the on_windows branch's _revealed() for why
+                    # this is deferred to here rather than called before
+                    # the glide starts - same reasoning, applied for
+                    # consistency even though this platform's own
+                    # steps=10 real glide didn't show the same
+                    # measured stall.
+                    self._user_mgmt_panel.refresh()
                 self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
 
     def _toggle_log_panel(self):
