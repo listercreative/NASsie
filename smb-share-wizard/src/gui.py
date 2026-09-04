@@ -1750,6 +1750,18 @@ class GUIWizard:
         # Parented to self._content_row, not self._main_area, since
         # that's what the Users panel itself is packed into.
         self._users_scrim = ttk.Frame(self._content_row)
+        # Covers the WHOLE window (header/logo included - see
+        # _build_header(), a plain sibling of self._main_area in root,
+        # never touched by either panel-scoped scrim above) for the one
+        # instant root.geometry() jump either panel's Windows-only path
+        # makes. That single call is still a full WM_SIZE/WM_PAINT
+        # round trip there, repainting every child in the window - not
+        # just the panel's own slice - reported live as the logo and
+        # the shares list's own "+" flickering/redrawing even though
+        # this scrim's already up over the panel by then. Parented
+        # directly to root, not main_area, so it can actually reach the
+        # header - see _toggle_users_panel()/_toggle_log_panel().
+        self._window_scrim = ttk.Frame(self.root)
         self._users_panel_open = False
         self._log_panel_open = False
         # Measured once, unpacked - see _toggle_users_panel()/
@@ -2513,6 +2525,7 @@ class GUIWizard:
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
                 self._users_scrim.place_forget()
+                self._window_scrim.place_forget()
                 self._notify_tour("user_mgmt_closed")
                 # Root just settled at its new (narrower) width - see
                 # window_corners.apply()'s own comment on why <Configure>
@@ -2522,12 +2535,18 @@ class GUIWizard:
             if on_windows:
                 # Cover the panel FIRST, entirely via place(), while
                 # it's still fully packed and visible - only once it's
-                # fully covered (nothing left on screen to disturb)
-                # does root actually shrink, in one single jump
-                # (steps=1) rather than an animated glide. That jump
-                # happens entirely behind the now-opaque scrim, so it's
-                # never visible either way.
+                # fully covered does root actually shrink. _covered()
+                # then ALSO covers the rest of the window (header/logo,
+                # shares list) with self._window_scrim before that
+                # jump - the panel's own scrim never reached those, so
+                # without this the jump's one WM_SIZE/WM_PAINT round
+                # trip still flickered them (reported live) even though
+                # the panel itself was already safely hidden. Both
+                # scrims come off together in _done(), once the jump's
+                # single repaint has already happened behind them.
                 def _covered():
+                    self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+                    self._window_scrim.lift()
                     self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=1)
                 self._animate_users_scrim(opening=False, on_complete=_covered)
             else:
@@ -2547,9 +2566,21 @@ class GUIWizard:
                 panel_width = self._users_panel_width - _PANEL_GUTTER
                 self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
                 self._users_scrim.lift()
+                # Also cover the REST of the window (header/logo, shares
+                # list) before the jump - see the closing branch's
+                # identical _covered() comment for why the panel's own
+                # scrim isn't enough on its own. Comes off again the
+                # instant the jump lands, in _jumped() below - by then
+                # the panel-only scrim is already covering exactly what
+                # still needs to stay hidden for the reveal glide that
+                # follows, so nothing is ever visible uncovered for even
+                # one frame.
+                self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+                self._window_scrim.lift()
                 self._pack_users_panel()
                 self._user_mgmt_panel.refresh()
                 def _jumped():
+                    self._window_scrim.place_forget()
                     self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
                     self._reapply_corners()
                     self._animate_users_scrim(opening=True)
@@ -2587,9 +2618,24 @@ class GUIWizard:
             # never visible either way.
             def _covered():
                 self._place_log_glide(base_width)
+                # Also cover the REST of the window (header/logo,
+                # shares list) before the jump, not just the Log
+                # panel's own slice - see _toggle_users_panel()'s
+                # identical _covered() comment for why: the jump is
+                # still one full WM_SIZE/WM_PAINT round trip on
+                # Windows, repainting every child in the window,
+                # header included (and the header genuinely does
+                # resize here - grow_left moves root's own left edge,
+                # and header spans root's full width - so unlike the
+                # Users panel's simple width-only jump, this one isn't
+                # just a stray repaint to hide, it's a real geometry
+                # change too; either way it should never be visible).
+                self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+                self._window_scrim.lift()
                 def _jumped():
                     self._place_log_steady()
                     self._log_scrim.place_forget()
+                    self._window_scrim.place_forget()
                     # See _toggle_users_panel()'s identical call for why.
                     self._reapply_corners()
                 self._animate_root_width(-self._log_panel_width, grow_left=True, on_complete=_jumped, steps=1)
@@ -2606,9 +2652,14 @@ class GUIWizard:
             # one frame before the scrim is there to cover it.
             self._log_scrim.place(x=0, y=0, width=panel_width, relheight=1.0)
             self._log_scrim.lift()
+            # Also cover the rest of the window before the jump - see
+            # the closing branch's identical _covered() comment above.
+            self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+            self._window_scrim.lift()
             self._place_log_glide(base_width)
             def _jumped():
                 self._place_log_steady()
+                self._window_scrim.place_forget()
                 self._animate_log_scrim(opening=True)
                 # See _toggle_users_panel()'s identical call for why.
                 self._reapply_corners()
