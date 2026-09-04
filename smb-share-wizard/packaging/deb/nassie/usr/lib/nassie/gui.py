@@ -48,33 +48,153 @@ def _patch_messagebox_front(messagebox_module, simpledialog_module, filedialog_m
     def _wrap(fn):
         def wrapper(*args, **kwargs):
             parent = kwargs.get("parent") or tk._default_root
-            # Restored to whatever it was BEFORE this call, not
-            # unconditionally forced off - every NASsie window is
-            # permanently "-topmost" now (see _bring_window_to_front()),
-            # so blindly turning it off here would silently undo that the
-            # moment any messagebox/askstring call involving that window
-            # returns.
-            was_topmost = False
-            if parent is not None:
-                try:
-                    was_topmost = bool(parent.attributes("-topmost"))
-                    parent.attributes("-topmost", True)
-                except tk.TclError:
-                    parent = None
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                if parent is not None and not was_topmost:
-                    try:
-                        parent.attributes("-topmost", False)
-                    except tk.TclError:
-                        pass
+            return with_parent_topmost(parent, lambda: fn(*args, **kwargs))
         return wrapper
 
     for name in ("showinfo", "showwarning", "showerror", "askyesno", "askokcancel", "askquestion"):
         setattr(messagebox_module, name, _wrap(getattr(messagebox_module, name)))
     simpledialog_module.askstring = _wrap(simpledialog_module.askstring)
     filedialog_module.askdirectory = _wrap(filedialog_module.askdirectory)
+
+
+def with_parent_topmost(parent, fn):
+    """Runs fn() with `parent` (a NASsie Tk window) temporarily forced
+    -topmost, so a dialog or native OS picker IT spawns - but that isn't
+    itself raised by Tk's own transient-stacking, since it's either a
+    real separate OS-level window (tkinter.filedialog on Windows/macOS)
+    or, on Linux, a completely unrelated process's window (zenity/
+    kdialog - see core.pick_directory_native()) - doesn't get stuck
+    behind NASsie's own permanently-topmost window layer (every NASsie
+    window is "-topmost" forever - see _bring_window_to_front()). Used
+    by _patch_messagebox_front()'s own wrapper (above) AND directly by
+    CreateShareDialog._browse_path() for the zenity/kdialog path, which
+    calls pick_directory_native() straight from core.py rather than
+    through tkinter.filedialog, so _patch_messagebox_front() alone
+    never covered it - reported live on Linux, the picker opening
+    genuinely stuck behind CreateShareDialog with no way to reach it,
+    the exact same failure this function already existed to prevent for
+    filedialog.askdirectory (see that function's own docstring for the
+    ORIGINAL report, on Windows) - just never extended to this other
+    native-picker path.
+
+    Restores parent's PRIOR -topmost state afterward, not
+    unconditionally clearing it - every NASsie window is permanently
+    "-topmost", so blindly turning it off here would silently undo
+    that the moment this call returns.
+
+    A single attributes("-topmost", True) is enough on Windows (the
+    original askdirectory report/fix, see above) - SetWindowPos there
+    applies synchronously, no round trip needed. GNOME/Wayland (via
+    Xwayland - the zenity report this was extended for) is the case
+    _bring_window_to_front()'s own docstring already documents at
+    length: some window managers don't reliably apply "-topmost" from a
+    plain set alone, and need an actual FALSE->TRUE toggle (a real
+    z-order CHANGE, not just a state that happens to already read
+    "true") plus a synchronous update() in between to force the
+    request to actually reach the WM before whatever runs next. Skipping
+    that here would leave this call racing the fn() below (zenity/
+    kdialog's own subprocess.run() blocks the Tk main loop immediately
+    after - if the WM hasn't actually restacked yet by then, there's no
+    later update() to save it) - the exact failure mode reported live."""
+    was_topmost = False
+    if parent is not None:
+        try:
+            was_topmost = bool(parent.attributes("-topmost"))
+            parent.attributes("-topmost", False)
+            parent.update()
+            parent.attributes("-topmost", True)
+            parent.update()
+        except tk.TclError:
+            parent = None
+    try:
+        return fn()
+    finally:
+        if parent is not None and not was_topmost:
+            try:
+                parent.attributes("-topmost", False)
+            except tk.TclError:
+                pass
+
+
+def _all_nassie_toplevels(root):
+    """root, plus every currently-alive Toplevel descendant of it - every
+    window _bring_window_to_front() has ever made permanently -topmost
+    (every one of them, unconditionally, in its own __init__ - root
+    included). Toplevels nest under whichever window they were
+    constructed with (CreateShareDialog etc. all pass app.root, or a
+    chain up to it) as real Tk widget-tree children, so a plain
+    recursive winfo_children() walk from root finds all of them - no
+    separate registry to keep in sync needed."""
+    result = [root]
+
+    def walk(widget):
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                result.append(child)
+            walk(child)
+
+    walk(root)
+    return result
+
+
+def run_below_nassie_windows(root, fn):
+    """Runs fn() - a call that blocks waiting on some OTHER application's
+    own window (zenity/kdialog, via core.pick_directory_native()) - with
+    EVERY currently-open NASsie window's permanent "-topmost" (see
+    _bring_window_to_front()) turned OFF first, restoring each one
+    afterward.
+
+    with_parent_topmost() (above) is NOT the right tool for this, even
+    though it looks similar - that one moves a single NASsie window (the
+    caller's own parent) to the front of NASsie's OWN topmost layer,
+    which is exactly right for a dialog Tk itself owns (askdirectory's
+    real native picker on Windows/macOS - a genuine OS-level owned-
+    window relationship, so it inherits its owner's z-position
+    automatically). zenity/kdialog have no such relationship at all - a
+    fully independent process's window, no owner, no transient hint
+    pointing at NASsie whatsoever (zenity's own --attach flag, which
+    would have set exactly that, is a documented no-op as of zenity
+    4.2: "DEPRECATED; does nothing"). Reported live, twice: first with
+    NO topmost handling at all, then again after wrapping just the
+    calling dialog in with_parent_topmost() - which turned out to be a
+    complete no-op, since that dialog was ALREADY -topmost (from its
+    own _bring_window_to_front() call) before AND after, no net change.
+    root is ALSO permanently -topmost and was never touched either way -
+    an ordinary window like zenity can only ever land on top of NASsie
+    if NOTHING belonging to NASsie is currently claiming the always-on-
+    top layer, not just whichever single window happened to spawn it.
+
+    Best-effort, like with_parent_topmost() - a TclError on any one
+    window (mid-teardown, say) just drops that window from both the
+    "turn off" and "restore" passes rather than aborting the whole
+    thing."""
+    windows = [w for w in _all_nassie_toplevels(root) if w.winfo_exists()]
+    prior = {}
+    for w in windows:
+        try:
+            prior[w] = bool(w.attributes("-topmost"))
+            w.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+    # One synchronous round trip is enough here (unlike
+    # with_parent_topmost()'s own False->True->False->True dance) -
+    # this only ever needs the OFF state to actually reach the WM
+    # before fn() launches the external picker; there's no subsequent
+    # ON state on this side of that call for a missed round trip to
+    # undermine.
+    try:
+        root.update()
+    except tk.TclError:
+        pass
+    try:
+        return fn()
+    finally:
+        for w, was in prior.items():
+            if was and w.winfo_exists():
+                try:
+                    w.attributes("-topmost", True)
+                except tk.TclError:
+                    pass
 
 
 _patch_messagebox_front(messagebox, simpledialog, filedialog)
@@ -1271,7 +1391,17 @@ class CreateShareDialog(tk.Toplevel):
         # real native picker (what this already amounts to on Windows/
         # macOS) has proper folder creation built in - no separate
         # NASsie-side "New Folder" flow needed alongside it.
-        handled, selected = pick_directory_native("Select Folder to Share")
+        #
+        # run_below_nassie_windows(), not with_parent_topmost() - zenity/
+        # kdialog have no owner relationship to ANY NASsie window (see
+        # run_below_nassie_windows()'s own docstring for why that
+        # distinction matters and why the with_parent_topmost() version
+        # of this fix turned out to be a no-op), so every NASsie window
+        # currently claiming the always-on-top layer - not just this
+        # dialog - has to step aside for the picker to ever reach it.
+        handled, selected = run_below_nassie_windows(
+            self.app.root, lambda: pick_directory_native("Select Folder to Share")
+        )
         if not handled:
             selected = filedialog.askdirectory(parent=self, title="Select Folder to Share")
         if selected:
