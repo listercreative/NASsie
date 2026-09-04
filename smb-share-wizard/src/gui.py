@@ -1863,13 +1863,14 @@ class GUIWizard:
         self._build_header()
         self._build_shares_page()
 
-        # The Users panel is docked inside self._content_row itself
-        # (packed side="right" - unaffected by anything below). The Log
-        # panel is NOT - it's a sibling of self._content_row inside
-        # self._main_area instead, since it needs place() (see
-        # _place_log_steady()/_place_log_glide()), not pack() - see
-        # _toggle_users_panel()/_toggle_log_panel() and their own class
-        # docstrings for why these are panels, not separate windows.
+        # The Users panel is docked inside self._content_row itself on
+        # Linux/macOS (packed side="right" - unaffected by anything
+        # below). The Log panel is NOT - it's a sibling of
+        # self._content_row inside self._main_area instead, since it
+        # needs place() (see _place_log_steady()/_place_log_glide()),
+        # not pack() - see _toggle_users_panel()/_toggle_log_panel() and
+        # their own class docstrings for why these are panels, not
+        # separate windows.
         #
         # Users is the pack()-based, always-smooth side (matching what
         # Log used to be) and Log is the place()-based, jump+scrim side
@@ -1881,8 +1882,44 @@ class GUIWizard:
         # frequently used panel (Users) the side that's cheap, and the
         # rarely-opened one (Log) the side that pays that cost, was a
         # direct, explicit tradeoff, not a technical requirement.
+        #
+        # Windows is a THIRD shape, not just a slower version of the
+        # Linux one: self._user_mgmt_panel lives in its own separate,
+        # borderless overlay Toplevel (self._users_overlay) instead of
+        # inside content_row at all - see _toggle_users_panel()'s own
+        # docstring for the full reasoning (window_corners.
+        # animate_window_slide()'s docstring has the other half). In
+        # short: every attempt at animating THIS window's own bounds on
+        # Windows - a real multi-step glide, and separately a scrim-
+        # covered instant jump - measured real, unavoidable per-call
+        # repaint cost. A native OS primitive exists for exactly this
+        # (AnimateWindow/AW_SLIDE) but it can only show/hide a window,
+        # never resize an already-visible one - so the panel has to
+        # BE its own window to use it at all. root itself never
+        # resizes for this panel on Windows any more.
+        self._on_windows = platform.system() == "Windows"
         self._log_panel = LogPanel(self._main_area)
-        self._user_mgmt_panel = UserManagementPanel(self, self._content_row)
+        if self._on_windows:
+            # overrideredirect(True): no titlebar/borders - see
+            # window_corners._windows_raw_hwnd()'s own docstring for why
+            # that specifically is what makes AnimateWindow's HWND
+            # lookup simple (no OS-drawn frame to walk up to).
+            # Withdrawn immediately - _position_users_overlay() sizes
+            # and places it for real before it's ever shown, and until
+            # then it shouldn't flash into existence at Tk's own default
+            # placement.
+            self._users_overlay = tk.Toplevel(self.root)
+            self._users_overlay.overrideredirect(True)
+            self._users_overlay.withdraw()
+            self._user_mgmt_panel = UserManagementPanel(self, self._users_overlay)
+            # Packed once, permanently - unlike the Linux/macOS side
+            # (packed/unpacked on every toggle, see _pack_users_panel()),
+            # visibility here is entirely the OVERLAY WINDOW's own
+            # show/hide, never this frame's.
+            self._user_mgmt_panel.frame.pack(fill="both", expand=True)
+        else:
+            self._users_overlay = None
+            self._user_mgmt_panel = UserManagementPanel(self, self._content_row)
         # A plain, childless frame placed on top of the Log panel during
         # its open/close animation - see _toggle_log_panel()'s own
         # comment for why this, not a per-frame root resize, is what
@@ -1924,6 +1961,18 @@ class GUIWizard:
         self._users_panel_width = self._user_mgmt_panel.frame.winfo_reqwidth() + _PANEL_GUTTER
         self._log_panel_width = self._log_panel.frame.winfo_reqwidth() + _PANEL_GUTTER
         self._place_log_steady()
+        if self._on_windows:
+            self._position_users_overlay()
+            # Keeps the overlay glued to root's right edge if the main
+            # window moves or resizes WHILE the panel's open - it's a
+            # fully separate top-level window, so nothing about root's
+            # own geometry changes naturally carries it along the way
+            # place()-managed content_row (see _place_log_steady()) is
+            # carried automatically. Gated to "only while open" inside
+            # the handler itself, not here, so this stays a single
+            # binding for the window's whole lifetime rather than
+            # something added/removed on every toggle.
+            self.root.bind("<Configure>", self._reposition_users_overlay_if_open, add="+")
         # None until the first time _animate_root_width() actually needs
         # to reposition root (grow_left=True - the Users panel) - see
         # its own docstring for what this ends up measuring and why it
@@ -2455,6 +2504,35 @@ class GUIWizard:
         # _place_log_glide().
         self._user_mgmt_panel.frame.pack(side="right", fill="y", padx=(_PANEL_GUTTER, 0))
 
+    def _position_users_overlay(self):
+        # Windows only - see GUIWizard.__init__'s own comment on why
+        # self._users_overlay exists at all. Sizes and moves it to sit
+        # flush against root's CURRENT right edge, top-aligned with
+        # content_row and matching its height - reads as a drawer
+        # attached directly to the main window's own frame, not a
+        # window floating independently on the desktop. winfo_rootx()/
+        # winfo_rooty() are screen-absolute regardless of which
+        # top-level a widget belongs to, so content_row's own position
+        # works here exactly as well as it would for a widget inside
+        # THIS window.
+        self.root.update_idletasks()
+        panel_width = self._users_panel_width - _PANEL_GUTTER
+        x = self.root.winfo_rootx() + self.root.winfo_width()
+        y = self._content_row.winfo_rooty()
+        height = self._content_row.winfo_height()
+        self._users_overlay.geometry(f"{panel_width}x{height}+{x}+{y}")
+
+    def _reposition_users_overlay_if_open(self, event=None):
+        # root's own <Configure> fires constantly (any move/resize, not
+        # just ones relevant to this) - only actually worth reacting to
+        # while the overlay is visible; repositioning it while withdrawn
+        # would just waste a geometry() call nothing's watching, and
+        # _position_users_overlay() itself is called fresh right before
+        # every show anyway (see _toggle_users_panel()), so a closed
+        # overlay is never stale the next time it opens regardless.
+        if self._users_panel_open:
+            self._position_users_overlay()
+
     def _animate_root_width(self, delta_width, grow_left=False, on_complete=None, steps=10):
         # Steps the window from its current width to the target width
         # over several real mainloop turns (via after()) instead of one
@@ -2631,49 +2709,57 @@ class GUIWizard:
 
 
     def _toggle_users_panel(self):
-        # The cheap, pack()-based side (see GUIWizard.__init__'s own
-        # comment on why Users, not Log, was moved here) - one plain
-        # steps=10 _animate_root_width() glide, same on every platform.
-        # Confirmed live, smooth on Linux/macOS from the start.
+        # Linux/macOS: the cheap, pack()-based side (see
+        # GUIWizard.__init__'s own comment on why Users, not Log, was
+        # moved here) - one plain steps=10 _animate_root_width() glide.
+        # Confirmed live, smooth from the start; untouched by any of
+        # this method's own Windows-specific history below.
         #
-        # Windows went through two other designs before landing back
-        # here, worth recording so this doesn't get "fixed" back into
-        # one of them:
+        # Windows doesn't call _animate_root_width() for this panel at
+        # all any more - self._user_mgmt_panel lives in its own separate
+        # overlay window there (self._users_overlay, see
+        # GUIWizard.__init__), shown/hidden via
+        # window_corners.animate_window_slide(). Two other designs were
+        # tried and rejected first, worth recording so this doesn't get
+        # "fixed" back into one of them:
         #
-        # 1. steps=1 (an instant, un-animated jump) - the ORIGINAL
-        #    Windows-only path, reverted for being visibly abrupt with
-        #    no motion at all.
-        # 2. steps=1 hidden behind a pair of scrims (self._window_scrim/
-        #    a since-removed self._users_scrim), with the entire
-        #    VISIBLE open/close motion done afterward as a pure
-        #    place()-based reveal/cover, never touching root's geometry
-        #    at all (git history: _animate_users_scrim()). This traded
-        #    the choppiness for a different, also-real complaint: the
-        #    window's own OUTER bounds (the actual OS-drawn frame - not
-        #    something any in-app scrim can cover) still SNAPPED to
-        #    size in that one instant call, with only the CONTENT
-        #    inside animating afterward - reported live as "the panel
-        #    snaps open and closed."
+        # 1. A real multi-step root.geometry() glide, same as Linux -
+        #    genuinely smoother-TIMED once DWM's own competing tween was
+        #    suppressed (window_corners.set_transitions_suppressed()),
+        #    but still measurably choppy: each real geometry() call on
+        #    Windows is its own WM_SIZE/WM_PAINT round trip, repainting
+        #    the ENTIRE window, and X11 simply doesn't charge anywhere
+        #    near that per call. No amount of suppressing DWM's own
+        #    animation removes a cost that's or real per-call repaint
+        #    work, not DWM's tweening.
+        # 2. A steps=1 jump hidden behind a pair of scrims, with the
+        #    entire VISIBLE motion done afterward as a place()-based
+        #    reveal over already-rendered content, never touching root's
+        #    geometry after that one hidden jump. Fixed the choppiness,
+        #    but traded it for a different, equally real complaint: the
+        #    window's own OUTER bounds - the actual OS-drawn frame, not
+        #    something any in-app overlay can cover - still SNAPPED to
+        #    its final size in that one instant call, with only the
+        #    CONTENT inside animating afterward. Reported live as "the
+        #    panel snaps open and closed."
         #
-        # A real multi-step glide (this method, unconditionally) is the
-        # only way to make the window's actual outer edges move
-        # gradually rather than jump - there's no way around that: an
-        # overlay can hide/reveal content, but it can never hide the
-        # real OS window frame moving. The earlier "still choppy even
-        # with DWM suppressed" verdict that first motivated design #2
-        # was measured BEFORE _revealed()'s refresh()-deferral fix
-        # existed (see git history) - that test very likely mixed real
-        # per-call repaint cost with the SAME refresh()/Treeview-
-        # repopulation contention already confirmed (via anim_debug.log)
-        # to stall design #2's own reveal steps, so it was never a
-        # clean read on what plain steps=10 alone actually costs on
-        # Windows. window_corners.set_transitions_suppressed() (see its
-        # own docstring) still brackets _animate_root_width()'s geometry
-        # loop below regardless of platform, so DWM's own competing
-        # tween is out of the picture either way.
+        # Both designs were fundamentally stuck choosing between "the
+        # window's real bounds move smoothly but cost real per-call
+        # repaint work" and "nothing costs anything but the window's own
+        # edges jump." AnimateWindow(AW_SLIDE) (see that function's own
+        # docstring) sidesteps the tradeoff entirely rather than
+        # picking a side of it: it's a native OS primitive built for
+        # exactly this ("flyout panel") case, animated entirely
+        # compositor-side with the app never asked to redraw at any
+        # intermediate frame - but it can only show/hide a window, never
+        # resize an already-visible one, which is WHY the panel had to
+        # become a genuinely separate window on Windows to use it at
+        # all; root's own bounds never move for this panel there any
+        # more, so there's nothing left to either snap or cost repaint
+        # time.
         anim_debug.log(
             f"_toggle_users_panel clicked, currently_open={self._users_panel_open} "
-            f"animating={self._users_panel_animating}"
+            f"animating={self._users_panel_animating} on_windows={self._on_windows}"
         )
         # Ignore a click that lands while a previous toggle's own
         # animation hasn't finished yet, rather than starting a second,
@@ -2681,7 +2767,10 @@ class GUIWizard:
         # own comment in __init__ for why that's a real correctness
         # problem, not just a cosmetic one. Reported live as rapid-fire
         # open/close/open flicker from nothing more than an eager
-        # double-click on the toolbar button.
+        # double-click on the toolbar button. AnimateWindow() itself is
+        # synchronous (see its own docstring), so on Windows this guard
+        # mostly matters for the rare case a click lands WHILE that one
+        # blocking call is running.
         if self._users_panel_animating:
             anim_debug.log("_toggle_users_panel ignored - already animating")
             return
@@ -2696,35 +2785,69 @@ class GUIWizard:
             self._users_panel_open = False
             self._users_panel_animating = True
             self._users_toggle_btn.set_pressed(False)
-            def _done():
-                self._user_mgmt_panel.frame.pack_forget()
+            if self._on_windows:
+                window_corners.animate_window_slide(self._users_overlay, showing=False)
+                # Unconditional, regardless of whether the call above
+                # actually ran the native animation - AnimateWindow
+                # already hid the real Win32 window either way (or, on
+                # failure, never touched it at all), but Tk's OWN
+                # tracked wm_state has no way to know that on its own;
+                # this syncs it (a no-op if already hidden, the actual
+                # fallback hide if the call above failed outright).
+                self._users_overlay.withdraw()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_closed")
-                # Root just settled at its new (narrower) width - see
-                # window_corners.apply()'s own comment on why <Configure>
-                # alone can't be trusted to leave the bottom corners
-                # correctly shaped once a resize like this one finishes.
-                self._reapply_corners()
-            self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=10)
+            else:
+                def _done():
+                    self._user_mgmt_panel.frame.pack_forget()
+                    self._users_panel_animating = False
+                    self._notify_tour("user_mgmt_closed")
+                    # Root just settled at its new (narrower) width -
+                    # see window_corners.apply()'s own comment on why
+                    # <Configure> alone can't be trusted to leave the
+                    # bottom corners correctly shaped once a resize like
+                    # this one finishes.
+                    self._reapply_corners()
+                self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=10)
         else:
             self._users_panel_open = True
             self._users_panel_animating = True
             self._users_toggle_btn.set_pressed(True)
-            self._pack_users_panel()
-            def _done():
+            if self._on_windows:
+                # Freshly positioned every time, not just once at
+                # startup - root may have moved or resized since the
+                # panel was last open, and the <Configure> binding (see
+                # GUIWizard.__init__) only tracks that WHILE open.
+                self._position_users_overlay()
+                window_corners.animate_window_slide(self._users_overlay, showing=True)
+                # See the closing branch's identical call for why this
+                # runs unconditionally either way.
+                self._users_overlay.deiconify()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
-                self._reapply_corners()
-                # Deferred to here, not called before the glide starts -
-                # see _toggle_log_panel()'s unaffected design aside,
-                # this avoids refresh()'s own background-thread
-                # completion callback (root.after(0, apply), doing real
-                # synchronous Treeview work) landing mid-glide and
-                # stealing the event loop out from under one of this
-                # glide's own steps - confirmed live as a measurable
-                # stall when this used to run before the jump.
+                # AFTER the slide, not before - refresh()'s own
+                # list_users() call runs on a background thread (see its
+                # own docstring), whose completion callback has to reach
+                # back into this same Tcl interpreter (root.after(0,
+                # apply)) - doing that while the main thread is inside
+                # AnimateWindow()'s own blocking native call is a real
+                # thread-safety risk, not just a timing nicety like it
+                # was for the old step()/after() glide this replaced.
                 self._user_mgmt_panel.refresh()
-            self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
+            else:
+                self._pack_users_panel()
+                def _done():
+                    self._users_panel_animating = False
+                    self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+                    self._reapply_corners()
+                    # Deferred to here, not called before the glide
+                    # starts - avoids refresh()'s own background-thread
+                    # completion callback landing mid-glide and stealing
+                    # the event loop out from under one of this glide's
+                    # own steps - confirmed live as a measurable stall
+                    # when this used to run before the jump.
+                    self._user_mgmt_panel.refresh()
+                self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
 
     def _toggle_log_panel(self):
         # The place()-based, jump+scrim side (see GUIWizard.__init__'s
