@@ -117,10 +117,18 @@ def set_transitions_suppressed(window, suppressed):
     with True right before and False right after, rather than this ever
     being set once for the window's whole lifetime: scoping it to just
     the moment NASsie's own glide is actually running is what keeps
-    native minimize/restore animated the rest of the time."""
+    native minimize/restore animated the rest of the time.
+
+    Returns True if DwmSetWindowAttribute actually reported success,
+    False for every other case (no dwmapi, no HWND, or the call itself
+    erroring) - _animate_root_width() feeds this straight to
+    anim_debug.log()'s own hwnd_ok field, since a False here means
+    Windows is left animating this resize no matter what the rest of
+    this method's own bracketing does - worth knowing directly rather
+    than inferring it from screen-recorded choppiness alone."""
     handle = _windows_dwm_handle(window)
     if handle is None:
-        return
+        return False
     dwmapi, hwnd = handle
     DWMWA_TRANSITIONS_FORCEDISABLED = 3
     value = ctypes.c_int(1 if suppressed else 0)
@@ -129,8 +137,9 @@ def set_transitions_suppressed(window, suppressed):
             hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
             ctypes.byref(value), ctypes.sizeof(value),
         )
+        return True
     except OSError:
-        pass
+        return False
 
 
 class _XRectangle(ctypes.Structure):
