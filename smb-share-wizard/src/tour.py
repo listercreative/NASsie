@@ -824,9 +824,14 @@ class GuiTour:
         self._highlight = None
         self._callout = None
         self._wait_event = None
-        # (bound_widget, event_name, funcid) for the current step's
-        # container tracking - see _track_container()/_untrack_container().
+        # (bound_widget, event_name, funcid, reposition_fn) for the
+        # current step's container tracking - see
+        # _track_container()/_untrack_container().
         self._tracking = []
+        # Set by pause_tracking() (see its own docstring) to whatever
+        # _tracking held at the moment of pausing - None means nothing's
+        # currently paused (the normal state).
+        self._paused = None
         # Whichever dialog/window the CURRENT (or most recently opened)
         # step's action happened in - starts out None (nothing but the
         # main window exists yet); updated by on_event()'s window= arg
@@ -1309,10 +1314,81 @@ class GuiTour:
             except tk.TclError:
                 pass
 
+        # after_idle, not a direct bind - reposition() calls
+        # widget.update_idletasks() (see _HighlightBox.place_around()'s
+        # own docstring for why: the highlight target's geometry needs
+        # to be genuinely settled, not stale, before reading it), which
+        # is a real, synchronous, APPLICATION-WIDE flush of every
+        # pending layout/redraw task - not scoped to just this highlight.
+        # Calling that directly inside the <Configure> handler ran it
+        # synchronously in the middle of Tk's own processing of that
+        # exact event, for every <Configure> the container ever fires -
+        # including every one of GUIWizard._animate_root_width()'s own
+        # real per-step geometry() calls, whenever a tour step happens
+        # to be showing (confirmed live: the tour is active, un-skipped,
+        # in every screen-recorded report of "the whole window
+        # repainting" so far). Deferring to after_idle doesn't remove
+        # that flush - correctness still needs it - but it stops this
+        # forcing itself synchronously into the middle of root's own
+        # event handling, letting the animation's own after()-scheduled
+        # steps run on their own schedule instead of queuing up behind
+        # it.
+        # reposition itself (not just the bind() funcid) is kept
+        # alongside it - see pause_tracking()/resume_tracking() below,
+        # which need to unbind and later re-bind this SAME closure
+        # (container/widget/highlight_target etc., all captured above),
+        # not a fresh one.
         self._tracking = [
-            (container, "<Configure>", container.bind("<Configure>", reposition, add="+")),
+            (container, "<Configure>", container.bind(
+                "<Configure>", lambda e: container.after_idle(reposition), add="+"
+            ), reposition),
         ]
         self._schedule_reassert(container)
+
+    def pause_tracking(self):
+        """Temporarily unbinds every current step's own container
+        tracking (a no-op if nothing's tracked right now - no step
+        showing a callout, or already paused) - see
+        GUIWizard._animate_root_width()'s own call for why: reposition()
+        calls widget.update_idletasks() (see _track_container()'s own
+        comment), a real, synchronous, application-wide flush of every
+        pending layout/redraw task, on every single <Configure> the
+        tracked container fires - including every one of that method's
+        own real per-step geometry() calls, for however many steps a
+        glide runs. Pausing here means that flush happens once, in
+        resume_tracking(), instead of once per step. Keeps
+        self._tracking itself intact (just the live bindings removed),
+        so resume_tracking() knows exactly what to re-bind - unlike
+        _untrack_container(), which clears it because a step is
+        actually ending, not just this callout's tracking going quiet
+        for a moment."""
+        self._paused = self._tracking
+        for widget, event, funcid, _reposition in self._tracking:
+            try:
+                widget.unbind(event, funcid)
+            except tk.TclError:
+                pass
+
+    def resume_tracking(self):
+        """Re-binds whatever pause_tracking() paused (a no-op if nothing
+        was), and runs each one's own reposition() exactly once right
+        away - not waiting for the next real <Configure> - so nothing's
+        left stale for however long the pause lasted (e.g. a whole
+        panel-toggle glide's worth of geometry() calls the tracker never
+        saw)."""
+        paused = getattr(self, "_paused", None)
+        if not paused:
+            return
+        self._paused = None
+        new_tracking = []
+        for widget, event, _old_funcid, reposition in paused:
+            try:
+                funcid = widget.bind(event, lambda e, r=reposition: widget.after_idle(r), add="+")
+                new_tracking.append((widget, event, funcid, reposition))
+                reposition()
+            except tk.TclError:
+                pass
+        self._tracking = new_tracking
 
     def _schedule_reassert(self, container):
         # Practical workaround for a real platform limitation, not a
@@ -1363,7 +1439,7 @@ class GuiTour:
         container.after(1500, _reassert)
 
     def _untrack_container(self):
-        for widget, event, funcid in self._tracking:
+        for widget, event, funcid, _reposition in self._tracking:
             try:
                 widget.unbind(event, funcid)
             except tk.TclError:
@@ -1371,6 +1447,9 @@ class GuiTour:
                 # it was bound to may already be gone.
                 pass
         self._tracking = []
+        # A step actually ending is a real end, not a pause - nothing
+        # left to resume later (see pause_tracking()/resume_tracking()).
+        self._paused = None
 
     def on_event(self, event, window=None):
         # Called by GUIWizard right when the action a visible step is
