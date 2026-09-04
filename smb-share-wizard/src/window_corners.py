@@ -41,17 +41,26 @@ ever told to stand down for the ~160ms NASsie's own glide is actually
 running - native minimize/restore keeps its normal animation the rest
 of the time.
 
-_enable_composited_resize() (below, also Windows only, also called
-from _round_windows()) is the OTHER standing Windows-only fix here,
-and a different kind from either of the above: WS_EX_COMPOSITED is the
-standard, decades-old Win32 answer to a top-level window with many
-child controls each showing stale/uninitialized pixels for whatever a
-resize just exposed, until every individual one gets around to
-repainting - not something specific to Tk, DWM transitions, or this
-app. Set once, permanently, at startup, unlike
-set_transitions_suppressed()'s deliberately scoped toggle - this is a
-standing instruction for how the window's whole child hierarchy gets
-composited, not an animation-timing knob.
+set_composited_resize() (below) is the same story again, for a THIRD
+Windows-only setting: WS_EX_COMPOSITED is the standard Win32 answer to
+a top-level window with many child controls each showing stale/
+uninitialized pixels for whatever a resize just exposed, until every
+individual one gets around to repainting - reported live, screen-
+recorded, as a ghosted scrollbar and a black flash right at the Users
+panel's own growing edge. A first version set this once, permanently,
+at startup, matching how _round_windows() below still handles corner
+rounding - and it visibly fixed that resize artifact, but broke real
+functionality elsewhere: CreateShareDialog's own "+" button, and
+GuiTour's own guidance callout taking far longer to first appear.
+Enabling compositing on a window's entire child tree has real, ongoing
+cost, not something to pay for the app's whole lifetime just to smooth
+over one 160ms glide. set_composited_resize() is the scoped version,
+same pattern as set_transitions_suppressed() above: GUIWizard.
+_animate_root_width() calls it (True) immediately before its own
+geometry() loop and (False) immediately after, so compositing is only
+ever active for the glide itself - neither the "+" button nor the
+tour's callout is ever shown DURING one, so neither should see it
+active at all.
 """
 from __future__ import annotations
 
@@ -119,37 +128,40 @@ def _round_windows(window):
         # Windows 10 and earlier don't have this attribute at all -
         # DwmSetWindowAttribute just errors instead of no-oping.
         pass
-    _enable_composited_resize(hwnd)
 
 
-def _enable_composited_resize(hwnd):
-    """Sets WS_EX_COMPOSITED on the real top-level HWND - the standard,
-    decades-old Win32 fix for exactly the class of bug
-    GUIWizard._animate_root_width()'s own per-widget freezes (header
-    logo, Path column stretch, the Users toggle button, GuiTour's
-    highlight tracking, the Users panel's own scrim) were all reactive
-    patches for: a top-level window with many child controls, each
-    painting itself separately, shows stale or uninitialized (often
-    black) pixels for whatever's newly exposed by a resize until every
-    individual child gets around to repainting - reported live,
-    screen-recorded, as a ghosted scrollbar and a black flash right at
-    the Users panel's own growing edge. WS_EX_COMPOSITED tells DWM to
-    draw the ENTIRE window hierarchy into one off-screen buffer and
-    present it atomically instead - this is what that style exists for,
-    not something specific to Tk or this app. Set once, permanently, at
-    startup (unlike set_transitions_suppressed()'s own deliberately
-    scoped toggle) - this isn't an animation-timing knob to turn on and
-    off around a glide, it's a standing instruction for how this
-    window's whole child hierarchy gets composited, period.
+def set_composited_resize(window, enabled):
+    """Windows only, no-op (returns False) elsewhere or on any failure -
+    same best-effort contract as set_transitions_suppressed(). Toggles
+    WS_EX_COMPOSITED on `window`'s real top-level HWND - the standard
+    Win32 answer to a top-level window with many child controls each
+    showing stale/uninitialized pixels for whatever a resize just
+    exposed, until every individual one gets around to repainting -
+    reported live, screen-recorded, as a ghosted scrollbar and a black
+    flash right at the Users panel's own growing edge during
+    GUIWizard._animate_root_width()'s own glide.
 
-    Doesn't replace the per-widget freezes above - those also cut real,
-    unnecessary REDRAW WORK (fewer Treeview column relayouts, fewer
-    widget rebuilds), which is worth keeping regardless of whether this
-    also fixes the visual artifact those redraws were causing."""
+    Scoped (True right before that glide's geometry() loop, False right
+    after - see that method's own call), NOT set once, permanently, at
+    startup, the way an earlier version of this did - reverted, live:
+    enabling compositing on the window's ENTIRE child tree has real,
+    ongoing cost (this app's own docstring history elsewhere makes the
+    same point about set_transitions_suppressed() staying on forever),
+    and left on for the app's whole lifetime it visibly broke real
+    functionality - CreateShareDialog's own "+" button, and GuiTour's
+    own guidance callout taking far longer to first appear. Scoping
+    this to just the ~160ms an actual glide runs, exactly like
+    set_transitions_suppressed() already does for a different Windows-
+    only setting, means neither of those - which don't happen DURING a
+    panel-toggle glide - should ever see it active at all."""
+    handle = _windows_dwm_handle(window)
+    if handle is None:
+        return False
+    _dwmapi, hwnd = handle
     try:
         user32 = ctypes.windll.user32
     except (AttributeError, OSError):
-        return
+        return False
     GWL_EXSTYLE = -20
     WS_EX_COMPOSITED = 0x02000000
     try:
@@ -158,9 +170,11 @@ def _enable_composited_resize(hwnd):
         user32.SetWindowLongPtrW.restype = ctypes.c_longlong
         user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
         current = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | WS_EX_COMPOSITED)
+        new_style = (current | WS_EX_COMPOSITED) if enabled else (current & ~WS_EX_COMPOSITED)
+        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style)
+        return True
     except (AttributeError, OSError):
-        pass
+        return False
 
 
 def set_transitions_suppressed(window, suppressed):

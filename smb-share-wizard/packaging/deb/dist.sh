@@ -6,7 +6,7 @@
 set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-VERSION="0.1.25"
+VERSION="0.1.26"
 OUT="$SCRIPT_DIR/nassie-linux-installer.tar.gz"
 STAGE=$(mktemp -d)
 BUNDLE_DIR="$STAGE/nassie-installer"
@@ -14,7 +14,7 @@ BUNDLE_DIR="$STAGE/nassie-installer"
 "$SCRIPT_DIR/build.sh"
 
 mkdir -p "$BUNDLE_DIR"
-cp "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/preview.py" "$SCRIPT_DIR/nassie_0.1.25_all.deb" "$BUNDLE_DIR/"
+cp "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/preview.py" "$SCRIPT_DIR/nassie_0.1.26_all.deb" "$BUNDLE_DIR/"
 chmod +x "$BUNDLE_DIR/install.sh"
 
 cat > "$BUNDLE_DIR/README.txt" <<EOF
