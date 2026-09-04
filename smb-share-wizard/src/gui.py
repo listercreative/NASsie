@@ -1951,6 +1951,23 @@ class GUIWizard:
         # Parented directly to root, not main_area, so it can actually
         # reach the header.
         self._window_scrim = ttk.Frame(self.root)
+        # Covers JUST the Users panel's own area, for the real steps=10
+        # glide _toggle_users_panel() runs on EVERY platform (unlike
+        # window_scrim above, this isn't a Windows-only steps=1 thing) -
+        # see that method's own comment for why: the panel itself is
+        # pack(side="right") in content_row, so its own x position has
+        # to shift by the full panel width over the course of the
+        # glide (it genuinely MOVES, not just redraws in place - unlike
+        # the header logo/toggle button, which only needed to stay put
+        # and could be frozen outright), and Windows was reported live
+        # as visibly ghosting that (a duplicated scrollbar, a flash of
+        # black right at its own growing edge) across every one of
+        # those real steps. Hiding the whole transient behind this,
+        # rather than trying to make each of its 10 individual
+        # reposition steps clean, is the same principle as every other
+        # freeze in _animate_root_width(), just scoped to a region
+        # instead of a single widget.
+        self._users_scrim = ttk.Frame(self._content_row)
         self._users_panel_open = False
         # Sole guard against a second click landing mid-glide - see
         # _toggle_users_panel()'s own comment for why that's not just a
@@ -2629,6 +2646,35 @@ class GUIWizard:
             frozen_x = header_icon.winfo_x()
             header_icon.place(x=frozen_x, y=0, anchor="n")
 
+        # Same freeze, different mechanism: the Users toggle button
+        # (self._users_toggle_btn.frame, the 👤 toolbar icon) is pack()'d
+        # side="right" in a toolbar that's pack(fill="x") in root - as
+        # root grows across this glide's real steps, the toolbar widens
+        # right along with it, and pack's own right-anchoring re-derives
+        # this button's x position on every single one of them, exactly
+        # like the header logo's relx=0.5 did (see its own comment
+        # above) - just via pack()'s own tracking instead of place()'s.
+        # Reported live, screen-recorded: the icon rendering fully BLANK
+        # (not a duplicate this time - the glyph itself never got
+        # redrawn at its new position before the next step already
+        # moved it again) after a toggle - same underlying "Windows
+        # doesn't keep up with rapid reposition+redraw" cause, different
+        # visible symptom. place(), not pack_forget()+place() - calling
+        # place() on an already-pack()'d widget implicitly detaches it
+        # from pack (Tk only ever honors one geometry manager per
+        # widget at a time), so this alone is enough to freeze it; the
+        # later pack(side="right") call implicitly detaches it from
+        # place() again, the same way in reverse.
+        toggle_btn_frame = getattr(self, "_users_toggle_btn", None)
+        if toggle_btn_frame is not None:
+            toggle_btn_frame = toggle_btn_frame.frame
+            frozen_btn_x = toggle_btn_frame.winfo_x()
+            frozen_btn_y = toggle_btn_frame.winfo_y()
+            toggle_btn_frame.place(
+                x=frozen_btn_x, y=frozen_btn_y,
+                width=toggle_btn_frame.winfo_width(), height=toggle_btn_frame.winfo_height(),
+            )
+
         # Same freeze, much bigger payoff: the shares list's "Path"
         # column is stretch=True (see _build_shares_page()), meaning
         # ttk's OWN Treeview implementation recomputes and redraws its
@@ -2728,6 +2774,15 @@ class GUIWizard:
                 # by whatever the last freeze's x happened to be).
                 if header_icon is not None:
                     header_icon.place(x=0, relx=0.5, y=0, anchor="n")
+                # Back to live pack(side="right") tracking - matches
+                # GUIWizard._build_shares_page()'s own original call
+                # exactly, since this needs to be the SAME pack
+                # configuration going forward, not a guessed one. See
+                # the freeze's own comment above for why place() alone
+                # was enough to detach it in the first place, and why
+                # the same is true in reverse here.
+                if toggle_btn_frame is not None:
+                    toggle_btn_frame.pack(side="right")
                 # Re-enables stretch on the settled, FINAL width, not a
                 # stale one from mid-glide - ttk recomputes the column's
                 # correct pixel width itself from here, once, cleanly.
@@ -2839,8 +2894,25 @@ class GUIWizard:
             self._users_panel_open = False
             self._users_panel_animating = True
             self._users_toggle_btn.set_pressed(False)
+            # Covers the panel's own area BEFORE the glide starts, while
+            # it's still fully visible - see self._users_scrim's own
+            # comment in __init__ for why: hides the panel's own real
+            # per-step reposition (pack(side="right") tracking
+            # content_row's shrinking width) rather than trying to make
+            # each of those 10 steps individually clean.
+            panel_width = self._users_panel_width - _PANEL_GUTTER
+            self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
+            self._users_scrim.lift()
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
+                # update_idletasks() BEFORE removing the scrim, not
+                # after - see the opening branch's identical call for
+                # why: forces everything underneath to actually finish
+                # settling at the new (narrower) width WHILE still
+                # hidden, so there's nothing left to redraw once the
+                # scrim comes off.
+                self.root.update_idletasks()
+                self._users_scrim.place_forget()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_closed")
                 # Root just settled at its new (narrower) width - see
@@ -2853,8 +2925,29 @@ class GUIWizard:
             self._users_panel_open = True
             self._users_panel_animating = True
             self._users_toggle_btn.set_pressed(True)
+            # Covers the panel's full FINAL area BEFORE it's even
+            # packed - using panel_width, the cached target (known in
+            # advance, no need to wait and measure it after the glide) -
+            # so the panel's real content, and its own per-step
+            # reposition as content_row grows underneath it, is never
+            # visible even for one frame. relx=1.0 keeps this pinned to
+            # content_row's live right edge throughout, the same way
+            # the panel itself will be once it's actually packed.
+            panel_width = self._users_panel_width - _PANEL_GUTTER
+            self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
+            self._users_scrim.lift()
             self._pack_users_panel()
             def _done():
+                # update_idletasks() BEFORE removing the scrim, not
+                # after - see _animate_root_width()'s own header-icon
+                # freeze comment for the general shape of why: forces
+                # the now-packed panel (and everything else content_row
+                # resized around it) to actually finish settling at its
+                # final position WHILE still hidden, so there's nothing
+                # left to redraw - no ghosted scrollbar, no flash at its
+                # own edge - once the scrim comes off.
+                self.root.update_idletasks()
+                self._users_scrim.place_forget()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
                 self._reapply_corners()

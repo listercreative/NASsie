@@ -40,6 +40,18 @@ its own geometry() loop and (False) immediately after, so DWM is only
 ever told to stand down for the ~160ms NASsie's own glide is actually
 running - native minimize/restore keeps its normal animation the rest
 of the time.
+
+_enable_composited_resize() (below, also Windows only, also called
+from _round_windows()) is the OTHER standing Windows-only fix here,
+and a different kind from either of the above: WS_EX_COMPOSITED is the
+standard, decades-old Win32 answer to a top-level window with many
+child controls each showing stale/uninitialized pixels for whatever a
+resize just exposed, until every individual one gets around to
+repainting - not something specific to Tk, DWM transitions, or this
+app. Set once, permanently, at startup, unlike
+set_transitions_suppressed()'s deliberately scoped toggle - this is a
+standing instruction for how the window's whole child hierarchy gets
+composited, not an animation-timing knob.
 """
 from __future__ import annotations
 
@@ -106,6 +118,48 @@ def _round_windows(window):
     except OSError:
         # Windows 10 and earlier don't have this attribute at all -
         # DwmSetWindowAttribute just errors instead of no-oping.
+        pass
+    _enable_composited_resize(hwnd)
+
+
+def _enable_composited_resize(hwnd):
+    """Sets WS_EX_COMPOSITED on the real top-level HWND - the standard,
+    decades-old Win32 fix for exactly the class of bug
+    GUIWizard._animate_root_width()'s own per-widget freezes (header
+    logo, Path column stretch, the Users toggle button, GuiTour's
+    highlight tracking, the Users panel's own scrim) were all reactive
+    patches for: a top-level window with many child controls, each
+    painting itself separately, shows stale or uninitialized (often
+    black) pixels for whatever's newly exposed by a resize until every
+    individual child gets around to repainting - reported live,
+    screen-recorded, as a ghosted scrollbar and a black flash right at
+    the Users panel's own growing edge. WS_EX_COMPOSITED tells DWM to
+    draw the ENTIRE window hierarchy into one off-screen buffer and
+    present it atomically instead - this is what that style exists for,
+    not something specific to Tk or this app. Set once, permanently, at
+    startup (unlike set_transitions_suppressed()'s own deliberately
+    scoped toggle) - this isn't an animation-timing knob to turn on and
+    off around a glide, it's a standing instruction for how this
+    window's whole child hierarchy gets composited, period.
+
+    Doesn't replace the per-widget freezes above - those also cut real,
+    unnecessary REDRAW WORK (fewer Treeview column relayouts, fewer
+    widget rebuilds), which is worth keeping regardless of whether this
+    also fixes the visual artifact those redraws were causing."""
+    try:
+        user32 = ctypes.windll.user32
+    except (AttributeError, OSError):
+        return
+    GWL_EXSTYLE = -20
+    WS_EX_COMPOSITED = 0x02000000
+    try:
+        user32.GetWindowLongPtrW.restype = ctypes.c_longlong
+        user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_longlong
+        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong]
+        current = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | WS_EX_COMPOSITED)
+    except (AttributeError, OSError):
         pass
 
 
