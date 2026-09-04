@@ -2622,6 +2622,18 @@ class GUIWizard:
         suppressed_ok = window_corners.set_transitions_suppressed(self.root, True)
         anim_debug.log(f"set_transitions_suppressed(True) -> {suppressed_ok}")
 
+        # Scoped exactly like the call above, for a different Windows-
+        # only setting - see set_composited_resize()'s own docstring for
+        # why this HAS to be scoped to just the glide (True here, False
+        # the instant the last step lands below) rather than set once,
+        # permanently, at startup the way an earlier version of this
+        # did: left on for the app's whole lifetime, it visibly broke
+        # real functionality (CreateShareDialog's own "+" button,
+        # GuiTour's own guidance callout) that has nothing to do with
+        # this glide at all.
+        composited_ok = window_corners.set_composited_resize(self.root, True)
+        anim_debug.log(f"set_composited_resize(True) -> {composited_ok}")
+
         # Freezes the header's logo at its CURRENT pixel position for
         # the duration of this glide, instead of leaving it on its
         # normal place(relx=0.5) tracking (see _build_header()'s own
@@ -2755,8 +2767,10 @@ class GUIWizard:
             if i == steps - 1:
                 self.root.minsize(w, height)
                 restored_ok = window_corners.set_transitions_suppressed(self.root, False)
+                composited_restored_ok = window_corners.set_composited_resize(self.root, False)
                 anim_debug.log(
                     f"_animate_root_width done, set_transitions_suppressed(False) -> {restored_ok}, "
+                    f"set_composited_resize(False) -> {composited_restored_ok}, "
                     f"final winfo_width={self.root.winfo_width()}"
                 )
                 # Back to live relx=0.5 tracking, now that the glide's
