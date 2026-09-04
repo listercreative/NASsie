@@ -510,7 +510,20 @@ class _RowActionBar:
         self.build_fn = build_fn
         self.bar = ttk.Frame(tree)
         tree.bind("<<TreeviewSelect>>", lambda e: self.update(), add="+")
-        tree.bind("<Configure>", lambda e: self.update(), add="+")
+        # reposition(), NOT update() - a resize doesn't change WHICH row
+        # is selected or what build_fn returns for it, only where the
+        # (already-built) bar needs to sit, exactly like the scroll
+        # bindings below - see their own comment for why update()'s
+        # destroy-then-rebuild is wasted work whenever the actual set of
+        # buttons can't have changed. Previously bound to update() here
+        # specifically, unlike scroll - real cost during
+        # GUIWizard._animate_root_width()'s own multi-step glide: content_
+        # row (and so this tree) resizes on every one of its real
+        # geometry() steps, so any currently-selected row's action
+        # buttons were being destroyed and rebuilt from scratch that many
+        # times per toggle - confirmed live as a major contributor to
+        # "the whole window repainting" during it, not just relocated.
+        tree.bind("<Configure>", lambda e: tree.after_idle(self.reposition), add="+")
         # Scrolling doesn't fire either of the above, but it also doesn't
         # change WHICH row is selected or that row's own state - only
         # reposition() (place() the ALREADY-built buttons at the row's
@@ -562,10 +575,27 @@ class _RowActionBar:
             # no rebuild either.
             self.bar.place_forget()
             return
-        self._place(bbox)
+        # measure=False - see _place()'s own comment for why reposition()
+        # specifically never needs it.
+        self._place(bbox, measure=False)
 
-    def _place(self, bbox):
-        self.bar.update_idletasks()
+    def _place(self, bbox, measure=True):
+        # measure=False (reposition() only) skips update_idletasks() -
+        # a real, synchronous, application-wide flush of every pending
+        # layout/redraw task, not scoped to just this bar - see
+        # GuiTour.pause_tracking()'s own docstring for the general shape
+        # of this problem. It's only genuinely needed right after
+        # update() freshly destroys and rebuilds the bar's buttons, to
+        # get an accurate winfo_reqwidth() for content that didn't exist
+        # a moment ago. reposition() never changes what's built - same
+        # buttons, same content, same size - so the frame's required
+        # width can't have changed since the LAST time it was measured,
+        # making this flush pure redundant cost on every one of
+        # GUIWizard._animate_root_width()'s own real per-step
+        # geometry() calls, whenever a row happens to be selected during
+        # one.
+        if measure:
+            self.bar.update_idletasks()
         x, y, _w, h = bbox
         bar_w = self.bar.winfo_reqwidth()
         margin = 4
@@ -2141,6 +2171,12 @@ class GUIWizard:
 
         if icon_label is not None:
             icon_label.place(relx=0.5, y=0, anchor="n")
+        # Kept on self, not local-only - _animate_root_width() freezes
+        # this widget's position for the duration of its own glide (see
+        # its own comment for why) and needs a handle to it. None if
+        # there's no icon at all (see _load_icon_image()'s own
+        # fallback), in which case that freeze is just always a no-op.
+        self._header_icon_label = icon_label
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=8, pady=(10, 0))
 
@@ -2569,6 +2605,73 @@ class GUIWizard:
         suppressed_ok = window_corners.set_transitions_suppressed(self.root, True)
         anim_debug.log(f"set_transitions_suppressed(True) -> {suppressed_ok}")
 
+        # Freezes the header's logo at its CURRENT pixel position for
+        # the duration of this glide, instead of leaving it on its
+        # normal place(relx=0.5) tracking (see _build_header()'s own
+        # comment on why it's relx-based at all - centering against the
+        # header's own live width). relx=0.5 means that width changing
+        # on every single one of this glide's steps forces the label to
+        # recompute AND redraw its position that many times too - not
+        # just root itself repainting. Reported live, screen-recorded:
+        # a duplicate/ghosted icon mid-glide, the same class of "stale
+        # pixels never cleared before the next paint" bug already fixed
+        # once for the scrim-based Windows design this replaced - except
+        # THAT fix isn't available here at all, since there's no scrim
+        # hiding anything mid-glide any more (the whole point of a REAL
+        # multi-step resize is that every intermediate frame is visible
+        # on purpose). Freezing the logo's pixel position removes the
+        # per-step cost entirely rather than trying to make each of the
+        # 10 individual re-centers clean: it just doesn't move (or
+        # redraw) until put back on relx=0.5 tracking, in one single,
+        # clean re-place(), once the glide is fully done.
+        header_icon = self._header_icon_label
+        if header_icon is not None:
+            frozen_x = header_icon.winfo_x()
+            header_icon.place(x=frozen_x, y=0, anchor="n")
+
+        # Same freeze, much bigger payoff: the shares list's "Path"
+        # column is stretch=True (see _build_shares_page()), meaning
+        # ttk's OWN Treeview implementation recomputes and redraws its
+        # entire column layout - EVERY visible row, not just one small
+        # label - on every single width change it sees. content_row
+        # tracks main_area's live width (relwidth=1.0 - see
+        # _place_log_steady()), so as root grows across all 10 of this
+        # glide's real geometry() calls, shares_list's own allocated
+        # width changes 10 times right along with it, and stretch=True
+        # means the Treeview redraws its full column layout that many
+        # times too - reported live as the window's entire content
+        # repainting, not just the header. Disabling stretch for the
+        # glide's duration freezes the column at whatever pixel width it
+        # already has - the Treeview's own OUTER bounds still resize
+        # live with the window (this is stretch, a column-width policy,
+        # not the widget's own geometry - "the window really expands"
+        # stays completely intact), it just stops redistributing space
+        # internally until stretch is switched back on, once, after the
+        # glide - at which point ttk recomputes the correct final column
+        # width itself from the settled width, no manual math needed
+        # here for what that width should be.
+        try:
+            path_stretch_was = self.shares_list.column("path", "stretch")
+        except tk.TclError:
+            path_stretch_was = None
+        if path_stretch_was:
+            self.shares_list.column("path", stretch=False)
+
+        # Pauses GuiTour's own container tracking (see its
+        # pause_tracking()'s own docstring) for the glide's duration -
+        # a real, measured contributor when a tour step happens to be
+        # showing a callout: its reposition() calls widget.
+        # update_idletasks(), a synchronous, APPLICATION-WIDE flush of
+        # every pending layout/redraw task, on every single <Configure>
+        # the tracked container fires, which very much includes every
+        # one of THIS method's own real per-step geometry() calls.
+        # getattr(), not self._tour directly - the tour may never have
+        # started, or may already be finished (see _notify_tour()'s own
+        # identical guard) - either way, nothing to pause.
+        tour = getattr(self, "_tour", None)
+        if tour is not None:
+            tour.pause_tracking()
+
         def step(i):
             w = widths[i]
             anim_debug.log(
@@ -2610,6 +2713,32 @@ class GUIWizard:
                     f"_animate_root_width done, set_transitions_suppressed(False) -> {restored_ok}, "
                     f"final winfo_width={self.root.winfo_width()}"
                 )
+                # Back to live relx=0.5 tracking, now that the glide's
+                # done and there's only ever going to be ONE more
+                # re-center to actually draw - see the freeze's own
+                # comment above for why it was frozen at all. x=0
+                # explicitly, not omitted - place() only ever CHANGES
+                # the options actually passed to it, it doesn't reset
+                # ones left out back to their own defaults, so leaving
+                # x out here would keep the freeze's own explicit pixel
+                # offset stacked on top of relx forever (confirmed live:
+                # place_info() showing x and relx BOTH still set after
+                # this ran without x=0 - Tk resolves that as relx*width
+                # + x, permanently shifting the logo off its true center
+                # by whatever the last freeze's x happened to be).
+                if header_icon is not None:
+                    header_icon.place(x=0, relx=0.5, y=0, anchor="n")
+                # Re-enables stretch on the settled, FINAL width, not a
+                # stale one from mid-glide - ttk recomputes the column's
+                # correct pixel width itself from here, once, cleanly.
+                if path_stretch_was:
+                    self.shares_list.column("path", stretch=True)
+                # Re-binds GuiTour's own tracking (a no-op if nothing was
+                # paused above) and repositions its highlight/callout
+                # exactly once, against the now-settled final geometry -
+                # see pause_tracking()'s own docstring.
+                if tour is not None:
+                    tour.resume_tracking()
                 if on_complete:
                     on_complete()
             else:
