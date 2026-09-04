@@ -1,4 +1,5 @@
-"""Best-effort native corner rounding for the main window.
+"""Best-effort native corner rounding for the main window, and (Windows
+only) turning off DWM's own transition animations for it.
 
 Windows 11 already rounds every top-level window via DWM with no app
 involvement in the common case, but DWMWA_WINDOW_CORNER_PREFERENCE makes
@@ -15,6 +16,30 @@ by default. apply() below clips that client rectangle's bottom two
 corners with the X Shape extension so they match the WM-drawn rounded
 top instead of standing out as hard corners under it - see the
 GUIWizard.__init__ call site in gui.py for why only the bottom two.
+
+set_transitions_suppressed() (below, Windows only) is the other half of
+that: DWM tweens a top-level window's bounds across its own transition
+duration on EVERY resize/move by default, repainting content as it
+goes, regardless of how many (or how few) root.geometry() calls the
+app itself makes to get there - confirmed live, screen-recorded on a
+real Windows machine, that GUIWizard's panel-toggle glides
+(_toggle_users_panel()/_toggle_log_panel()) still looked gradual and
+choppy even after being reduced to one supposedly-atomic geometry()
+call. That's DWM's own animation, layered on top of whatever the app
+asked for - the app has no control over its timing or easing at all
+unless it's told to stop entirely for a moment.
+
+An earlier version of this tried exactly that: force transitions off
+for the window's entire lifetime, in _round_windows() below,
+permanently. Works, but is a genuinely bad trade globally - it also
+kills the native minimize/restore animation for this window, all the
+time, not just during NASsie's own panel glides - correctly rejected
+live. set_transitions_suppressed() is the scoped version:
+GUIWizard._animate_root_width() calls it (True) immediately before
+its own geometry() loop and (False) immediately after, so DWM is only
+ever told to stand down for the ~160ms NASsie's own glide is actually
+running - native minimize/restore keeps its normal animation the rest
+of the time.
 """
 from __future__ import annotations
 
@@ -42,17 +67,34 @@ def apply(window, radius=8):
     return lambda: None
 
 
-def _round_windows(window):
+def _windows_dwm_handle(window):
+    """(dwmapi, hwnd) for `window`'s real, OS-decorated top-level HWND, or
+    None if either the DLLs or the window itself aren't resolvable (no
+    dwmapi on this Windows version, or the Tk window's already gone) -
+    every Windows-only caller below (_round_windows(),
+    set_transitions_suppressed()) shares this exact lookup rather than
+    each re-deriving it slightly differently."""
     try:
         dwmapi = ctypes.windll.dwmapi
         user32 = ctypes.windll.user32
     except (AttributeError, OSError):
-        return
+        return None
     # winfo_id() is Tk's own child frame HWND, not the OS-decorated
     # top-level window DWM actually draws - GetParent() walks up to that
     # one. The same lookup ttkbootstrap/sv_ttk-style "set the titlebar
     # dark too" helpers use for the identical reason.
-    hwnd = user32.GetParent(window.winfo_id())
+    try:
+        hwnd = user32.GetParent(window.winfo_id())
+    except tk.TclError:
+        return None
+    return dwmapi, hwnd
+
+
+def _round_windows(window):
+    handle = _windows_dwm_handle(window)
+    if handle is None:
+        return
+    dwmapi, hwnd = handle
     DWMWA_WINDOW_CORNER_PREFERENCE = 33
     DWMWCP_ROUND = 2
     preference = ctypes.c_int(DWMWCP_ROUND)
@@ -64,6 +106,30 @@ def _round_windows(window):
     except OSError:
         # Windows 10 and earlier don't have this attribute at all -
         # DwmSetWindowAttribute just errors instead of no-oping.
+        pass
+
+
+def set_transitions_suppressed(window, suppressed):
+    """Windows only, no-op elsewhere (and best-effort even there - see
+    _windows_dwm_handle()). Toggles DWMWA_TRANSITIONS_FORCEDISABLED for
+    `window`'s real top-level HWND - see this module's own docstring for
+    why GUIWizard._animate_root_width() brackets its own geometry() loop
+    with True right before and False right after, rather than this ever
+    being set once for the window's whole lifetime: scoping it to just
+    the moment NASsie's own glide is actually running is what keeps
+    native minimize/restore animated the rest of the time."""
+    handle = _windows_dwm_handle(window)
+    if handle is None:
+        return
+    dwmapi, hwnd = handle
+    DWMWA_TRANSITIONS_FORCEDISABLED = 3
+    value = ctypes.c_int(1 if suppressed else 0)
+    try:
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+            ctypes.byref(value), ctypes.sizeof(value),
+        )
+    except OSError:
         pass
 
 

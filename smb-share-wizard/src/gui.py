@@ -1745,22 +1745,14 @@ class GUIWizard:
         # actually animates now. Themed (ttk, not tk) so it matches
         # whatever's normally visible there with no color to hand-tune.
         self._log_scrim = ttk.Frame(self._main_area)
-        # Same trick, for the Users panel's Windows-only path - see
-        # _animate_users_scrim()/_toggle_users_panel()'s own comments.
-        # Parented to self._content_row, not self._main_area, since
-        # that's what the Users panel itself is packed into.
-        self._users_scrim = ttk.Frame(self._content_row)
         # Covers the WHOLE window (header/logo included - see
         # _build_header(), a plain sibling of self._main_area in root,
-        # never touched by either panel-scoped scrim above) for the one
-        # instant root.geometry() jump either panel's Windows-only path
-        # makes. That single call is still a full WM_SIZE/WM_PAINT
-        # round trip there, repainting every child in the window - not
-        # just the panel's own slice - reported live as the logo and
-        # the shares list's own "+" flickering/redrawing even though
-        # this scrim's already up over the panel by then. Parented
-        # directly to root, not main_area, so it can actually reach the
-        # header - see _toggle_users_panel()/_toggle_log_panel().
+        # never touched by _log_scrim above, which only ever reaches
+        # main_area) for _toggle_log_panel()'s own steps=1 jump. That
+        # single call is still a full WM_SIZE/WM_PAINT round trip there,
+        # repainting every child in the window - not just the Log
+        # panel's own slice. Parented directly to root, not main_area,
+        # so it can actually reach the header.
         self._window_scrim = ttk.Frame(self.root)
         self._users_panel_open = False
         self._log_panel_open = False
@@ -2369,6 +2361,21 @@ class GUIWizard:
         widths = [old_width + round(actual_delta * i / steps) for i in range(1, steps)] + [target_width]
         xs = [max(0, old_x - (w - old_width)) for w in widths] if grow_left else None
 
+        # Windows only, no-op elsewhere (see window_corners.py's own
+        # docstring) - DWM otherwise tweens each of these geometry()
+        # calls across its own transition duration on top of whatever
+        # timing/steps this method itself already uses, which is what
+        # actually made even a single, atomic call still look gradual
+        # and choppy there (confirmed live, screen-recorded) - not the
+        # per-frame WM repaint cost this method's own steps= parameter
+        # controls. Scoped to just this glide's own real duration (True
+        # here, False the instant the last step lands below) rather
+        # than left on for the window's whole lifetime - see
+        # set_transitions_suppressed()'s own docstring for why that
+        # matters: native minimize/restore stays animated everywhere
+        # else.
+        window_corners.set_transitions_suppressed(self.root, True)
+
         def step(i):
             w = widths[i]
             if grow_left:
@@ -2401,6 +2408,7 @@ class GUIWizard:
                 self.root.geometry(f"{w}x{height}")
             if i == steps - 1:
                 self.root.minsize(w, height)
+                window_corners.set_transitions_suppressed(self.root, False)
                 if on_complete:
                     on_complete()
             else:
@@ -2440,78 +2448,30 @@ class GUIWizard:
 
         step(0)
 
-    def _animate_users_scrim(self, opening, on_complete=None):
-        # The Users panel's own version of _animate_log_scrim() above -
-        # same reasoning, mirrored for the opposite edge: this panel
-        # sits at content_row's RIGHT edge (see _pack_users_panel()),
-        # not main_area's left, and (unlike the Log panel) never moves
-        # root's x - _toggle_users_panel() only ever calls
-        # _animate_root_width() here with grow_left=False, a pure
-        # resize - so relx=1.0 alone is enough to keep this pinned to
-        # content_row's live right edge with no drift-compensation of
-        # its own to worry about.
-        #
-        # The covered region's RIGHT edge stays pinned to content_row's
-        # own right edge throughout (relx=1.0), while its LEFT edge -
-        # the boundary nearest the shares list - is what moves,
-        # shrinking the covered width from the full panel down to
-        # nothing (opening) or growing it back up (closing). Reads as
-        # the panel wiping into view FROM the shares list outward, or
-        # retreating the same way in reverse - only ever a place()
-        # geometry change, never a root.geometry() call, so it stays
-        # cheap enough to animate on Windows even though the per-frame
-        # glide _toggle_users_panel() otherwise uses (steps=10, a real
-        # resize each frame) was reported live as choppy there.
-        panel_width = self._users_panel_width - _PANEL_GUTTER
-        steps = 10
-        duration_ms = 160
-        step_delay = max(1, duration_ms // steps)
-
-        def step(i):
-            revealed = i / steps if opening else 1 - i / steps
-            covered_width = max(0, round(panel_width * (1 - revealed)))
-            if covered_width <= 0:
-                self._users_scrim.place_forget()
-            else:
-                self._users_scrim.place(relx=1.0, x=-covered_width, y=0, width=covered_width, relheight=1.0)
-                self._users_scrim.lift()
-            if i < steps:
-                self.root.after(step_delay, lambda: step(i + 1))
-            elif on_complete:
-                on_complete()
-
-        step(0)
-
     def _toggle_users_panel(self):
         # The cheap, pack()-based side (see GUIWizard.__init__'s own
-        # comment on why Users, not Log, was moved here) - identical in
-        # shape to what this method looked like before the swap, just
-        # targeting self._user_mgmt_panel/self._users_panel_width/
-        # self._users_panel_open instead of the Log panel's equivalents.
+        # comment on why Users, not Log, was moved here) - one plain
+        # steps=10 _animate_root_width() glide, same on every platform,
+        # no scrim of its own needed (contrast _toggle_log_panel(),
+        # which pays a real, structural WM cost for MOVING root - see
+        # _animate_root_width()'s own comment - that this panel's pure
+        # resize never had to begin with).
         #
-        # _animate_root_width()'s own comment already documents that a
-        # glide's per-frame geometry() call is "real work for the WM",
-        # expensive enough that grow_left (the Log panel) had to stop
-        # doing it at all; a PURE resize (no reposition, what this panel
-        # has always used) was believed cheap enough to keep animating
-        # there, and on Linux/X11 that holds up fine - confirmed live,
-        # smooth, still steps=10 below. Windows' DWM is a different
-        # story: each intermediate geometry() call there is a full
-        # WM_SIZE/WM_PAINT round trip repainting every child widget,
-        # including ones nowhere near the panel edge - reported live as
-        # visibly choppy opening this panel, with the header's own logo
-        # Label specifically flickering/redrawing on every one of those
-        # 10 frames. Rather than trade the glide for a plain instant
-        # jump there (steps=1, no animation at all - reported live in
-        # turn as feeling abrupt), this now does what
-        # _toggle_log_panel() already does for the exact same WM cost
-        # problem on ITS side: pay the WM's per-resize cost exactly
-        # once (steps=1, hidden behind an opaque scrim) and do the
-        # actual visible "opening"/"closing" motion entirely afterward
-        # via _animate_users_scrim() - a pure place() reveal/cover that
-        # never touches root's geometry at all, so it stays smooth on
-        # Windows too.
-        on_windows = platform.system() == "Windows"
+        # This used to branch on platform.system() == "Windows" here,
+        # trading this exact glide for a steps=1 jump hidden behind a
+        # pair of scrims, because 10 real geometry() calls were reported
+        # live as choppy there. That diagnosis turned out to be wrong:
+        # screen-recorded on a real Windows machine, even the steps=1
+        # jump ITSELF still looked gradual and choppy - because DWM
+        # tweens a top-level window's bounds across its own transition
+        # duration on every resize, however many geometry() calls the
+        # app made to get there. The actual fix is
+        # _animate_root_width()'s own window_corners.set_transitions_
+        # suppressed() bracket, which tells DWM to stand down for the
+        # ~160ms this glide is genuinely running - once that's in place,
+        # this plain steps=10 glide is exactly as smooth on Windows as
+        # it's always been on Linux, with no scrim, no jump, and no
+        # platform check needed here at all.
         if self._users_panel_open:
             # See _tour_blocks_closing()'s docstring - lets the dedicated
             # "Close" step's own click-to-close-the-panel through as
@@ -2524,74 +2484,22 @@ class GUIWizard:
             self._users_toggle_btn.set_pressed(False)
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
-                self._users_scrim.place_forget()
-                self._window_scrim.place_forget()
                 self._notify_tour("user_mgmt_closed")
                 # Root just settled at its new (narrower) width - see
                 # window_corners.apply()'s own comment on why <Configure>
                 # alone can't be trusted to leave the bottom corners
                 # correctly shaped once a resize like this one finishes.
                 self._reapply_corners()
-            if on_windows:
-                # Cover the panel FIRST, entirely via place(), while
-                # it's still fully packed and visible - only once it's
-                # fully covered does root actually shrink. _covered()
-                # then ALSO covers the rest of the window (header/logo,
-                # shares list) with self._window_scrim before that
-                # jump - the panel's own scrim never reached those, so
-                # without this the jump's one WM_SIZE/WM_PAINT round
-                # trip still flickered them (reported live) even though
-                # the panel itself was already safely hidden. Both
-                # scrims come off together in _done(), once the jump's
-                # single repaint has already happened behind them.
-                def _covered():
-                    self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
-                    self._window_scrim.lift()
-                    self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=1)
-                self._animate_users_scrim(opening=False, on_complete=_covered)
-            else:
-                self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=10)
+            self._animate_root_width(-self._users_panel_width, on_complete=_done, steps=10)
         else:
             self._users_panel_open = True
             self._users_toggle_btn.set_pressed(True)
-            if on_windows:
-                # Cover the panel's full FINAL area BEFORE it's even
-                # packed - using panel_width, the cached target (known
-                # in advance, no need to wait and measure it after the
-                # jump) - so the panel's real content is never visible
-                # even for one frame before the scrim is there to cover
-                # it. See _animate_users_scrim()'s own comment for why
-                # relx=1.0 alone is enough to keep this pinned to
-                # content_row's live right edge through the jump below.
-                panel_width = self._users_panel_width - _PANEL_GUTTER
-                self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
-                self._users_scrim.lift()
-                # Also cover the REST of the window (header/logo, shares
-                # list) before the jump - see the closing branch's
-                # identical _covered() comment for why the panel's own
-                # scrim isn't enough on its own. Comes off again the
-                # instant the jump lands, in _jumped() below - by then
-                # the panel-only scrim is already covering exactly what
-                # still needs to stay hidden for the reveal glide that
-                # follows, so nothing is ever visible uncovered for even
-                # one frame.
-                self._window_scrim.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
-                self._window_scrim.lift()
-                self._pack_users_panel()
-                self._user_mgmt_panel.refresh()
-                def _jumped():
-                    self._window_scrim.place_forget()
-                    self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
-                    self._reapply_corners()
-                    self._animate_users_scrim(opening=True)
-                self._animate_root_width(self._users_panel_width, on_complete=_jumped, steps=1)
-            else:
-                self._pack_users_panel()
-                self._user_mgmt_panel.refresh()
-                def _done():
-                    self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
-                    self._reapply_corners()
-                self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
+            self._pack_users_panel()
+            self._user_mgmt_panel.refresh()
+            def _done():
+                self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
+                self._reapply_corners()
+            self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
 
     def _toggle_log_panel(self):
         # The place()-based, jump+scrim side (see GUIWizard.__init__'s
