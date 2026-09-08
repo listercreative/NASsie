@@ -2698,8 +2698,30 @@ class GUIWizard:
         # clean re-place(), once the glide is fully done.
         header_icon = self._header_icon_label
         if is_windows and header_icon is not None:
-            frozen_x = header_icon.winfo_x()
-            header_icon.place(x=frozen_x, y=0, anchor="n")
+            # Was a freeze (place() pinned to a captured pixel x, with an
+            # explicit relx=0 - an earlier version of this left relx=0.5
+            # active by accident, which is its own real bug: Tk resolves
+            # leftover place() options additively as x + relx*width, so
+            # that "frozen" icon actually kept drifting by half of every
+            # step's width delta). Fixing THAT (confirmed via a packaged-
+            # build screenshot burst) killed the sustained multi-hundred-
+            # ms drift, but left a real, clearly-visible single-frame
+            # duplicate at whichever end of the glide the freeze/restore
+            # repaint happened to land on - reported live as still
+            # looking broken, and it does: DWM composites at its own
+            # vsync-driven cadence, independent of when Tk's place() call
+            # actually finishes repainting, so there's an inherent gap
+            # between "old position's pixels are still in the backing
+            # surface" and "new position has been drawn" that a
+            # REPOSITION can always get caught inside, no matter how
+            # correct the position math is - confirmed by a follow-up
+            # forced-update_idletasks() experiment that just moved the
+            # gap from one end of the glide to the other instead of
+            # closing it. Unmapping the icon entirely for the glide's
+            # duration removes the gap instead of trying to time around
+            # it: nothing drawn means nothing for DWM to catch
+            # mid-repaint.
+            header_icon.place_forget()
 
         # Same freeze, different mechanism: the Users toggle button
         # (self._users_toggle_btn.frame, the 👤 toolbar icon) is pack()'d
@@ -2815,19 +2837,15 @@ class GUIWizard:
                     f"_animate_root_width done, set_transitions_suppressed(False) -> {restored_ok}, "
                     f"final winfo_width={self.root.winfo_width()}"
                 )
-                # Back to live relx=0.5 tracking, now that the glide's
-                # done and there's only ever going to be ONE more
-                # re-center to actually draw - see the freeze's own
-                # comment above for why it was frozen at all. x=0
-                # explicitly, not omitted - place() only ever CHANGES
-                # the options actually passed to it, it doesn't reset
-                # ones left out back to their own defaults, so leaving
-                # x out here would keep the freeze's own explicit pixel
-                # offset stacked on top of relx forever (confirmed live:
-                # place_info() showing x and relx BOTH still set after
-                # this ran without x=0 - Tk resolves that as relx*width
-                # + x, permanently shifting the logo off its true center
-                # by whatever the last freeze's x happened to be).
+                # Re-maps the icon (place_forget()'d at the top of this
+                # method - see that call's own comment for why it's
+                # unmapped for the WHOLE glide rather than repositioned
+                # each step or at the edges) fresh, in its normal
+                # relx=0.5 tracking, now that the glide's done and
+                # there's only ever going to be this ONE paint. Nothing
+                # was drawn at any other position in the meantime, so
+                # there's no stale pixels for DWM to catch mid-repaint
+                # the way a live reposition could.
                 if is_windows and header_icon is not None:
                     header_icon.place(x=0, relx=0.5, y=0, anchor="n")
                 # Back to live pack(side="right") tracking - matches
@@ -2912,13 +2930,20 @@ class GUIWizard:
         #    (a real OS-composited slide, no per-frame app redraw cost),
         #    but root itself never actually resized any more - a
         #    fundamentally different mechanism from Linux/macOS, not
-        #    just a different-looking version of the same one. Rejected
-        #    live, explicitly, for that reason: "we aren't expanding the
+        #    just a different-looking version of the same one. Tried
+        #    TWICE (git history: commit ed2e0b6, and again after the
+        #    header-icon relx bug fix still left a measured ceiling on
+        #    this method's own approach) - rejected live BOTH times,
+        #    explicitly, for the same reason: "we aren't expanding the
         #    window like in Linux, but popping out a separate window. It
-        #    fundamentally works differently" - the window has to be the
-        #    SAME single window, actually growing, on every platform,
-        #    even if that costs more on Windows than either alternative
-        #    did.
+        #    fundamentally works differently" / "even implemented
+        #    perfectly, a second real window is the wrong idea." That's
+        #    a hard constraint on this app, not a polish target - the
+        #    window has to be the SAME single window, actually growing,
+        #    on every platform, even if that costs more on Windows than
+        #    either alternative did. See window_corners.py's own
+        #    docstring for the full AnimateWindow history - don't
+        #    re-attempt this a third time expecting a different verdict.
         #
         # window_corners.set_transitions_suppressed() (see its own
         # docstring) still brackets the geometry loop below regardless
