@@ -28,9 +28,17 @@ cp -r "$SRC/nassie_ttk" "$PKGLIB/"
 # copies it straight into the package if present.
 find "$PKGLIB/nassie_ttk" -name "__pycache__" -exec rm -rf {} +
 
+# icons/ - baked PNG icon assets (see gui.py's _load_icon()). Only the
+# *.png output ships - render_icons.py is the dev-only authoring script
+# that generates them, not something the running app ever imports.
+rm -rf "$PKGLIB/icons"
+mkdir -p "$PKGLIB/icons"
+cp "$SRC"/icons/*.png "$PKGLIB/icons/"
+
 find "$PKG" -type d -exec chmod 755 {} \;
 chmod 644 "$PKGLIB"/*.py "$PKGLIB/nassie_icon.png"
 find "$PKGLIB/nassie_ttk" -type f -exec chmod 644 {} \;
+find "$PKGLIB/icons" -type f -exec chmod 644 {} \;
 chmod 755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/usr/bin/nassie"
 chmod 644 "$PKG/DEBIAN/control" \
           "$PKG/usr/share/applications/nassie.desktop" \

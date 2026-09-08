@@ -456,12 +456,45 @@ def _deselect_on_blank_click(tree, event):
         tree.selection_remove(*tree.selection())
 
 
-def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs):
-    # A plain "+" (or any single glyph) at the default button font size
-    # reads as thin/washed-out next to full-color emoji icons - a larger
-    # size (see the "Icon.TButton" style) gives it comparable visual
-    # weight without needing to fall back to a colored-pill emoji glyph
-    # just for "add".
+def _asset_base_dir():
+    # Ships right next to this file both in the source tree and in the
+    # installed package (see build.sh/build.ps1). A frozen PyInstaller
+    # --onefile build extracts its data files into a temp dir at
+    # sys._MEIPASS instead - __file__ isn't a real path there, so that
+    # has to be checked first.
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_ICON_CACHE = {}
+
+
+def _load_icon(name, size=24):
+    # Icons used to be emoji characters (text=) rendered by whichever
+    # font the OS picked - Segoe UI Emoji on Windows, Noto Color Emoji on
+    # Linux - which differ in both size AND color (color-emoji glyphs
+    # ignore fg=/foreground entirely, so there was never a way to tune
+    # that from app code). Reported live as the two platforms visibly not
+    # matching. These are pre-baked PNGs instead (see icons/render_icons.py
+    # for how - not shipped, a one-time authoring step), one fixed image
+    # loaded identically everywhere, no OS font involved at all. Source
+    # PNGs are 96px (see render_icons.py's OUT_SIZE) so subsample() below
+    # stays an integer factor - same pattern _build_header() already uses
+    # for the window icon.
+    key = (name, size)
+    cached = _ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = os.path.join(_asset_base_dir(), "icons", f"{name}.png")
+    img = tk.PhotoImage(file=path)
+    scale = max(1, img.width() // size)
+    icon = img.subsample(scale, scale)
+    _ICON_CACHE[key] = icon
+    return icon
+
+
+def _icon_button(parent, icon, tooltip, command, size=24, shadow=False, **kwargs):
     if shadow:
         # nassie_ttk's flat theme draws buttons with no border/relief at
         # all (its own flat, modern look), which reads fine for a busy
@@ -478,7 +511,7 @@ def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs
         # what the current ttk theme does with real button styling.
         card = tk.Frame(parent, background="#adadad")
         btn = ttk.Button(
-            card, text=icon, command=command, width=width, style="Icon.TButton", **kwargs
+            card, image=_load_icon(icon, size), command=command, style="Icon.TButton", **kwargs
         )
         btn.pack(padx=(0, 2), pady=(0, 2))
         _Tooltip(btn, tooltip)
@@ -488,7 +521,7 @@ def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs
         # own comment) reaches it instead.
         card.button = btn
         return card
-    btn = ttk.Button(parent, text=icon, command=command, width=width, style="Icon.TButton", **kwargs)
+    btn = ttk.Button(parent, image=_load_icon(icon, size), command=command, style="Icon.TButton", **kwargs)
     _Tooltip(btn, tooltip)
     return btn
 
@@ -828,7 +861,7 @@ class _AddRowFeedback:
         # that first placement lands.
         tree.tag_configure("add_row", background=_ADD_ROW_BG)
         self.icon = tk.Label(
-            tree, text="➕", bg=_ADD_ROW_BG, fg="#0e92ab", font=("TkDefaultFont", 11), cursor="hand2",
+            tree, image=_load_icon("icon_add"), bg=_ADD_ROW_BG, cursor="hand2",
         )
         self.icon.bind("<Enter>", self._on_enter, add="+")
         self.icon.bind("<Leave>", self._on_leave, add="+")
@@ -927,13 +960,12 @@ class _ToggleButton:
     def __init__(self, parent, icon, tooltip, command, idle_bg):
         self.idle_bg = idle_bg
         self.pressed = False
-        # Fixed pixel size, not just font+padding - different emoji
-        # glyphs (👤 vs 📜) render at different natural sizes even at the
-        # same font/padding, which left the two toggle buttons visibly
-        # different heights (reported live). pack_propagate(False) keeps
-        # this frame at exactly _SIZE regardless of what its child needs,
-        # and the Label fills it completely, so both buttons end up
-        # pixel-identical no matter which glyph is inside.
+        # Fixed pixel size, not just image+padding - pack_propagate(False)
+        # keeps this frame at exactly _SIZE regardless of what its child
+        # needs, and the Label fills it completely, so both buttons end
+        # up pixel-identical (both icons are baked to the same size
+        # already - see _load_icon() - but the border/relief below still
+        # needs a size the content itself doesn't drive).
         # borderwidth+relief give this an actual raised/sunken 3D edge,
         # not just a flat color swap - a color shade alone doesn't read
         # as "pressed" (reported live: "just looks like it's shaded a
@@ -948,7 +980,7 @@ class _ToggleButton:
         )
         self.frame.pack_propagate(False)
         self.label = tk.Label(
-            self.frame, text=icon, font=("TkDefaultFont", 12), bg=idle_bg, fg="#333333", cursor="hand2",
+            self.frame, image=_load_icon(icon), bg=idle_bg, fg="#333333", cursor="hand2",
         )
         self.label.pack(fill="both", expand=True)
         for widget in (self.frame, self.label):
@@ -1030,9 +1062,9 @@ class AddUserDialog(tk.Toplevel):
         # Kept as an attribute (unlike every other dialog's Cancel
         # button) so the tour's own "New User" step (see tour.py) can
         # point a highlight box directly at it once this dialog opens.
-        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self._on_cancel, shadow=True)
+        self.cancel_button = _icon_button(btn_frame, "icon_cancel", "Cancel", self._on_cancel, shadow=True)
         self.cancel_button.pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_ok", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
 
         self.username_entry.focus_set()
         _center_over_parent(self, parent)
@@ -1130,8 +1162,8 @@ class ChoiceDialog(tk.Toplevel):
         # AddUserDialog's identical btn_frame for the same convention.
         btn_frame = ttk.Frame(body)
         btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
-        _icon_button(btn_frame, "✖", "Cancel", self.destroy, shadow=True).pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", ok_label, self._on_ok, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_cancel", "Cancel", self.destroy, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_ok", ok_label, self._on_ok, shadow=True).pack(side="left", padx=4)
 
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
@@ -1193,9 +1225,9 @@ class PasswordPromptDialog(tk.Toplevel):
         # (see tour.py) needs a real widget handle to point at, the last
         # control at the BOTTOM of this stacked prompt/entry/buttons
         # layout.
-        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self.destroy, shadow=True)
+        self.cancel_button = _icon_button(btn_frame, "icon_cancel", "Cancel", self.destroy, shadow=True)
         self.cancel_button.pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_ok", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
 
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
@@ -1325,8 +1357,8 @@ class CreateShareDialog(tk.Toplevel):
         # with Cancel just to its left.
         action_frame = ttk.Frame(self.name_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "✔", "OK", self._confirm_name, shadow=True).pack(side="right")
-        _icon_button(action_frame, "✖", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
+        _icon_button(action_frame, "icon_ok", "OK", self._confirm_name, shadow=True).pack(side="right")
+        _icon_button(action_frame, "icon_cancel", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
 
     def _build_path_page(self):
         self.path_page = ttk.Frame(self)
@@ -1344,7 +1376,7 @@ class CreateShareDialog(tk.Toplevel):
         # doesn't exist yet, same as it always has.
         self.path_entry = ttk.Entry(form, width=32, state="readonly", cursor="arrow")
         self.path_entry.grid(row=0, column=1, sticky="w", pady=4)
-        _icon_button(form, "📂", "Browse", self._browse_path).grid(row=0, column=2, padx=4)
+        _icon_button(form, "icon_browse", "Browse", self._browse_path).grid(row=0, column=2, padx=4)
 
         # Back stays isolated on the left (a navigation action, not part
         # of the confirm/cancel decision) - Cancel and Create Share
@@ -1352,15 +1384,15 @@ class CreateShareDialog(tk.Toplevel):
         # right, same reasoning and pack order as _build_name_page's.
         action_frame = ttk.Frame(self.path_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "◀", "Back", self._show_name_page, shadow=True).pack(side="left")
+        _icon_button(action_frame, "icon_back", "Back", self._show_name_page, shadow=True).pack(side="left")
         # shadow=True returns the shadow-casting Frame, not the ttk.Button
         # itself - .button reaches the real one, needed here since
         # _apply_done()/its own start disable this via .configure(state=
         # ...) after the fact (every OTHER shadowed button in this dialog
         # is fire-and-forget, never touched again post-creation).
-        self.create_button = _icon_button(action_frame, "✔", "OK", self._on_create_share, shadow=True)
+        self.create_button = _icon_button(action_frame, "icon_ok", "OK", self._on_create_share, shadow=True)
         self.create_button.pack(side="right")
-        _icon_button(action_frame, "✖", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
+        _icon_button(action_frame, "icon_cancel", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
 
     def _show_name_page(self):
         self.path_page.pack_forget()
@@ -1677,10 +1709,10 @@ class UserManagementPanel:
         # selection - nothing here applies to it.
         if item == self._add_user_row_id:
             return False
-        _icon_button(container, "🔑", "Change Password", self._change_password).pack(
+        _icon_button(container, "icon_key", "Change Password", self._change_password).pack(
             side="left", fill="y", padx=1
         )
-        _icon_button(container, "🗑", "Delete User", self._delete_user).pack(side="left", fill="y", padx=1)
+        _icon_button(container, "icon_delete", "Delete User", self._delete_user).pack(side="left", fill="y", padx=1)
         return True
 
     def refresh(self):
@@ -2042,7 +2074,9 @@ class GUIWizard:
         # (see _measure_action_bar_width) is the only way to get this
         # right regardless of that.
         self.root.update_idletasks()
-        share_bar_w = self._measure_action_bar_width(("📖", "📷", "➖", "+👤", "🔗", "🗑"))
+        share_bar_w = self._measure_action_bar_width(
+            ("icon_readonly", "icon_qr", "icon_detach", "icon_new_user", "icon_attach", "icon_delete")
+        )
         name_col_w = self.shares_list.column("#0", "width")
         # name column + vertical scrollbar (~20px) + a floor for the Path
         # column so it isn't squeezed to nothing + the action bar itself +
@@ -2098,7 +2132,7 @@ class GUIWizard:
         # block's comment for why a measurement beats a guessed constant.
         probe = ttk.Frame(self.root)
         for icon in icons:
-            ttk.Button(probe, text=icon, width=3, style="Icon.TButton").pack(side="left", fill="y", padx=1)
+            ttk.Button(probe, image=_load_icon(icon), style="Icon.TButton").pack(side="left", fill="y", padx=1)
         probe.update_idletasks()
         width = probe.winfo_reqwidth()
         probe.destroy()
@@ -2329,13 +2363,13 @@ class GUIWizard:
         toolbar = ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=8, pady=(8, 0))
         self._users_toggle_btn = _ToggleButton(
-            toolbar, "👤", "Manage Users", self._toggle_users_panel, toolbar_bg,
+            toolbar, "icon_users", "Manage Users", self._toggle_users_panel, toolbar_bg,
         )
         self._users_toggle_btn.pack(side="right")
         self._log_toggle_btn = _ToggleButton(
-            # 📋 (clipboard) reads as "notes/tasks", not "log" - 📜
-            # (scroll) is the more common "history/log" convention.
-            toolbar, "📜", "View Log", self._toggle_log_panel, toolbar_bg,
+            # A scroll icon ("history/log"), not a clipboard ("notes/
+            # tasks") - see icons/render_icons.py for the source glyph.
+            toolbar, "icon_log", "View Log", self._toggle_log_panel, toolbar_bg,
         )
         # Not packed - the Log panel is the one that has to sit on the
         # left (see _toggle_log_panel()'s own docstring for why that
@@ -2622,6 +2656,27 @@ class GUIWizard:
         suppressed_ok = window_corners.set_transitions_suppressed(self.root, True)
         anim_debug.log(f"set_transitions_suppressed(True) -> {suppressed_ok}")
 
+        # Every freeze below (header logo, toggle button, Path column
+        # stretch, tour tracking) exists ONLY to work around Windows-
+        # specific repaint costs - each one's own comment cites a live,
+        # screen-recorded Windows symptom (ghosted icon, blank icon,
+        # full-window repaint, a synchronous flush per step) as its
+        # reason for existing. They were made unconditional across every
+        # platform for a while for code-path simplicity, but that
+        # silently cost Linux/macOS their own PREVIOUSLY-live tracking
+        # of these same elements during the glide - reported live as
+        # "the icon doesn't transform correctly" (the toggle button
+        # frozen in place, then teleporting to its final spot in one
+        # frame instead of sliding with the edge like it used to) and
+        # "the border created by the tour isn't drawn correctly as the
+        # window changes size" (the highlight/callout frozen mid-glide,
+        # then snapping once at the end). Gating each freeze to Windows
+        # only restores that original live tracking everywhere else,
+        # without touching the one thing that has to stay identical on
+        # every platform: root's own real, multi-step geometry() glide
+        # below is completely unaffected by this flag either way.
+        is_windows = platform.system() == "Windows"
+
         # Freezes the header's logo at its CURRENT pixel position for
         # the duration of this glide, instead of leaving it on its
         # normal place(relx=0.5) tracking (see _build_header()'s own
@@ -2642,7 +2697,7 @@ class GUIWizard:
         # redraw) until put back on relx=0.5 tracking, in one single,
         # clean re-place(), once the glide is fully done.
         header_icon = self._header_icon_label
-        if header_icon is not None:
+        if is_windows and header_icon is not None:
             frozen_x = header_icon.winfo_x()
             header_icon.place(x=frozen_x, y=0, anchor="n")
 
@@ -2668,12 +2723,13 @@ class GUIWizard:
         toggle_btn_frame = getattr(self, "_users_toggle_btn", None)
         if toggle_btn_frame is not None:
             toggle_btn_frame = toggle_btn_frame.frame
-            frozen_btn_x = toggle_btn_frame.winfo_x()
-            frozen_btn_y = toggle_btn_frame.winfo_y()
-            toggle_btn_frame.place(
-                x=frozen_btn_x, y=frozen_btn_y,
-                width=toggle_btn_frame.winfo_width(), height=toggle_btn_frame.winfo_height(),
-            )
+            if is_windows:
+                frozen_btn_x = toggle_btn_frame.winfo_x()
+                frozen_btn_y = toggle_btn_frame.winfo_y()
+                toggle_btn_frame.place(
+                    x=frozen_btn_x, y=frozen_btn_y,
+                    width=toggle_btn_frame.winfo_width(), height=toggle_btn_frame.winfo_height(),
+                )
 
         # Same freeze, much bigger payoff: the shares list's "Path"
         # column is stretch=True (see _build_shares_page()), meaning
@@ -2697,7 +2753,7 @@ class GUIWizard:
         # width itself from the settled width, no manual math needed
         # here for what that width should be.
         try:
-            path_stretch_was = self.shares_list.column("path", "stretch")
+            path_stretch_was = self.shares_list.column("path", "stretch") if is_windows else None
         except tk.TclError:
             path_stretch_was = None
         if path_stretch_was:
@@ -2715,7 +2771,7 @@ class GUIWizard:
         # started, or may already be finished (see _notify_tour()'s own
         # identical guard) - either way, nothing to pause.
         tour = getattr(self, "_tour", None)
-        if tour is not None:
+        if is_windows and tour is not None:
             tour.pause_tracking()
 
         def step(i):
@@ -2772,7 +2828,7 @@ class GUIWizard:
                 # this ran without x=0 - Tk resolves that as relx*width
                 # + x, permanently shifting the logo off its true center
                 # by whatever the last freeze's x happened to be).
-                if header_icon is not None:
+                if is_windows and header_icon is not None:
                     header_icon.place(x=0, relx=0.5, y=0, anchor="n")
                 # Back to live pack(side="right") tracking - matches
                 # GUIWizard._build_shares_page()'s own original call
@@ -2792,7 +2848,7 @@ class GUIWizard:
                 # paused above) and repositions its highlight/callout
                 # exactly once, against the now-settled final geometry -
                 # see pause_tracking()'s own docstring.
-                if tour is not None:
+                if is_windows and tour is not None:
                     tour.resume_tracking()
                 if on_complete:
                     on_complete()
@@ -2883,6 +2939,18 @@ class GUIWizard:
         if self._users_panel_animating:
             anim_debug.log("_toggle_users_panel ignored - already animating")
             return
+        # The panel-content scrim below (see self._users_scrim's own
+        # comment in __init__) exists to hide the SAME Windows-only
+        # repaint cost as _animate_root_width()'s own is_windows-gated
+        # freezes: the panel's real content repositioning live, once
+        # per step, as content_row grows/shrinks under it. Scoping it
+        # to Windows too (it had drifted unconditional, like those
+        # freezes) restores Linux/macOS's original look of the panel's
+        # own content actually sliding into/out of view over the
+        # glide, instead of popping in/out all at once - reported live
+        # as "the user management column just kind of appears instead
+        # of being drawn correctly".
+        use_panel_scrim = platform.system() == "Windows"
         if self._users_panel_open:
             # See _tour_blocks_closing()'s docstring - lets the dedicated
             # "Close" step's own click-to-close-the-panel through as
@@ -2901,18 +2969,20 @@ class GUIWizard:
             # content_row's shrinking width) rather than trying to make
             # each of those 10 steps individually clean.
             panel_width = self._users_panel_width - _PANEL_GUTTER
-            self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
-            self._users_scrim.lift()
+            if use_panel_scrim:
+                self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
+                self._users_scrim.lift()
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
-                # update_idletasks() BEFORE removing the scrim, not
-                # after - see the opening branch's identical call for
-                # why: forces everything underneath to actually finish
-                # settling at the new (narrower) width WHILE still
-                # hidden, so there's nothing left to redraw once the
-                # scrim comes off.
-                self.root.update_idletasks()
-                self._users_scrim.place_forget()
+                if use_panel_scrim:
+                    # update_idletasks() BEFORE removing the scrim, not
+                    # after - see the opening branch's identical call for
+                    # why: forces everything underneath to actually finish
+                    # settling at the new (narrower) width WHILE still
+                    # hidden, so there's nothing left to redraw once the
+                    # scrim comes off.
+                    self.root.update_idletasks()
+                    self._users_scrim.place_forget()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_closed")
                 # Root just settled at its new (narrower) width - see
@@ -2934,20 +3004,22 @@ class GUIWizard:
             # content_row's live right edge throughout, the same way
             # the panel itself will be once it's actually packed.
             panel_width = self._users_panel_width - _PANEL_GUTTER
-            self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
-            self._users_scrim.lift()
+            if use_panel_scrim:
+                self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
+                self._users_scrim.lift()
             self._pack_users_panel()
             def _done():
-                # update_idletasks() BEFORE removing the scrim, not
-                # after - see _animate_root_width()'s own header-icon
-                # freeze comment for the general shape of why: forces
-                # the now-packed panel (and everything else content_row
-                # resized around it) to actually finish settling at its
-                # final position WHILE still hidden, so there's nothing
-                # left to redraw - no ghosted scrollbar, no flash at its
-                # own edge - once the scrim comes off.
-                self.root.update_idletasks()
-                self._users_scrim.place_forget()
+                if use_panel_scrim:
+                    # update_idletasks() BEFORE removing the scrim, not
+                    # after - see _animate_root_width()'s own header-icon
+                    # freeze comment for the general shape of why: forces
+                    # the now-packed panel (and everything else content_row
+                    # resized around it) to actually finish settling at its
+                    # final position WHILE still hidden, so there's nothing
+                    # left to redraw - no ghosted scrollbar, no flash at its
+                    # own edge - once the scrim comes off.
+                    self.root.update_idletasks()
+                    self._users_scrim.place_forget()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
                 self._reapply_corners()
@@ -3080,8 +3152,8 @@ class GUIWizard:
             share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
             share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
             read_only = bool(share_user and share_user.get("read_only"))
-            icon, tip = ("📖", "Read-only - click to make read-write") if read_only else (
-                "📝", "Read-write - click to make read-only"
+            icon, tip = ("icon_readonly", "Read-only - click to make read-write") if read_only else (
+                "icon_readwrite", "Read-write - click to make read-only"
             )
             _icon_button(
                 container, icon, tip, self._change_access_level_for_selection
@@ -3091,20 +3163,20 @@ class GUIWizard:
             # barcode anywhere in it) - a camera stands in for the actual
             # action (point your phone's camera at it) instead of trying
             # to depict the code itself.
-            _icon_button(container, "📷", "Show QR Code", self._show_qr_for_selection).pack(
+            _icon_button(container, "icon_qr", "Show QR Code", self._show_qr_for_selection).pack(
                 side="left", fill="y", padx=1
             )
             _icon_button(
-                container, "➖", "Detach User", self._unattach_selected_user
+                container, "icon_detach", "Detach User", self._unattach_selected_user
             ).pack(side="left", fill="y", padx=1)
         else:
-            _icon_button(container, "+👤", "New User", self._new_user_for_selected_share).pack(
+            _icon_button(container, "icon_new_user", "New User", self._new_user_for_selected_share).pack(
                 side="left", fill="y", padx=1
             )
             _icon_button(
-                container, "🔗", "Attach User", self._attach_user_to_selected_share
+                container, "icon_attach", "Attach User", self._attach_user_to_selected_share
             ).pack(side="left", fill="y", padx=1)
-            _icon_button(container, "🗑", "Delete Share", self._delete_selected_share).pack(
+            _icon_button(container, "icon_delete", "Delete Share", self._delete_selected_share).pack(
                 side="left", fill="y", padx=1
             )
         return True
@@ -3123,7 +3195,7 @@ class GUIWizard:
             "<<ComboboxSelected>>",
             lambda e: self._commit_inline_attach(label_to_username.get(var.get(), var.get())),
         )
-        _icon_button(container, "✖", "Cancel", self._cancel_inline_attach).pack(side="left", fill="y", padx=1)
+        _icon_button(container, "icon_cancel", "Cancel", self._cancel_inline_attach).pack(side="left", fill="y", padx=1)
         # Opens the dropdown right away - the whole point of "contextual
         # dropdown" is picking a user in one motion, not a second click
         # just to open what clicking the attach icon conceptually already

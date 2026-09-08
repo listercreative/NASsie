@@ -23,6 +23,20 @@ namespace eval ttk::theme::sv_light {
 
   load_images [file join [file dirname [info script]] spritesheet_light.png]
 
+  # Treeitem.indicator (below) is an IMAGE element, not text - Treeview's
+  # own -foreground selected-state map (further down) only recolors real
+  # text, so a selected row's expand/collapse arrow stayed the sheet's
+  # baked-in gray instead of turning white with the rest of the row
+  # (reported live). These are the same right/down arrow shapes, pixel-
+  # for-pixel (same alpha per pixel, just RGB forced to colors(-selfg)),
+  # pre-recolored offline rather than at runtime since Tk photo images
+  # have no built-in recolor operation.
+  variable I
+  set I(right-selected) [image create photo \
+    -file [file join [file dirname [info script]] indicator_right_selected.png] -format png]
+  set I(down-selected) [image create photo \
+    -file [file join [file dirname [info script]] indicator_down_selected.png] -format png]
+
   ttk::style theme create sun-valley-light -parent clam -settings {
         
     # Button
@@ -464,6 +478,9 @@ namespace eval ttk::theme::sv_light {
     
     ttk::style element create Treeitem.indicator image \
       [list $I(right) \
+        {selected user1} $I(down-selected) \
+        {selected user2} $I(empty) \
+        selected $I(right-selected) \
         user2 $I(empty) \
         user1 $I(down) \
       ] -width 26 -sticky {}
