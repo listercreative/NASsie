@@ -24,18 +24,23 @@ import sys
 
 from PySide6.QtCore import (
     Qt, QSize, QRect, QPropertyAnimation, QEasingCurve, QThread, Signal, QTimer, QObject, QEvent,
-    QRegularExpression,
+    QRegularExpression, QModelIndex, QPoint,
 )
-from PySide6.QtGui import QIcon, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator
+from PySide6.QtGui import (
+    QIcon, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator, QPainter, QPolygon,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QToolButton, QPushButton, QFrame, QTreeWidget, QTreeWidgetItem,
     QLineEdit, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
     QPlainTextEdit, QFileDialog, QStackedWidget, QSizePolicy,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core import SMBWizard, QR_PASSWORD_RESET_NOTE, pick_directory_native, SHARE_NAME_MAX_LEN, SHARE_NAME_RE
+from tour import tour_state, mark_tour_completed, tour_progress_index
+from tour_qt import GuiTourQt
 
 # ---------------------------------------------------------------------------
 # Constants - queried/measured live from this machine's real Tk app rather
@@ -78,6 +83,14 @@ _COLORS = {
     "toggle_pressed_bg": "#37474f",
     "border": "#d0d0d0",
 }
+# The single hover color the whole shares tree uses - _AddRowOverlay's
+# own idle/hover pairing (below) was confirmed live as the one people
+# are actually happy with, so real row hover (_RowHoverDelegate,
+# _SharesTree.drawBranches()) reuses this exact value instead of a
+# second, similar-but-different one of its own. One constant instead of
+# a plain string literal repeated three times so all four places can
+# never quietly drift apart from each other again.
+_ROW_HOVER_BG = "#d7eef2"
 # gui.py's own explicit override (ttk.Style(...).configure("Treeview",
 # rowheight=36)) - takes priority over light.tcl's own font-metric-
 # derived default, so 36 is the real, final value to match.
@@ -92,6 +105,8 @@ def _build_stylesheet() -> str:
             background: #ffffff;
             border: 1px solid {c['border']};
             outline: none;
+            selection-background-color: {c['tree_selbg']};
+            selection-color: {c['tree_selfg']};
         }}
         QTreeWidget::item {{ height: {_TREE_ROW_HEIGHT}px; outline: none; }}
         QTreeWidget::item:selected {{ background: {c['tree_selbg']}; color: {c['tree_selfg']}; outline: none; border: none; }}
@@ -205,7 +220,7 @@ class _AddRowOverlay(QLabel):
     - a bare tree row gives no cursor change or visible click response
     of its own, and there is no way to tell it's a button otherwise.
     """
-    _HOVER_BG = "#d7eef2"
+    _HOVER_BG = _ROW_HOVER_BG
     _PRESSED_BG = "#c2e6ec"
 
     def __init__(self, tree: "QTreeWidget", item: "QTreeWidgetItem", on_click):
@@ -373,12 +388,181 @@ class _RowActionBar(QWidget):
         if rect.isEmpty():
             self.hide()
             return
+        # sizeHint() right after addWidget() can otherwise still see a
+        # stale (even zero-width) layout: a freshly constructed widget
+        # type this bar hasn't shown before (the inline-attach QComboBox
+        # - every OTHER row-action widget is a plain QPushButton, reused
+        # across rows) needs a pending style/polish event processed
+        # before its size actually factors into the layout's own
+        # sizeHint - self._layout.activate() alone does NOT force that;
+        # only pumping the event queue does. Confirmed live via a debug
+        # dump: self._layout.sizeHint() measured (0, 0) even though the
+        # combo box's and Cancel button's OWN sizeHint()s were already
+        # correct (154x26 and 29x29) - the individual widgets were fine,
+        # only the layout's aggregate hadn't caught up yet. Without this,
+        # the bar was placed at the viewport's far edge with zero width:
+        # invisible, not just misplaced - the inline "pick a user"
+        # dropdown never showed at all.
+        QApplication.processEvents()
         bar_w = self.sizeHint().width()
         viewport_w = self.tree.viewport().width()
         x = max(0, viewport_w - bar_w)
         self.setGeometry(x, rect.top(), bar_w, rect.height())
         self.show()
         self.raise_()
+
+
+class _RowHoverDelegate(QStyledItemDelegate):
+    """Paints a hovered, non-selected cell with _ROW_HOVER_BG instead
+    of QTreeWidget's own "::item:hover" stylesheet rule (see
+    _SharesTree.drawBranches()'s own docstring for why a plain QSS rule
+    doesn't reach the branch/indent strip at all). Works by temporarily
+    swapping the item's own background brush for the hover color and
+    letting the normal paint path draw with that (not by hand-drawing
+    text/icons), so every other rendering detail - font, icon, a
+    spanned user row's full-row width, RTL, ... - stays exactly what
+    QStyledItemDelegate already gets right on its own.
+    """
+
+    def paint(self, painter, option, index):
+        tree = self.parent()
+        item = tree.itemFromIndex(index) if tree is not None else None
+        if (
+            item is not None
+            and not (option.state & QStyle.StateFlag.State_Selected)
+            and index.siblingAtColumn(0) == tree._hover_index
+        ):
+            col = index.column()
+            original = item.background(col)
+            item.setBackground(col, QColor(_ROW_HOVER_BG))
+            opt = QStyleOptionViewItem(option)
+            # Clearing the native hover flag is load-bearing - left
+            # set, the style's own default paint layers ITS OWN hover
+            # treatment on top, which empirically won over the
+            # background we just set (confirmed live: the flat,
+            # mismatched gray came right back).
+            opt.state &= ~QStyle.StateFlag.State_MouseOver
+            super().paint(painter, opt, index)
+            item.setBackground(col, original)
+            return
+        super().paint(painter, option, index)
+
+
+class _SharesTree(QTreeWidget):
+    """Plain QTreeWidget, except for drawBranches() below - exists only
+    to fix one thing: the branch/indent strip QTreeView reserves to the
+    LEFT of every row (where the expand arrow sits, and where deeper
+    levels get pushed further right) is painted entirely separately
+    from the item delegate - confirmed live: neither a user row's own
+    background brush (set per-item in _restripe_tree()) nor
+    setFirstColumnSpanned(True) (needed anyway, to keep a long label
+    from being truncated at column 0's width) ever gets asked to paint
+    that strip, so a striped or selected user row's color always
+    stopped dead at its right edge instead of reaching the row's true
+    physical left edge - regardless of expand/collapse state, since
+    that was never the actual cause. Zeroing the tree's indentation
+    "fixed" that by removing the strip altogether, but took the
+    expand/collapse arrow and the users-are-nested-under-their-share
+    visual cue down with it - neither of which anyone asked to lose.
+    Painting the strip here, matching whatever color the row would
+    show anyway, keeps both: real indentation and the arrow are still
+    there (super().drawBranches() still draws them, right after this),
+    just no longer sitting on an unpainted gap.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Qt doesn't expose "which row is currently hovered" anywhere
+        # drawBranches() can just ask for it - tracked by hand here, the
+        # same way the item delegate's own native hover painting must
+        # do it internally. Mouse tracking (off by default) is what
+        # makes mouseMoveEvent fire on plain movement instead of only
+        # while a button is held.
+        self.setMouseTracking(True)
+        self._hover_index = QModelIndex()
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        # Normalized to column 0 - indexAt() returns whichever column
+        # the cursor's x happens to land in (usually "Path", column 1,
+        # since it's the wider one), but drawBranches() below only ever
+        # gets asked about column 0's index for a row. Comparing the
+        # two directly (QModelIndex equality includes column) meant
+        # they silently never matched over most of a row's width -
+        # confirmed live: the branch/indent strip's hover fill only
+        # ever showed while the cursor was directly over column 0's own
+        # (narrow) text, reverting to the row's plain stripe tint
+        # everywhere else, even though the content area's own native
+        # hover highlight was working correctly the whole time.
+        index = self.indexAt(event.position().toPoint())
+        if index.isValid():
+            index = index.siblingAtColumn(0)
+        if index != self._hover_index:
+            old = self._hover_index
+            self._hover_index = index
+            if old.isValid():
+                self.viewport().update(self.visualRect(old))
+            if index.isValid():
+                self.viewport().update(self.visualRect(index))
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if self._hover_index.isValid():
+            self.viewport().update(self.visualRect(self._hover_index))
+        self._hover_index = QModelIndex()
+
+    def drawBranches(self, painter, rect, index):
+        # Painting this ourselves (rather than a "QTreeWidget::branch"
+        # stylesheet rule) is load-bearing, not just a style choice - a
+        # QSS rule targeting ::branch:selected was tried first and
+        # made the expand/collapse arrow itself disappear on a selected
+        # row, confirmed live: defining ANY stylesheet rule for that
+        # sub-control/pseudo-state combination appears to switch Qt to
+        # a fully custom branch paint for it that needs an explicit
+        # "image:" to draw an arrow at all - we don't have one, so
+        # nothing did.
+        item = self.itemFromIndex(index)
+        if item is None:
+            super().drawBranches(painter, rect, index)
+            return
+        if item.isSelected():
+            painter.fillRect(rect, QColor(_COLORS["tree_selbg"]))
+            fg = QColor(_COLORS["tree_selfg"])
+        elif index == self._hover_index:
+            painter.fillRect(rect, QColor(_ROW_HOVER_BG))
+            fg = QColor(_COLORS["fg"])
+        else:
+            brush = item.background(0)
+            if brush.style() != Qt.BrushStyle.NoBrush:
+                painter.fillRect(rect, brush)
+            fg = QColor(_COLORS["fg"])
+        if item.childCount() == 0:
+            # A leaf row has nothing to draw an arrow for - super()
+            # still gets a turn, matching every other row, in case a
+            # future style/theme change means this isn't always a pure
+            # no-op the way it is under the ones actually tested here.
+            super().drawBranches(painter, rect, index)
+            return
+        # Own arrow, not the native one, because the native one flatly
+        # ignores palette/QSS text color - confirmed live: stayed the
+        # same dark color selected or not, on both the stock native
+        # paint and every stylesheet-driven attempt to recolor it. One
+        # indentation()-wide slot, matching where Qt places the
+        # innermost level's own arrow.
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(fg)
+        indent = self.indentation()
+        slot = QRect(rect.right() - indent, rect.top(), indent, rect.height())
+        cx, cy = slot.center().x(), slot.center().y()
+        s = 4
+        if item.isExpanded():
+            points = [QPoint(cx - s, cy - s // 2), QPoint(cx + s, cy - s // 2), QPoint(cx, cy + s)]
+        else:
+            points = [QPoint(cx - s // 2, cy - s), QPoint(cx - s // 2, cy + s), QPoint(cx + s, cy)]
+        painter.drawPolygon(QPolygon(points))
+        painter.restore()
 
 
 class _TreeSorter:
@@ -543,10 +727,20 @@ class ChoiceDialog(QDialog):
 
 
 class PasswordPromptDialog(QDialog):
-    def __init__(self, parent, title="Password", message="Enter password:"):
+    # on_shown (optional) fires with this dialog once it's fully mapped,
+    # right before the modal exec() loop starts - the one caller that
+    # needs it (the QR code tour step) uses it to notify the tour this
+    # dialog just opened, same idea as CreateShareDialog/AddUserDialog's
+    # own showEvent()-based notify, but opt-in here instead of hardcoded
+    # into this class, since this dialog is reused everywhere a password
+    # needs asking for and none of those OTHER callers have anything to
+    # do with that one specific tour step. Matches gui.py's identical
+    # on_shown parameter/reasoning.
+    def __init__(self, parent, title="Password", message="Enter password:", on_shown=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.result_value = None
+        self._on_shown = on_shown
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(message))
         self.entry = QLineEdit()
@@ -557,6 +751,12 @@ class PasswordPromptDialog(QDialog):
         buttons.accepted.connect(self._on_ok)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not event.spontaneous() and self._on_shown is not None:
+            QTimer.singleShot(0, lambda: self._on_shown(self))
 
     def _on_ok(self):
         self.result_value = self.entry.text()
@@ -608,6 +808,12 @@ class AddUserDialog(QDialog):
         self.setWindowTitle("New User")
         self.result_data = None
         self._existing = existing_usernames
+        # Reached from either MainWindow directly (share row's "New
+        # User") or UserManagementPanel (the Users panel's own "+") -
+        # both already expose main_window the same way (see that
+        # panel's own __init__), so this always resolves to the real
+        # MainWindow regardless of which one constructed this dialog.
+        self.main_window = getattr(parent, "main_window", parent)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -630,8 +836,32 @@ class AddUserDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._on_ok)
-        buttons.rejected.connect(self.reject)
+        buttons.rejected.connect(self._on_cancel)
         layout.addWidget(buttons)
+        self.cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Deferred - see CreateShareDialog._on_new_share()'s identical
+        # reasoning. showEvent() (not __init__) is what actually fires
+        # once this dialog is really mapped, whether it was opened via
+        # .show() or .exec() (both trigger it), so a single QTimer here
+        # covers every call site without each one having to remember to
+        # defer it themselves - and only ever fires once, since Qt only
+        # sends a real (non-spontaneous) showEvent on first display.
+        if not event.spontaneous():
+            QTimer.singleShot(0, lambda: self.main_window._notify_tour("user_dialog_opened", window=self))
+
+    def _on_cancel(self):
+        # See MainWindow._tour_blocks_closing()'s docstring - lets the
+        # dedicated "Cancel" step's own Cancel click through as normal,
+        # blocks it everywhere else in the tour (e.g. midway through
+        # "Username and Password") so it can't strand the tour pointed
+        # at a field on a dialog that no longer exists.
+        if self.main_window._tour_blocks_closing(self, "user_dialog_cancelled"):
+            return
+        self.main_window._notify_tour("user_dialog_cancelled", window=self)
+        self.reject()
 
     def _on_ok(self):
         username = self.username_entry.text().strip()
@@ -653,6 +883,7 @@ class AddUserDialog(QDialog):
         self.result_data = {
             "username": username, "password": password, "read_only": self.readonly_check.isChecked(),
         }
+        self.main_window._notify_tour("user_created", window=self)
         self.accept()
 
 
@@ -667,6 +898,11 @@ class CreateShareDialog(QDialog):
         self.wizard = wizard
         self._on_done = on_done
         self._worker = None
+        # Always the real MainWindow - the one constructor call site
+        # passes it directly (unlike AddUserDialog, which can also be
+        # opened from UserManagementPanel) - see tour_qt.py's own use of
+        # .name_entry/.path_entry for why this needs to be reachable.
+        self.main_window = parent
 
         layout = QVBoxLayout(self)
         self.stack = QStackedWidget()
@@ -721,15 +957,23 @@ class CreateShareDialog(QDialog):
         path_layout.addLayout(buttons_row)
         self.stack.addWidget(path_page)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Deferred - see AddUserDialog.showEvent()'s identical reasoning.
+        if not event.spontaneous():
+            QTimer.singleShot(0, lambda: self.main_window._notify_tour("share_dialog_opened", window=self))
+
     def _go_to_path_page(self):
         name = self.name_entry.text().strip()
         ok, message = self.wizard.check_share_name(name)
         if not ok:
             self.name_error.setText(message)
+            self.main_window._tour_flash_name_error(message)
             return
         self.name_error.setText("")
         self.path_entry.setText(self.wizard.default_share_path(name))
         self.stack.setCurrentIndex(1)
+        self.main_window._notify_tour("share_name_confirmed", window=self)
 
     def _browse(self):
         # pick_directory_native() is itself a same-line no-op on
@@ -1106,6 +1350,16 @@ class MainWindow(QMainWindow):
         self._attaching_candidates = []
         self._attaching_labels = {}
 
+        # See _start_tour()/_maybe_start_tour() below - GuiTourQt, or
+        # None whenever no tour is currently running.
+        self._tour = None
+        # Counts real toggles while the tour's own "Permission" step is
+        # showing - see _on_access_changed()'s own comment.
+        self._tour_permission_clicks = 0
+        # See _apply_all()'s own comment - the tour's first real check
+        # happens once, right after the first live share list lands.
+        self._did_first_refresh = False
+
         self.setWindowTitle("NASsie")
         self.resize(_BASE_WIDTH, _BASE_HEIGHT)
         # A floor matching the no-panel baseline - matches gui.py's own
@@ -1223,7 +1477,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.shares_tree = QTreeWidget()
+        self.shares_tree = _SharesTree()
+        self.shares_tree.setItemDelegate(_RowHoverDelegate(self.shares_tree))
         self.shares_tree.setHeaderLabels(["Share Name", "Path"])
         # "Path" (the last column) fills any remaining width instead of
         # leaving it unclaimed by any column - matches gui.py's own
@@ -1238,7 +1493,26 @@ class MainWindow(QMainWindow):
         # auto-hide-when-not-needed policy.
         self.shares_tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.shares_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        # Without this, the selection highlight's own "all columns" look
+        # (set via ::item:selected above) only reliably paints the FIRST
+        # column - confirmed live: the Path column stayed unshaded while
+        # the window had focus, then got shaded with a DIFFERENT
+        # (native, not the QSS) color once focus moved to another
+        # window. Qt's own per-column selection-span behavior, not
+        # something the stylesheet alone controls.
+        self.shares_tree.setAllColumnsShowFocus(True)
         self.shares_tree.itemClicked.connect(self._on_shares_item_clicked)
+        self.shares_tree.itemSelectionChanged.connect(self._on_shares_selection_changed_for_tour)
+        # Belt-and-suspenders alongside _populate_shares()'s own
+        # setFirstColumnSpanned(True) on each user row - confirmed live
+        # that a share row's span state doesn't reliably survive a
+        # manual collapse/re-expand (a Qt quirk, not a one-off): a user
+        # row that rendered correctly full-width right after populating
+        # reverted to a truncated, column-0-only box - background
+        # stopping short and long labels re-truncating - the moment its
+        # parent share was collapsed and clicked open again. Re-asserts
+        # it on every expand rather than trying to chase why Qt drops it.
+        self.shares_tree.itemExpanded.connect(self._on_share_item_expanded)
         _BlankClickDeselecter(self.shares_tree)
         layout.addWidget(self.shares_tree, 1)
 
@@ -1319,8 +1593,18 @@ class MainWindow(QMainWindow):
                 host.setFixedWidth(0)
             self._panel_state[kind] = opening
             btn.setChecked(opening)
+            if kind == "users":
+                self._notify_tour("user_mgmt_opened" if opening else "user_mgmt_closed", window=self.user_mgmt_panel)
             if self._suppress_transitions:
                 self._suppress_transitions(False)
+            # Belt-and-suspenders alongside the tour's own passive
+            # Move/Resize tracking (see GuiTourQt.refresh_position()'s
+            # own docstring) - guarantees a currently-showing highlight/
+            # callout ends up correctly placed once THIS glide's real
+            # final geometry has actually settled, not just wherever
+            # the last mid-glide frame happened to leave it.
+            if self._tour is not None:
+                self._tour.refresh_position()
             self._animation = None
             if self._pending_toggle is not None:
                 next_kind = self._pending_toggle
@@ -1343,6 +1627,66 @@ class MainWindow(QMainWindow):
         # cosmetic polish left for a later pass.
         self.statusBar().showMessage(message, 4000)
 
+    # -- guided tour (see tour_qt.py) --------------------------------------
+
+    def _notify_tour(self, event, window=None):
+        # Matches gui.py's own GUIWizard._notify_tour(): the active tour
+        # (if any) advances itself on real actions happening rather than
+        # a "Next" button, and follows the user into whichever dialog
+        # just opened - see GuiTourQt.on_event().
+        if self._tour is not None:
+            self._tour.on_event(event, window=window)
+
+    def _tour_waiting_on(self, event):
+        # True only while the tour is actually showing a step whose
+        # wait_event is this one - used to guard Delete Share/Detach so
+        # the tour's own "click this to see what it does" steps can
+        # never actually perform the destructive action regardless of
+        # what gets clicked. Matches gui.py's identical guard.
+        tour = self._tour
+        return bool(tour and tour._callout is not None and tour._wait_event == event)
+
+    def _tour_blocks_closing(self, dialog, own_close_event):
+        # True while the tour is actively pointed at THIS exact dialog
+        # and wants something OTHER than closing it right now - matches
+        # gui.py's identical guard (see its own docstring for the full
+        # reasoning: without this, Cancel/the window's own close button
+        # could always close the dialog anyway even though the tour's
+        # on_event() never matched and so never advanced, leaving the
+        # tour's callout stuck pointing at a field on an already-
+        # destroyed dialog).
+        tour = self._tour
+        return bool(
+            tour and tour._callout is not None and tour._active_window is dialog
+            and tour._wait_event != own_close_event
+        )
+
+    def _tour_flash_name_error(self, message):
+        if self._tour is not None:
+            self._tour.show_name_error(message)
+
+    def _maybe_start_tour(self):
+        state = tour_state()
+        if state == "new":
+            QTimer.singleShot(400, self._start_tour)
+        elif state == "interrupted":
+            QTimer.singleShot(400, self._offer_tour_resume)
+
+    def _offer_tour_resume(self):
+        if QMessageBox.question(
+            self, "Resume Tour",
+            "It looks like the guided tour didn't finish last time.\n\nContinue where you left off?",
+        ) == QMessageBox.StandardButton.Yes:
+            self._start_tour(resume_index=tour_progress_index())
+        else:
+            mark_tour_completed()
+
+    def _start_tour(self, resume_index=0):
+        # Rebuilt each time rather than cached - matches gui.py's own
+        # _start_tour() (see its own comment for why).
+        self._tour = GuiTourQt(self)
+        self._tour.start(resume_index=resume_index)
+
     # -- data refresh ---------------------------------------------------
 
     def refresh_all(self):
@@ -1363,6 +1707,16 @@ class MainWindow(QMainWindow):
         self._populate_shares(data["shares"])
         if self._panel_state["users"]:
             self.user_mgmt_panel.refresh()
+        if not self._did_first_refresh:
+            # The tour's very first step points at self._add_share_row,
+            # which only exists once this first (async) refresh has
+            # actually landed - starting on a fixed timer instead could
+            # win the race against it on a slow list_shares() call
+            # (confirmed live: it did, on this very machine), leaving
+            # the tour's first highlight box tracing the whole tree
+            # instead of just the add-row.
+            self._did_first_refresh = True
+            self._maybe_start_tour()
 
     def _populate_shares(self, shares):
         self.shares_tree.clear()
@@ -1385,7 +1739,20 @@ class MainWindow(QMainWindow):
                 label = u.get("username", "?")
                 if u.get("read_only"):
                     label += " (read-only)"
-                QTreeWidgetItem(share_item, [label, ""])
+                user_item = QTreeWidgetItem(share_item, [label, ""])
+                # Matches the pinned add-rows' own identical use of this
+                # (see _populate_shares()'s add-row setup just above) -
+                # a user row has nothing meaningful for the "Path"
+                # column anyway, so letting its label use the FULL row
+                # width instead of being squeezed into column 0's own
+                # (share-name-sized) width fixes real truncation -
+                # confirmed live: "caden (existing account)" and other
+                # longer labels were clipped to "bob ..." under a
+                # realistic column-0 width. Set after addWidget/the
+                # item's own construction, same reasoning as the add-row
+                # comment above - no model index to span until it's
+                # actually parented into the tree.
+                user_item.setFirstColumnSpanned(True)
         self.shares_tree.expandAll()
         self._shares_sorter.apply()
 
@@ -1397,6 +1764,22 @@ class MainWindow(QMainWindow):
         if item.parent() is None:
             return item.text(0), None
         return item.parent().text(0), item.text(0).split(" (")[0]
+
+    def _on_share_item_expanded(self, item):
+        # See setAllColumnsShowFocus()'s neighboring itemExpanded.connect()
+        # comment for why this exists at all.
+        for i in range(item.childCount()):
+            item.child(i).setFirstColumnSpanned(True)
+
+    def _on_shares_selection_changed_for_tour(self):
+        # Matches gui.py's own _notify_tour("share_selected") call in
+        # _on_shares_list_select() - fires whenever a real share/user
+        # row (not the add-row) becomes selected; on_event() itself is
+        # a no-op unless the tour is actually waiting on this exact
+        # event right now.
+        share, _ = self._selected_share_and_user()
+        if share:
+            self._notify_tour("share_selected")
 
     def _on_shares_item_clicked(self, item, column):
         if item is self._add_share_row:
@@ -1472,6 +1855,8 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_share_created(self, share_name, log_output):
+        if share_name:
+            self._notify_tour("share_created")
         if log_output.strip():
             self.log_panel.append(log_output)
         if share_name:
@@ -1483,6 +1868,21 @@ class MainWindow(QMainWindow):
     def _on_delete_share(self):
         share, _ = self._selected_share_and_user()
         if not share:
+            return
+        # The tour walks the user through clicking this button on the
+        # exact share it just guided them through creating - the real
+        # confirm-and-delete flow below is skipped entirely (not just
+        # discouraged) while that step is showing, so there's no path
+        # from clicking around during the tour to actually losing it.
+        # Matches gui.py's identical guard.
+        if self._tour_waiting_on("share_delete_dialog_opened"):
+            self._notify_tour("share_delete_dialog_opened")
+            QMessageBox.information(
+                self, "Delete Share",
+                f"This removes '{share}' from Samba (and can optionally delete its folder too). "
+                "Skipped here so you keep the share you just made.",
+            )
+            self._notify_tour("share_delete_dialog_cancelled")
             return
         if QMessageBox.question(self, "Delete Share", f"Delete share '{share}'?") != QMessageBox.StandardButton.Yes:
             return
@@ -1532,6 +1932,7 @@ class MainWindow(QMainWindow):
             self.log_panel.append(log_output)
         if added:
             self._toast(f"Added '{username}' to '{share}'.")
+            self._notify_tour("user_attached")
         else:
             QMessageBox.critical(self, "Failed", f"Could not add '{username}' to '{share}'.\n\n{log_output.strip()}")
         self.refresh_all()
@@ -1572,6 +1973,7 @@ class MainWindow(QMainWindow):
             for u in candidates
         }
         self._share_action_bar.update_bar()
+        self._notify_tour("attach_dropdown_opened")
 
     def _commit_inline_attach(self, user):
         share = self._attaching_share
@@ -1640,6 +2042,19 @@ class MainWindow(QMainWindow):
         share, user = self._selected_share_and_user()
         if not share or not user:
             return
+        # Same reasoning as _on_delete_share()'s identical guard - the
+        # tour walks the user through clicking this on the exact user it
+        # just guided them through attaching, so the real revoke-access
+        # flow below is skipped entirely while that step is showing.
+        if self._tour_waiting_on("user_detach_dialog_opened"):
+            self._notify_tour("user_detach_dialog_opened")
+            QMessageBox.information(
+                self, "Detach",
+                f"This removes {user}'s access to '{share}'. Skipped here so your "
+                "example share keeps its attached user.",
+            )
+            self._notify_tour("user_detach_dialog_cancelled")
+            return
         worker = _Worker(self.wizard.revoke_share_access, share, user)
         worker.done.connect(lambda result, log: self._on_access_revoked(share, user, result, log))
         self._keep_alive(worker)
@@ -1670,7 +2085,19 @@ class MainWindow(QMainWindow):
     def _on_access_changed(self, share, user, changed, log_output):
         if log_output.strip():
             self.log_panel.append(log_output)
-        if not changed:
+        if changed:
+            # The tour's own "Permission" step wants the user to see
+            # BOTH states (read-only and read-write) before moving on,
+            # which takes two real toggles, not one - matches gui.py's
+            # identical counting in _change_access_done().
+            if self._tour_waiting_on("access_level_changed"):
+                self._tour_permission_clicks += 1
+                if self._tour_permission_clicks >= 2:
+                    self._tour_permission_clicks = 0
+                    self._notify_tour("access_level_changed")
+            else:
+                self._tour_permission_clicks = 0
+        else:
             QMessageBox.critical(self, "Failed", f"Could not change access.\n\n{log_output.strip()}")
         self.refresh_all()
 
@@ -1678,8 +2105,12 @@ class MainWindow(QMainWindow):
         share, user = self._selected_share_and_user()
         if not share or not user:
             return
-        pw_dialog = PasswordPromptDialog(self, "Password", f"Enter {user}'s password to generate a QR code:")
+        pw_dialog = PasswordPromptDialog(
+            self, "Password", f"Enter {user}'s password to generate a QR code:",
+            on_shown=lambda dlg: self._notify_tour("qr_dialog_opened", window=dlg),
+        )
         if pw_dialog.exec() != QDialog.DialogCode.Accepted:
+            self._notify_tour("qr_prompt_cancelled")
             return
         password = pw_dialog.result_value
         if not self.wizard.verify_password(user, password, share):

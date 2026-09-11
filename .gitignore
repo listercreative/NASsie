@@ -17,3 +17,8 @@ smb-share-wizard/packaging/deb/nassie-linux-installer.tar.gz.sha256
 smb-share-wizard/packaging/windows/*.exe
 smb-share-wizard/packaging/windows/*.msi
 smb-share-wizard/packaging/windows/*.msi.sha256
+# PyInstaller's own --workpath/--distpath scratch dirs (build.ps1's
+# build/, plus various one-off local test builds) - same reasoning as
+# the .exe/.msi rule above, just the intermediate directories instead
+# of the final artifacts.
+smb-share-wizard/packaging/windows/build*/
