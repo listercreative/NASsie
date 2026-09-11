@@ -48,6 +48,7 @@ if __name__ == "__main__":
 Usage:
   nassie                Launch the terminal UI (TUI)
   nassie --gui           Launch the graphical desktop UI
+  nassie --gui-qt         [dev] Launch the in-progress PySide6 GUI rewrite
   nassie --cli           Launch the basic prompt-based wizard
   nassie --help, -h      Show this help message and exit""")
 
