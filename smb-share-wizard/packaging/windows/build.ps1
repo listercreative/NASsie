@@ -34,7 +34,7 @@ function Assert-LastExitCode($what) {
 $RepoSrc = Resolve-Path (Join-Path $PSScriptRoot "..\..\src")
 
 python -m pip install --upgrade pip
-python -m pip install pyinstaller rich "qrcode[pil]"
+python -m pip install pyinstaller rich "qrcode[pil]" PySide6
 
 # Verify the exact same Python that ran pip above can actually import
 # everything NASsie needs bundled, before PyInstaller ever runs. Windows
@@ -44,7 +44,7 @@ python -m pip install pyinstaller rich "qrcode[pil]"
 # installed doesn't guarantee PyInstaller's scan will ever see it. This
 # turns that class of bug into a loud build failure instead of a
 # ModuleNotFoundError inside the shipped .exe.
-python -c "import PyInstaller, rich, qrcode, PIL"
+python -c "import PyInstaller, rich, qrcode, PIL, PySide6"
 Assert-LastExitCode "Dependency check (pip install and PyInstaller may be seeing different Pythons - check 'where.exe python')"
 
 # Invoked as "python -m PyInstaller", not the bare "pyinstaller" command -
@@ -56,6 +56,16 @@ Assert-LastExitCode "Dependency check (pip install and PyInstaller may be seeing
 # (PIL.Image.init()) - invisible to PyInstaller's static import analysis,
 # so without this the QR feature's PNG save silently fails and leaves a
 # blank dialog on screen instead of a visible error.
+#
+# gui_qt/tour_qt + --collect-all=PySide6: the in-progress PySide6
+# rewrite, reachable only via the explicit `NASsie.exe --gui-qt` flag
+# (main.py never launches it by default) - bundled into this SAME exe
+# rather than a separate build, same as gui/tour already are for the
+# default Tk path, so `--gui-qt` works out of the box with nothing
+# extra to install. Without --collect-all=PySide6, PyInstaller's static
+# analysis misses the Qt plugin DLLs (platform backend, image formats,
+# ...) it loads dynamically at runtime - confirmed live in an earlier
+# standalone test build of just the Qt GUI.
 python -m PyInstaller `
   --onefile `
   --windowed `
@@ -65,10 +75,11 @@ python -m PyInstaller `
   --add-data "$(Join-Path $RepoSrc 'nassie_icon.png');." `
   --add-data "$(Join-Path $RepoSrc 'nassie_ttk');nassie_ttk" `
   --add-data "$(Join-Path $RepoSrc 'icons\*.png');icons" `
-  --hidden-import=core --hidden-import=cli --hidden-import=gui --hidden-import=tui --hidden-import=tour --hidden-import=nassie_ttk --hidden-import=window_corners --hidden-import=anim_debug `
+  --hidden-import=core --hidden-import=cli --hidden-import=gui --hidden-import=gui_qt --hidden-import=tui --hidden-import=tour --hidden-import=tour_qt --hidden-import=nassie_ttk --hidden-import=window_corners --hidden-import=anim_debug `
   --collect-all=rich `
   --collect-all=qrcode `
   --collect-all=PIL `
+  --collect-all=PySide6 `
   --distpath $PSScriptRoot `
   --workpath (Join-Path $PSScriptRoot "build") `
   --specpath (Join-Path $PSScriptRoot "build") `
