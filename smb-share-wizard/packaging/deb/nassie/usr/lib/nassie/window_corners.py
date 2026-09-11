@@ -40,6 +40,39 @@ its own geometry() loop and (False) immediately after, so DWM is only
 ever told to stand down for the ~160ms NASsie's own glide is actually
 running - native minimize/restore keeps its normal animation the rest
 of the time.
+
+A WS_EX_COMPOSITED style was also tried here, twice, for the same
+resize artifact (a ghosted scrollbar and a black flash right at the
+Users panel's own growing edge): first set once, permanently, at
+startup, then - after that visibly broke CreateShareDialog's own "+"
+button and delayed GuiTour's own guidance callout - scoped to just the
+glide's own real duration, exactly like set_transitions_suppressed()
+above. The scoped version didn't just fail to help: it made the SAME
+artifact worse, screen-recorded live as a solid black rectangle
+sitting for the panel's own scrim's entire covered area, not a brief
+flicker - almost certainly the scrim's own themed background never
+actually getting painted before WS_EX_COMPOSITED's compositor took its
+first snapshot, and (unlike ordinary, uncomposited redraw) never
+catching up on its own for as long as compositing stayed active.
+Removed entirely after that, not re-attempted a third way - two
+different applications of the same Win32 setting each caused a new,
+different, real regression, which is a strong enough signal to stop
+here rather than keep guessing at a fourth shape for it.
+
+A genuinely separate overlay Toplevel for the Users panel, shown/hidden
+via AnimateWindow(AW_SLIDE) instead of moving root at all, was tried
+TWICE across this project's history (commit ed2e0b6, and again after
+the header-icon relx bug fix still left a real, measured ceiling on
+the plain-resize approach - see gui.py's own git history for both).
+Both times it measurably worked - genuinely smoother, no per-frame
+app redraw cost, confirmed live - and both times it was rejected
+anyway, explicitly, for being a fundamentally different mechanism from
+Linux/macOS's real single-window resize: "even implemented perfectly,
+a second real window is the wrong idea." That's a hard constraint, not
+a polish target - don't re-attempt this design a third time expecting
+a different verdict; the plain multi-step _animate_root_width() glide
+(see gui.py) is the one mechanism actually allowed on Windows, whatever
+its own remaining costs are.
 """
 from __future__ import annotations
 
