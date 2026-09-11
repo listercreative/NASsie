@@ -1,10 +1,10 @@
 Package: nassie
-Version: 0.1.28
+Version: 0.1.29
 Section: admin
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.8), python3-rich, python3-tk, samba
-Recommends: policykit-1, python3-qrcode, python3-pyside6
+Depends: python3 (>= 3.8), python3-rich, python3-tk, python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, samba
+Recommends: policykit-1, python3-qrcode
 Maintainer: Caden Lister <cadenlister@gmail.com>
 Description: NASsie - cross-platform SMB share configuration wizard
  A terminal-UI wizard by default ('nassie'), with a graphical desktop UI

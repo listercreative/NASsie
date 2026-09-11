@@ -310,8 +310,13 @@ class TUIWizard:
 
     def _launch_gui_outside_curses(self):
         try:
-            from gui import GUIWizard
-            GUIWizard().run()
+            from gui_qt import run
+            run()
+        except SystemExit:
+            # gui_qt.run() ends normally (the user closing its window)
+            # via its own sys.exit(app.exec()), same as any other clean
+            # process exit - not an error to report.
+            pass
         except Exception as e:
             print(f"Could not launch the desktop UI: {e}")
 
