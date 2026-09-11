@@ -27,6 +27,17 @@ if __name__ == "__main__":
             print(f"GUI unavailable ({e}); falling back to the terminal wizard.")
             run_tui_then_basic()
 
+    def run_gui_qt():
+        # The in-progress PySide6 rewrite (see the migration plan) - not
+        # the default GUI yet. Gated behind an explicit flag rather than
+        # replacing --gui, so the shipping Tk build stays untouched while
+        # this reaches feature parity. No fallback to the Tk GUI on
+        # failure (unlike run_gui_then_tui's fallback to the TUI) - a
+        # crash here should be loud during development, not silently
+        # swallowed into the old GUI.
+        from gui_qt import run
+        run()
+
     def run_basic_cli():
         from cli import CLIWizard
         CLIWizard().start()
@@ -37,6 +48,7 @@ if __name__ == "__main__":
 Usage:
   nassie                Launch the terminal UI (TUI)
   nassie --gui           Launch the graphical desktop UI
+  nassie --gui-qt         [dev] Launch the in-progress PySide6 GUI rewrite
   nassie --cli           Launch the basic prompt-based wizard
   nassie --help, -h      Show this help message and exit""")
 
@@ -96,7 +108,7 @@ Usage:
             getattr(SMBWizard, RELAUNCH_HANDLERS[sys.argv[1]])(sys.argv[2])
         else:
             args = sys.argv[1:]
-            recognized = {"--gui", "--cli", "--help", "-h"}
+            recognized = {"--gui", "--gui-qt", "--cli", "--help", "-h"}
             unknown = [a for a in args if a not in recognized]
             if unknown:
                 print(f"Unknown option: {unknown[0]}", file=sys.stderr)
@@ -105,6 +117,8 @@ Usage:
 
             if "--help" in args or "-h" in args:
                 print_help()
+            elif "--gui-qt" in args:
+                run_gui_qt()
             elif "--gui" in args:
                 run_gui_then_tui()
             elif "--cli" in args:

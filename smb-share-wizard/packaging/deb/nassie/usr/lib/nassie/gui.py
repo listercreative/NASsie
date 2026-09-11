@@ -286,14 +286,27 @@ class _Tooltip:
         self.tip.wm_geometry(f"+{x}+{y}")
         self.tip.deiconify()
         self.tip.lift()
-        # No "-topmost" - same fix as GuiTour's _Callout (see tour.py):
-        # it pins the tooltip above EVERY window on the desktop, not just
-        # NASsie's own. And <Leave> alone doesn't reliably clean this up
-        # either - switching to another window WITHOUT the mouse actually
-        # leaving the button first (Alt-Tab, clicking a taskbar icon)
-        # never fires it, leaving the tooltip floating over whatever's
-        # now in front. Hiding on the owning window's own FocusOut closes
-        # that gap.
+        # A momentary "-topmost" toggle, immediately released - NOT left
+        # on (see below for why that's still avoided). Plain lift() alone
+        # isn't reliable for forcing an actual z-order CHANGE on this
+        # desktop (GNOME/Wayland via Xwayland) - the exact same quirk
+        # _bring_window_to_front()'s own docstring documents at length.
+        # Reported live: this tooltip's text ("Manage Users", for the
+        # toolbar's Users icon) partially rendering BEHIND the main
+        # window instead of above it, plain lift() apparently not
+        # actually reaching the front here. Toggling forces the z-order
+        # change the same way _bring_window_to_front()
+        # does; releasing it right back to False (unlike that function,
+        # which stays on) keeps this from pinning the tooltip above EVERY
+        # window on the desktop, not just NASsie's own - the exact
+        # regression a permanent "-topmost" caused here previously.
+        self.tip.attributes("-topmost", True)
+        self.tip.attributes("-topmost", False)
+        # <Leave> alone doesn't reliably clean this up either - switching
+        # to another window WITHOUT the mouse actually leaving the button
+        # first (Alt-Tab, clicking a taskbar icon) never fires it, leaving
+        # the tooltip floating over whatever's now in front. Hiding on the
+        # owning window's own FocusOut closes that gap.
         toplevel = self.widget.winfo_toplevel()
         self._focus_binding = (toplevel, toplevel.bind("<FocusOut>", self._hide, add="+"))
 
@@ -443,12 +456,45 @@ def _deselect_on_blank_click(tree, event):
         tree.selection_remove(*tree.selection())
 
 
-def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs):
-    # A plain "+" (or any single glyph) at the default button font size
-    # reads as thin/washed-out next to full-color emoji icons - a larger
-    # size (see the "Icon.TButton" style) gives it comparable visual
-    # weight without needing to fall back to a colored-pill emoji glyph
-    # just for "add".
+def _asset_base_dir():
+    # Ships right next to this file both in the source tree and in the
+    # installed package (see build.sh/build.ps1). A frozen PyInstaller
+    # --onefile build extracts its data files into a temp dir at
+    # sys._MEIPASS instead - __file__ isn't a real path there, so that
+    # has to be checked first.
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_ICON_CACHE = {}
+
+
+def _load_icon(name, size=24):
+    # Icons used to be emoji characters (text=) rendered by whichever
+    # font the OS picked - Segoe UI Emoji on Windows, Noto Color Emoji on
+    # Linux - which differ in both size AND color (color-emoji glyphs
+    # ignore fg=/foreground entirely, so there was never a way to tune
+    # that from app code). Reported live as the two platforms visibly not
+    # matching. These are pre-baked PNGs instead (see icons/render_icons.py
+    # for how - not shipped, a one-time authoring step), one fixed image
+    # loaded identically everywhere, no OS font involved at all. Source
+    # PNGs are 96px (see render_icons.py's OUT_SIZE) so subsample() below
+    # stays an integer factor - same pattern _build_header() already uses
+    # for the window icon.
+    key = (name, size)
+    cached = _ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = os.path.join(_asset_base_dir(), "icons", f"{name}.png")
+    img = tk.PhotoImage(file=path)
+    scale = max(1, img.width() // size)
+    icon = img.subsample(scale, scale)
+    _ICON_CACHE[key] = icon
+    return icon
+
+
+def _icon_button(parent, icon, tooltip, command, size=24, shadow=False, **kwargs):
     if shadow:
         # nassie_ttk's flat theme draws buttons with no border/relief at
         # all (its own flat, modern look), which reads fine for a busy
@@ -465,7 +511,7 @@ def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs
         # what the current ttk theme does with real button styling.
         card = tk.Frame(parent, background="#adadad")
         btn = ttk.Button(
-            card, text=icon, command=command, width=width, style="Icon.TButton", **kwargs
+            card, image=_load_icon(icon, size), command=command, style="Icon.TButton", **kwargs
         )
         btn.pack(padx=(0, 2), pady=(0, 2))
         _Tooltip(btn, tooltip)
@@ -475,7 +521,7 @@ def _icon_button(parent, icon, tooltip, command, width=3, shadow=False, **kwargs
         # own comment) reaches it instead.
         card.button = btn
         return card
-    btn = ttk.Button(parent, text=icon, command=command, width=width, style="Icon.TButton", **kwargs)
+    btn = ttk.Button(parent, image=_load_icon(icon, size), command=command, style="Icon.TButton", **kwargs)
     _Tooltip(btn, tooltip)
     return btn
 
@@ -497,7 +543,20 @@ class _RowActionBar:
         self.build_fn = build_fn
         self.bar = ttk.Frame(tree)
         tree.bind("<<TreeviewSelect>>", lambda e: self.update(), add="+")
-        tree.bind("<Configure>", lambda e: self.update(), add="+")
+        # reposition(), NOT update() - a resize doesn't change WHICH row
+        # is selected or what build_fn returns for it, only where the
+        # (already-built) bar needs to sit, exactly like the scroll
+        # bindings below - see their own comment for why update()'s
+        # destroy-then-rebuild is wasted work whenever the actual set of
+        # buttons can't have changed. Previously bound to update() here
+        # specifically, unlike scroll - real cost during
+        # GUIWizard._animate_root_width()'s own multi-step glide: content_
+        # row (and so this tree) resizes on every one of its real
+        # geometry() steps, so any currently-selected row's action
+        # buttons were being destroyed and rebuilt from scratch that many
+        # times per toggle - confirmed live as a major contributor to
+        # "the whole window repainting" during it, not just relocated.
+        tree.bind("<Configure>", lambda e: tree.after_idle(self.reposition), add="+")
         # Scrolling doesn't fire either of the above, but it also doesn't
         # change WHICH row is selected or that row's own state - only
         # reposition() (place() the ALREADY-built buttons at the row's
@@ -549,10 +608,27 @@ class _RowActionBar:
             # no rebuild either.
             self.bar.place_forget()
             return
-        self._place(bbox)
+        # measure=False - see _place()'s own comment for why reposition()
+        # specifically never needs it.
+        self._place(bbox, measure=False)
 
-    def _place(self, bbox):
-        self.bar.update_idletasks()
+    def _place(self, bbox, measure=True):
+        # measure=False (reposition() only) skips update_idletasks() -
+        # a real, synchronous, application-wide flush of every pending
+        # layout/redraw task, not scoped to just this bar - see
+        # GuiTour.pause_tracking()'s own docstring for the general shape
+        # of this problem. It's only genuinely needed right after
+        # update() freshly destroys and rebuilds the bar's buttons, to
+        # get an accurate winfo_reqwidth() for content that didn't exist
+        # a moment ago. reposition() never changes what's built - same
+        # buttons, same content, same size - so the frame's required
+        # width can't have changed since the LAST time it was measured,
+        # making this flush pure redundant cost on every one of
+        # GUIWizard._animate_root_width()'s own real per-step
+        # geometry() calls, whenever a row happens to be selected during
+        # one.
+        if measure:
+            self.bar.update_idletasks()
         x, y, _w, h = bbox
         bar_w = self.bar.winfo_reqwidth()
         margin = 4
@@ -785,7 +861,7 @@ class _AddRowFeedback:
         # that first placement lands.
         tree.tag_configure("add_row", background=_ADD_ROW_BG)
         self.icon = tk.Label(
-            tree, text="➕", bg=_ADD_ROW_BG, fg="#0e92ab", font=("TkDefaultFont", 11), cursor="hand2",
+            tree, image=_load_icon("icon_add"), bg=_ADD_ROW_BG, cursor="hand2",
         )
         self.icon.bind("<Enter>", self._on_enter, add="+")
         self.icon.bind("<Leave>", self._on_leave, add="+")
@@ -884,13 +960,12 @@ class _ToggleButton:
     def __init__(self, parent, icon, tooltip, command, idle_bg):
         self.idle_bg = idle_bg
         self.pressed = False
-        # Fixed pixel size, not just font+padding - different emoji
-        # glyphs (👤 vs 📜) render at different natural sizes even at the
-        # same font/padding, which left the two toggle buttons visibly
-        # different heights (reported live). pack_propagate(False) keeps
-        # this frame at exactly _SIZE regardless of what its child needs,
-        # and the Label fills it completely, so both buttons end up
-        # pixel-identical no matter which glyph is inside.
+        # Fixed pixel size, not just image+padding - pack_propagate(False)
+        # keeps this frame at exactly _SIZE regardless of what its child
+        # needs, and the Label fills it completely, so both buttons end
+        # up pixel-identical (both icons are baked to the same size
+        # already - see _load_icon() - but the border/relief below still
+        # needs a size the content itself doesn't drive).
         # borderwidth+relief give this an actual raised/sunken 3D edge,
         # not just a flat color swap - a color shade alone doesn't read
         # as "pressed" (reported live: "just looks like it's shaded a
@@ -905,7 +980,7 @@ class _ToggleButton:
         )
         self.frame.pack_propagate(False)
         self.label = tk.Label(
-            self.frame, text=icon, font=("TkDefaultFont", 12), bg=idle_bg, fg="#333333", cursor="hand2",
+            self.frame, image=_load_icon(icon), bg=idle_bg, fg="#333333", cursor="hand2",
         )
         self.label.pack(fill="both", expand=True)
         for widget in (self.frame, self.label):
@@ -987,9 +1062,9 @@ class AddUserDialog(tk.Toplevel):
         # Kept as an attribute (unlike every other dialog's Cancel
         # button) so the tour's own "New User" step (see tour.py) can
         # point a highlight box directly at it once this dialog opens.
-        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self._on_cancel, shadow=True)
+        self.cancel_button = _icon_button(btn_frame, "icon_cancel", "Cancel", self._on_cancel, shadow=True)
         self.cancel_button.pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_ok", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
 
         self.username_entry.focus_set()
         _center_over_parent(self, parent)
@@ -1087,8 +1162,8 @@ class ChoiceDialog(tk.Toplevel):
         # AddUserDialog's identical btn_frame for the same convention.
         btn_frame = ttk.Frame(body)
         btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
-        _icon_button(btn_frame, "✖", "Cancel", self.destroy, shadow=True).pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", ok_label, self._on_ok, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_cancel", "Cancel", self.destroy, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_ok", ok_label, self._on_ok, shadow=True).pack(side="left", padx=4)
 
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
@@ -1150,9 +1225,9 @@ class PasswordPromptDialog(tk.Toplevel):
         # (see tour.py) needs a real widget handle to point at, the last
         # control at the BOTTOM of this stacked prompt/entry/buttons
         # layout.
-        self.cancel_button = _icon_button(btn_frame, "✖", "Cancel", self.destroy, shadow=True)
+        self.cancel_button = _icon_button(btn_frame, "icon_cancel", "Cancel", self.destroy, shadow=True)
         self.cancel_button.pack(side="left", padx=4)
-        _icon_button(btn_frame, "✔", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
+        _icon_button(btn_frame, "icon_ok", "OK", self._on_ok, shadow=True).pack(side="left", padx=4)
 
         _center_over_parent(self, parent)
         _bring_window_to_front(self)
@@ -1282,8 +1357,8 @@ class CreateShareDialog(tk.Toplevel):
         # with Cancel just to its left.
         action_frame = ttk.Frame(self.name_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "✔", "OK", self._confirm_name, shadow=True).pack(side="right")
-        _icon_button(action_frame, "✖", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
+        _icon_button(action_frame, "icon_ok", "OK", self._confirm_name, shadow=True).pack(side="right")
+        _icon_button(action_frame, "icon_cancel", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
 
     def _build_path_page(self):
         self.path_page = ttk.Frame(self)
@@ -1301,7 +1376,7 @@ class CreateShareDialog(tk.Toplevel):
         # doesn't exist yet, same as it always has.
         self.path_entry = ttk.Entry(form, width=32, state="readonly", cursor="arrow")
         self.path_entry.grid(row=0, column=1, sticky="w", pady=4)
-        _icon_button(form, "📂", "Browse", self._browse_path).grid(row=0, column=2, padx=4)
+        _icon_button(form, "icon_browse", "Browse", self._browse_path).grid(row=0, column=2, padx=4)
 
         # Back stays isolated on the left (a navigation action, not part
         # of the confirm/cancel decision) - Cancel and Create Share
@@ -1309,15 +1384,15 @@ class CreateShareDialog(tk.Toplevel):
         # right, same reasoning and pack order as _build_name_page's.
         action_frame = ttk.Frame(self.path_page)
         action_frame.pack(fill="x", padx=8, pady=(4, 8))
-        _icon_button(action_frame, "◀", "Back", self._show_name_page, shadow=True).pack(side="left")
+        _icon_button(action_frame, "icon_back", "Back", self._show_name_page, shadow=True).pack(side="left")
         # shadow=True returns the shadow-casting Frame, not the ttk.Button
         # itself - .button reaches the real one, needed here since
         # _apply_done()/its own start disable this via .configure(state=
         # ...) after the fact (every OTHER shadowed button in this dialog
         # is fire-and-forget, never touched again post-creation).
-        self.create_button = _icon_button(action_frame, "✔", "OK", self._on_create_share, shadow=True)
+        self.create_button = _icon_button(action_frame, "icon_ok", "OK", self._on_create_share, shadow=True)
         self.create_button.pack(side="right")
-        _icon_button(action_frame, "✖", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
+        _icon_button(action_frame, "icon_cancel", "Cancel", self._on_close, shadow=True).pack(side="right", padx=(0, 4))
 
     def _show_name_page(self):
         self.path_page.pack_forget()
@@ -1634,10 +1709,10 @@ class UserManagementPanel:
         # selection - nothing here applies to it.
         if item == self._add_user_row_id:
             return False
-        _icon_button(container, "🔑", "Change Password", self._change_password).pack(
+        _icon_button(container, "icon_key", "Change Password", self._change_password).pack(
             side="left", fill="y", padx=1
         )
-        _icon_button(container, "🗑", "Delete User", self._delete_user).pack(side="left", fill="y", padx=1)
+        _icon_button(container, "icon_delete", "Delete User", self._delete_user).pack(side="left", fill="y", padx=1)
         return True
 
     def refresh(self):
@@ -1864,10 +1939,17 @@ class GUIWizard:
         self._build_shares_page()
 
         # The Users panel is docked inside self._content_row itself
-        # (packed side="right" - unaffected by anything below). The Log
-        # panel is NOT - it's a sibling of self._content_row inside
-        # self._main_area instead, since it needs place() (see
-        # _place_log_steady()/_place_log_glide()), not pack() - see
+        # (packed side="right" - unaffected by anything below), on
+        # every platform - see _toggle_users_panel()'s own docstring for
+        # the Windows-specific history of designs that tried to be
+        # something OTHER than this (a separate popped-out overlay
+        # window, notably) and were rejected: the window has to actually
+        # expand, the same single window, the same way it does on
+        # Linux - not a different mechanism that happens to look similar
+        # from a distance. The Log panel is NOT docked the same way -
+        # it's a sibling of self._content_row inside self._main_area
+        # instead, since it needs place() (see _place_log_steady()/
+        # _place_log_glide()), not pack() - see
         # _toggle_users_panel()/_toggle_log_panel() and their own class
         # docstrings for why these are panels, not separate windows.
         #
@@ -1901,6 +1983,23 @@ class GUIWizard:
         # Parented directly to root, not main_area, so it can actually
         # reach the header.
         self._window_scrim = ttk.Frame(self.root)
+        # Covers JUST the Users panel's own area, for the real steps=10
+        # glide _toggle_users_panel() runs on EVERY platform (unlike
+        # window_scrim above, this isn't a Windows-only steps=1 thing) -
+        # see that method's own comment for why: the panel itself is
+        # pack(side="right") in content_row, so its own x position has
+        # to shift by the full panel width over the course of the
+        # glide (it genuinely MOVES, not just redraws in place - unlike
+        # the header logo/toggle button, which only needed to stay put
+        # and could be frozen outright), and Windows was reported live
+        # as visibly ghosting that (a duplicated scrollbar, a flash of
+        # black right at its own growing edge) across every one of
+        # those real steps. Hiding the whole transient behind this,
+        # rather than trying to make each of its 10 individual
+        # reposition steps clean, is the same principle as every other
+        # freeze in _animate_root_width(), just scoped to a region
+        # instead of a single widget.
+        self._users_scrim = ttk.Frame(self._content_row)
         self._users_panel_open = False
         # Sole guard against a second click landing mid-glide - see
         # _toggle_users_panel()'s own comment for why that's not just a
@@ -1975,7 +2074,9 @@ class GUIWizard:
         # (see _measure_action_bar_width) is the only way to get this
         # right regardless of that.
         self.root.update_idletasks()
-        share_bar_w = self._measure_action_bar_width(("📖", "📷", "➖", "+👤", "🔗", "🗑"))
+        share_bar_w = self._measure_action_bar_width(
+            ("icon_readonly", "icon_qr", "icon_detach", "icon_new_user", "icon_attach", "icon_delete")
+        )
         name_col_w = self.shares_list.column("#0", "width")
         # name column + vertical scrollbar (~20px) + a floor for the Path
         # column so it isn't squeezed to nothing + the action bar itself +
@@ -2031,7 +2132,7 @@ class GUIWizard:
         # block's comment for why a measurement beats a guessed constant.
         probe = ttk.Frame(self.root)
         for icon in icons:
-            ttk.Button(probe, text=icon, width=3, style="Icon.TButton").pack(side="left", fill="y", padx=1)
+            ttk.Button(probe, image=_load_icon(icon), style="Icon.TButton").pack(side="left", fill="y", padx=1)
         probe.update_idletasks()
         width = probe.winfo_reqwidth()
         probe.destroy()
@@ -2121,6 +2222,12 @@ class GUIWizard:
 
         if icon_label is not None:
             icon_label.place(relx=0.5, y=0, anchor="n")
+        # Kept on self, not local-only - _animate_root_width() freezes
+        # this widget's position for the duration of its own glide (see
+        # its own comment for why) and needs a handle to it. None if
+        # there's no icon at all (see _load_icon_image()'s own
+        # fallback), in which case that freeze is just always a no-op.
+        self._header_icon_label = icon_label
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", padx=8, pady=(10, 0))
 
@@ -2256,13 +2363,13 @@ class GUIWizard:
         toolbar = ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=8, pady=(8, 0))
         self._users_toggle_btn = _ToggleButton(
-            toolbar, "👤", "Manage Users", self._toggle_users_panel, toolbar_bg,
+            toolbar, "icon_users", "Manage Users", self._toggle_users_panel, toolbar_bg,
         )
         self._users_toggle_btn.pack(side="right")
         self._log_toggle_btn = _ToggleButton(
-            # 📋 (clipboard) reads as "notes/tasks", not "log" - 📜
-            # (scroll) is the more common "history/log" convention.
-            toolbar, "📜", "View Log", self._toggle_log_panel, toolbar_bg,
+            # A scroll icon ("history/log"), not a clipboard ("notes/
+            # tasks") - see icons/render_icons.py for the source glyph.
+            toolbar, "icon_log", "View Log", self._toggle_log_panel, toolbar_bg,
         )
         # Not packed - the Log panel is the one that has to sit on the
         # left (see _toggle_log_panel()'s own docstring for why that
@@ -2549,6 +2656,146 @@ class GUIWizard:
         suppressed_ok = window_corners.set_transitions_suppressed(self.root, True)
         anim_debug.log(f"set_transitions_suppressed(True) -> {suppressed_ok}")
 
+        # Every freeze below (header logo, toggle button, Path column
+        # stretch, tour tracking) exists ONLY to work around Windows-
+        # specific repaint costs - each one's own comment cites a live,
+        # screen-recorded Windows symptom (ghosted icon, blank icon,
+        # full-window repaint, a synchronous flush per step) as its
+        # reason for existing. They were made unconditional across every
+        # platform for a while for code-path simplicity, but that
+        # silently cost Linux/macOS their own PREVIOUSLY-live tracking
+        # of these same elements during the glide - reported live as
+        # "the icon doesn't transform correctly" (the toggle button
+        # frozen in place, then teleporting to its final spot in one
+        # frame instead of sliding with the edge like it used to) and
+        # "the border created by the tour isn't drawn correctly as the
+        # window changes size" (the highlight/callout frozen mid-glide,
+        # then snapping once at the end). Gating each freeze to Windows
+        # only restores that original live tracking everywhere else,
+        # without touching the one thing that has to stay identical on
+        # every platform: root's own real, multi-step geometry() glide
+        # below is completely unaffected by this flag either way.
+        is_windows = platform.system() == "Windows"
+
+        # Freezes the header's logo at its CURRENT pixel position for
+        # the duration of this glide, instead of leaving it on its
+        # normal place(relx=0.5) tracking (see _build_header()'s own
+        # comment on why it's relx-based at all - centering against the
+        # header's own live width). relx=0.5 means that width changing
+        # on every single one of this glide's steps forces the label to
+        # recompute AND redraw its position that many times too - not
+        # just root itself repainting. Reported live, screen-recorded:
+        # a duplicate/ghosted icon mid-glide, the same class of "stale
+        # pixels never cleared before the next paint" bug already fixed
+        # once for the scrim-based Windows design this replaced - except
+        # THAT fix isn't available here at all, since there's no scrim
+        # hiding anything mid-glide any more (the whole point of a REAL
+        # multi-step resize is that every intermediate frame is visible
+        # on purpose). Freezing the logo's pixel position removes the
+        # per-step cost entirely rather than trying to make each of the
+        # 10 individual re-centers clean: it just doesn't move (or
+        # redraw) until put back on relx=0.5 tracking, in one single,
+        # clean re-place(), once the glide is fully done.
+        header_icon = self._header_icon_label
+        if is_windows and header_icon is not None:
+            # Was a freeze (place() pinned to a captured pixel x, with an
+            # explicit relx=0 - an earlier version of this left relx=0.5
+            # active by accident, which is its own real bug: Tk resolves
+            # leftover place() options additively as x + relx*width, so
+            # that "frozen" icon actually kept drifting by half of every
+            # step's width delta). Fixing THAT (confirmed via a packaged-
+            # build screenshot burst) killed the sustained multi-hundred-
+            # ms drift, but left a real, clearly-visible single-frame
+            # duplicate at whichever end of the glide the freeze/restore
+            # repaint happened to land on - reported live as still
+            # looking broken, and it does: DWM composites at its own
+            # vsync-driven cadence, independent of when Tk's place() call
+            # actually finishes repainting, so there's an inherent gap
+            # between "old position's pixels are still in the backing
+            # surface" and "new position has been drawn" that a
+            # REPOSITION can always get caught inside, no matter how
+            # correct the position math is - confirmed by a follow-up
+            # forced-update_idletasks() experiment that just moved the
+            # gap from one end of the glide to the other instead of
+            # closing it. Unmapping the icon entirely for the glide's
+            # duration removes the gap instead of trying to time around
+            # it: nothing drawn means nothing for DWM to catch
+            # mid-repaint.
+            header_icon.place_forget()
+
+        # Same freeze, different mechanism: the Users toggle button
+        # (self._users_toggle_btn.frame, the 👤 toolbar icon) is pack()'d
+        # side="right" in a toolbar that's pack(fill="x") in root - as
+        # root grows across this glide's real steps, the toolbar widens
+        # right along with it, and pack's own right-anchoring re-derives
+        # this button's x position on every single one of them, exactly
+        # like the header logo's relx=0.5 did (see its own comment
+        # above) - just via pack()'s own tracking instead of place()'s.
+        # Reported live, screen-recorded: the icon rendering fully BLANK
+        # (not a duplicate this time - the glyph itself never got
+        # redrawn at its new position before the next step already
+        # moved it again) after a toggle - same underlying "Windows
+        # doesn't keep up with rapid reposition+redraw" cause, different
+        # visible symptom. place(), not pack_forget()+place() - calling
+        # place() on an already-pack()'d widget implicitly detaches it
+        # from pack (Tk only ever honors one geometry manager per
+        # widget at a time), so this alone is enough to freeze it; the
+        # later pack(side="right") call implicitly detaches it from
+        # place() again, the same way in reverse.
+        toggle_btn_frame = getattr(self, "_users_toggle_btn", None)
+        if toggle_btn_frame is not None:
+            toggle_btn_frame = toggle_btn_frame.frame
+            if is_windows:
+                frozen_btn_x = toggle_btn_frame.winfo_x()
+                frozen_btn_y = toggle_btn_frame.winfo_y()
+                toggle_btn_frame.place(
+                    x=frozen_btn_x, y=frozen_btn_y,
+                    width=toggle_btn_frame.winfo_width(), height=toggle_btn_frame.winfo_height(),
+                )
+
+        # Same freeze, much bigger payoff: the shares list's "Path"
+        # column is stretch=True (see _build_shares_page()), meaning
+        # ttk's OWN Treeview implementation recomputes and redraws its
+        # entire column layout - EVERY visible row, not just one small
+        # label - on every single width change it sees. content_row
+        # tracks main_area's live width (relwidth=1.0 - see
+        # _place_log_steady()), so as root grows across all 10 of this
+        # glide's real geometry() calls, shares_list's own allocated
+        # width changes 10 times right along with it, and stretch=True
+        # means the Treeview redraws its full column layout that many
+        # times too - reported live as the window's entire content
+        # repainting, not just the header. Disabling stretch for the
+        # glide's duration freezes the column at whatever pixel width it
+        # already has - the Treeview's own OUTER bounds still resize
+        # live with the window (this is stretch, a column-width policy,
+        # not the widget's own geometry - "the window really expands"
+        # stays completely intact), it just stops redistributing space
+        # internally until stretch is switched back on, once, after the
+        # glide - at which point ttk recomputes the correct final column
+        # width itself from the settled width, no manual math needed
+        # here for what that width should be.
+        try:
+            path_stretch_was = self.shares_list.column("path", "stretch") if is_windows else None
+        except tk.TclError:
+            path_stretch_was = None
+        if path_stretch_was:
+            self.shares_list.column("path", stretch=False)
+
+        # Pauses GuiTour's own container tracking (see its
+        # pause_tracking()'s own docstring) for the glide's duration -
+        # a real, measured contributor when a tour step happens to be
+        # showing a callout: its reposition() calls widget.
+        # update_idletasks(), a synchronous, APPLICATION-WIDE flush of
+        # every pending layout/redraw task, on every single <Configure>
+        # the tracked container fires, which very much includes every
+        # one of THIS method's own real per-step geometry() calls.
+        # getattr(), not self._tour directly - the tour may never have
+        # started, or may already be finished (see _notify_tour()'s own
+        # identical guard) - either way, nothing to pause.
+        tour = getattr(self, "_tour", None)
+        if is_windows and tour is not None:
+            tour.pause_tracking()
+
         def step(i):
             w = widths[i]
             anim_debug.log(
@@ -2590,6 +2837,37 @@ class GUIWizard:
                     f"_animate_root_width done, set_transitions_suppressed(False) -> {restored_ok}, "
                     f"final winfo_width={self.root.winfo_width()}"
                 )
+                # Re-maps the icon (place_forget()'d at the top of this
+                # method - see that call's own comment for why it's
+                # unmapped for the WHOLE glide rather than repositioned
+                # each step or at the edges) fresh, in its normal
+                # relx=0.5 tracking, now that the glide's done and
+                # there's only ever going to be this ONE paint. Nothing
+                # was drawn at any other position in the meantime, so
+                # there's no stale pixels for DWM to catch mid-repaint
+                # the way a live reposition could.
+                if is_windows and header_icon is not None:
+                    header_icon.place(x=0, relx=0.5, y=0, anchor="n")
+                # Back to live pack(side="right") tracking - matches
+                # GUIWizard._build_shares_page()'s own original call
+                # exactly, since this needs to be the SAME pack
+                # configuration going forward, not a guessed one. See
+                # the freeze's own comment above for why place() alone
+                # was enough to detach it in the first place, and why
+                # the same is true in reverse here.
+                if toggle_btn_frame is not None:
+                    toggle_btn_frame.pack(side="right")
+                # Re-enables stretch on the settled, FINAL width, not a
+                # stale one from mid-glide - ttk recomputes the column's
+                # correct pixel width itself from here, once, cleanly.
+                if path_stretch_was:
+                    self.shares_list.column("path", stretch=True)
+                # Re-binds GuiTour's own tracking (a no-op if nothing was
+                # paused above) and repositions its highlight/callout
+                # exactly once, against the now-settled final geometry -
+                # see pause_tracking()'s own docstring.
+                if is_windows and tour is not None:
+                    tour.resume_tracking()
                 if on_complete:
                     on_complete()
             else:
@@ -2631,46 +2909,47 @@ class GUIWizard:
 
 
     def _toggle_users_panel(self):
-        # The cheap, pack()-based side (see GUIWizard.__init__'s own
-        # comment on why Users, not Log, was moved here) - one plain
-        # steps=10 _animate_root_width() glide, same on every platform.
-        # Confirmed live, smooth on Linux/macOS from the start.
+        # One plain steps=10 _animate_root_width() glide, the SAME
+        # mechanism on every platform - root's own window really,
+        # physically expands and shrinks, exactly like it always has on
+        # Linux/macOS. Two other Windows-only designs were tried and
+        # rejected; worth recording so this doesn't drift back into one
+        # of them:
         #
-        # Windows went through two other designs before landing back
-        # here, worth recording so this doesn't get "fixed" back into
-        # one of them:
+        # 1. A steps=1 jump hidden behind a pair of scrims, with the
+        #    entire VISIBLE motion done afterward as a place()-based
+        #    reveal over already-rendered content, never touching root's
+        #    geometry after that one hidden jump. Fixed per-call repaint
+        #    choppiness, but the window's own OUTER bounds - the actual
+        #    OS-drawn frame, not something any in-app overlay can cover
+        #    - still SNAPPED to its final size in that one instant call.
+        #    Reported live as "the panel snaps open and closed."
+        # 2. A genuinely separate, borderless overlay Toplevel for the
+        #    panel, shown/hidden via the native AnimateWindow(AW_SLIDE)
+        #    API instead of moving root at all - smoother-LOOKING motion
+        #    (a real OS-composited slide, no per-frame app redraw cost),
+        #    but root itself never actually resized any more - a
+        #    fundamentally different mechanism from Linux/macOS, not
+        #    just a different-looking version of the same one. Tried
+        #    TWICE (git history: commit ed2e0b6, and again after the
+        #    header-icon relx bug fix still left a measured ceiling on
+        #    this method's own approach) - rejected live BOTH times,
+        #    explicitly, for the same reason: "we aren't expanding the
+        #    window like in Linux, but popping out a separate window. It
+        #    fundamentally works differently" / "even implemented
+        #    perfectly, a second real window is the wrong idea." That's
+        #    a hard constraint on this app, not a polish target - the
+        #    window has to be the SAME single window, actually growing,
+        #    on every platform, even if that costs more on Windows than
+        #    either alternative did. See window_corners.py's own
+        #    docstring for the full AnimateWindow history - don't
+        #    re-attempt this a third time expecting a different verdict.
         #
-        # 1. steps=1 (an instant, un-animated jump) - the ORIGINAL
-        #    Windows-only path, reverted for being visibly abrupt with
-        #    no motion at all.
-        # 2. steps=1 hidden behind a pair of scrims (self._window_scrim/
-        #    a since-removed self._users_scrim), with the entire
-        #    VISIBLE open/close motion done afterward as a pure
-        #    place()-based reveal/cover, never touching root's geometry
-        #    at all (git history: _animate_users_scrim()). This traded
-        #    the choppiness for a different, also-real complaint: the
-        #    window's own OUTER bounds (the actual OS-drawn frame - not
-        #    something any in-app scrim can cover) still SNAPPED to
-        #    size in that one instant call, with only the CONTENT
-        #    inside animating afterward - reported live as "the panel
-        #    snaps open and closed."
-        #
-        # A real multi-step glide (this method, unconditionally) is the
-        # only way to make the window's actual outer edges move
-        # gradually rather than jump - there's no way around that: an
-        # overlay can hide/reveal content, but it can never hide the
-        # real OS window frame moving. The earlier "still choppy even
-        # with DWM suppressed" verdict that first motivated design #2
-        # was measured BEFORE _revealed()'s refresh()-deferral fix
-        # existed (see git history) - that test very likely mixed real
-        # per-call repaint cost with the SAME refresh()/Treeview-
-        # repopulation contention already confirmed (via anim_debug.log)
-        # to stall design #2's own reveal steps, so it was never a
-        # clean read on what plain steps=10 alone actually costs on
-        # Windows. window_corners.set_transitions_suppressed() (see its
-        # own docstring) still brackets _animate_root_width()'s geometry
-        # loop below regardless of platform, so DWM's own competing
-        # tween is out of the picture either way.
+        # window_corners.set_transitions_suppressed() (see its own
+        # docstring) still brackets the geometry loop below regardless
+        # of platform, so DWM's own competing tween is out of the
+        # picture; refresh() (see _done()'s own comment) is still
+        # deferred until after the glide finishes, not before it starts.
         anim_debug.log(
             f"_toggle_users_panel clicked, currently_open={self._users_panel_open} "
             f"animating={self._users_panel_animating}"
@@ -2685,6 +2964,18 @@ class GUIWizard:
         if self._users_panel_animating:
             anim_debug.log("_toggle_users_panel ignored - already animating")
             return
+        # The panel-content scrim below (see self._users_scrim's own
+        # comment in __init__) exists to hide the SAME Windows-only
+        # repaint cost as _animate_root_width()'s own is_windows-gated
+        # freezes: the panel's real content repositioning live, once
+        # per step, as content_row grows/shrinks under it. Scoping it
+        # to Windows too (it had drifted unconditional, like those
+        # freezes) restores Linux/macOS's original look of the panel's
+        # own content actually sliding into/out of view over the
+        # glide, instead of popping in/out all at once - reported live
+        # as "the user management column just kind of appears instead
+        # of being drawn correctly".
+        use_panel_scrim = platform.system() == "Windows"
         if self._users_panel_open:
             # See _tour_blocks_closing()'s docstring - lets the dedicated
             # "Close" step's own click-to-close-the-panel through as
@@ -2696,8 +2987,27 @@ class GUIWizard:
             self._users_panel_open = False
             self._users_panel_animating = True
             self._users_toggle_btn.set_pressed(False)
+            # Covers the panel's own area BEFORE the glide starts, while
+            # it's still fully visible - see self._users_scrim's own
+            # comment in __init__ for why: hides the panel's own real
+            # per-step reposition (pack(side="right") tracking
+            # content_row's shrinking width) rather than trying to make
+            # each of those 10 steps individually clean.
+            panel_width = self._users_panel_width - _PANEL_GUTTER
+            if use_panel_scrim:
+                self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
+                self._users_scrim.lift()
             def _done():
                 self._user_mgmt_panel.frame.pack_forget()
+                if use_panel_scrim:
+                    # update_idletasks() BEFORE removing the scrim, not
+                    # after - see the opening branch's identical call for
+                    # why: forces everything underneath to actually finish
+                    # settling at the new (narrower) width WHILE still
+                    # hidden, so there's nothing left to redraw once the
+                    # scrim comes off.
+                    self.root.update_idletasks()
+                    self._users_scrim.place_forget()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_closed")
                 # Root just settled at its new (narrower) width - see
@@ -2710,19 +3020,41 @@ class GUIWizard:
             self._users_panel_open = True
             self._users_panel_animating = True
             self._users_toggle_btn.set_pressed(True)
+            # Covers the panel's full FINAL area BEFORE it's even
+            # packed - using panel_width, the cached target (known in
+            # advance, no need to wait and measure it after the glide) -
+            # so the panel's real content, and its own per-step
+            # reposition as content_row grows underneath it, is never
+            # visible even for one frame. relx=1.0 keeps this pinned to
+            # content_row's live right edge throughout, the same way
+            # the panel itself will be once it's actually packed.
+            panel_width = self._users_panel_width - _PANEL_GUTTER
+            if use_panel_scrim:
+                self._users_scrim.place(relx=1.0, x=-panel_width, y=0, width=panel_width, relheight=1.0)
+                self._users_scrim.lift()
             self._pack_users_panel()
             def _done():
+                if use_panel_scrim:
+                    # update_idletasks() BEFORE removing the scrim, not
+                    # after - see _animate_root_width()'s own header-icon
+                    # freeze comment for the general shape of why: forces
+                    # the now-packed panel (and everything else content_row
+                    # resized around it) to actually finish settling at its
+                    # final position WHILE still hidden, so there's nothing
+                    # left to redraw - no ghosted scrollbar, no flash at its
+                    # own edge - once the scrim comes off.
+                    self.root.update_idletasks()
+                    self._users_scrim.place_forget()
                 self._users_panel_animating = False
                 self._notify_tour("user_mgmt_opened", window=self._user_mgmt_panel)
                 self._reapply_corners()
                 # Deferred to here, not called before the glide starts -
-                # see _toggle_log_panel()'s unaffected design aside,
-                # this avoids refresh()'s own background-thread
-                # completion callback (root.after(0, apply), doing real
-                # synchronous Treeview work) landing mid-glide and
-                # stealing the event loop out from under one of this
-                # glide's own steps - confirmed live as a measurable
-                # stall when this used to run before the jump.
+                # avoids refresh()'s own background-thread completion
+                # callback (root.after(0, apply), doing real synchronous
+                # Treeview work) landing mid-glide and stealing the
+                # event loop out from under one of this glide's own
+                # steps - confirmed live as a measurable stall when this
+                # used to run before the jump.
                 self._user_mgmt_panel.refresh()
             self._animate_root_width(self._users_panel_width, on_complete=_done, steps=10)
 
@@ -2845,8 +3177,8 @@ class GUIWizard:
             share = next((s for s in self.wizard.list_shares() if s["name"] == share_name), None)
             share_user = next((u for u in (share or {}).get("users", []) if u["username"] == username), None)
             read_only = bool(share_user and share_user.get("read_only"))
-            icon, tip = ("📖", "Read-only - click to make read-write") if read_only else (
-                "📝", "Read-write - click to make read-only"
+            icon, tip = ("icon_readonly", "Read-only - click to make read-write") if read_only else (
+                "icon_readwrite", "Read-write - click to make read-only"
             )
             _icon_button(
                 container, icon, tip, self._change_access_level_for_selection
@@ -2856,20 +3188,20 @@ class GUIWizard:
             # barcode anywhere in it) - a camera stands in for the actual
             # action (point your phone's camera at it) instead of trying
             # to depict the code itself.
-            _icon_button(container, "📷", "Show QR Code", self._show_qr_for_selection).pack(
+            _icon_button(container, "icon_qr", "Show QR Code", self._show_qr_for_selection).pack(
                 side="left", fill="y", padx=1
             )
             _icon_button(
-                container, "➖", "Detach User", self._unattach_selected_user
+                container, "icon_detach", "Detach User", self._unattach_selected_user
             ).pack(side="left", fill="y", padx=1)
         else:
-            _icon_button(container, "+👤", "New User", self._new_user_for_selected_share).pack(
+            _icon_button(container, "icon_new_user", "New User", self._new_user_for_selected_share).pack(
                 side="left", fill="y", padx=1
             )
             _icon_button(
-                container, "🔗", "Attach User", self._attach_user_to_selected_share
+                container, "icon_attach", "Attach User", self._attach_user_to_selected_share
             ).pack(side="left", fill="y", padx=1)
-            _icon_button(container, "🗑", "Delete Share", self._delete_selected_share).pack(
+            _icon_button(container, "icon_delete", "Delete Share", self._delete_selected_share).pack(
                 side="left", fill="y", padx=1
             )
         return True
@@ -2888,7 +3220,7 @@ class GUIWizard:
             "<<ComboboxSelected>>",
             lambda e: self._commit_inline_attach(label_to_username.get(var.get(), var.get())),
         )
-        _icon_button(container, "✖", "Cancel", self._cancel_inline_attach).pack(side="left", fill="y", padx=1)
+        _icon_button(container, "icon_cancel", "Cancel", self._cancel_inline_attach).pack(side="left", fill="y", padx=1)
         # Opens the dropdown right away - the whole point of "contextual
         # dropdown" is picking a user in one motion, not a second click
         # just to open what clicking the attach icon conceptually already
