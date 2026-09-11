@@ -4,7 +4,7 @@ Section: admin
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.8), python3-rich, python3-tk, samba
-Recommends: policykit-1, python3-qrcode
+Recommends: policykit-1, python3-qrcode, python3-pyside6
 Maintainer: Caden Lister <cadenlister@gmail.com>
 Description: NASsie - cross-platform SMB share configuration wizard
  A terminal-UI wizard by default ('nassie'), with a graphical desktop UI

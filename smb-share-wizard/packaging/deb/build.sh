@@ -12,7 +12,15 @@ SRC="$PROJECT_ROOT/src"
 PKG="$SCRIPT_DIR/nassie"
 PKGLIB="$PKG/usr/lib/nassie"
 
-cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/window_corners.py" "$SRC/anim_debug.py" "$SRC/nassie_icon.png" "$PKGLIB/"
+# gui_qt.py/tour_qt.py - the in-progress PySide6 rewrite, reachable only
+# via the explicit `nassie --gui-qt` flag (main.py never launches it by
+# default - see that file's own run_gui_qt() comment) - still shipped
+# unconditionally here, same as gui.py/tour.py, since main.py's dispatch
+# unconditionally imports whichever one the flag it got actually asked
+# for; leaving them out landed as a live ModuleNotFoundError the moment
+# `--gui-qt` was used from an installed package, not a graceful "not
+# supported here" message.
+cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/gui_qt.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/tour_qt.py" "$SRC/window_corners.py" "$SRC/anim_debug.py" "$SRC/nassie_icon.png" "$PKGLIB/"
 cp "$PROJECT_ROOT/assets/nassie_icon.png" "$PKG/usr/share/pixmaps/nassie.png"
 
 # nassie_ttk/ is a real package (theme/*.tcl, theme/*.png, sv.tcl,
