@@ -91,6 +91,14 @@ _COLORS = {
 # a plain string literal repeated three times so all four places can
 # never quietly drift apart from each other again.
 _ROW_HOVER_BG = "#d7eef2"
+# The shares tree's own tour-selection-lock guard (see its
+# _BlankClickDeselecter(self.shares_tree, guard_fn=...) call) leaves
+# these two wait_events unlocked - both are steps asking for a row
+# DIFFERENT from whatever (if anything) happens to already be selected
+# (the add-row, and the "Shares"/"Select User" free-pick steps), unlike
+# every other row-dependent step, whose wait_event means "stay on
+# whatever row an EARLIER step already had you select."
+_SHARES_TOUR_FREE_PICK_EVENTS = {"share_selected", "share_dialog_opened"}
 # gui.py's own explicit override (ttk.Style(...).configure("Treeview",
 # rowheight=36)) - takes priority over light.tcl's own font-metric-
 # derived default, so 36 is the real, final value to match.
@@ -308,16 +316,41 @@ class _BlankClickDeselecter(QObject):
     previously-selected row (and its own floating _RowActionBar) just
     stayed selected/highlighted indefinitely after clicking away from
     it - reported live, for both the shares list and the Users panel.
+
+    While guard_fn() is True (the tour uses this - see its own call
+    sites) this does more than just skip its usual deselect-on-blank-
+    click behavior: it also blocks switching selection to a DIFFERENT
+    row entirely, as long as something is already selected. Every row-
+    action tour step (New User, Attach, Permission, QR, Detach, ...)
+    implicitly depends on the row selected by an EARLIER step ("Shares")
+    staying selected - reported live, twice, testing this exact flow:
+    an accidental click on a different row mid-step left the tour's own
+    highlight/callout stuck pointing at the row action bar for whatever
+    was selected WHEN THAT STEP STARTED, not the row now actually
+    selected, with no obvious way back short of manually reselecting
+    the original row. Nothing is blocked while NOTHING is selected yet
+    (self.tree.currentItem() is None) - the "Shares" step itself still
+    needs a first, free pick of any row.
     """
 
-    def __init__(self, tree: "QTreeWidget"):
+    def __init__(self, tree: "QTreeWidget", guard_fn=None):
         super().__init__(tree)
         self.tree = tree
+        # Optional - returns True while this class's own usual behavior
+        # (deselect on blank click) should instead become the stronger
+        # "lock selection to whatever's already selected" described
+        # above.
+        self._guard_fn = guard_fn
         tree.viewport().installEventFilter(self)
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.MouseButtonPress and self.tree.itemAt(event.position().toPoint()) is None:
-            self.tree.clearSelection()
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if self._guard_fn is not None and self._guard_fn():
+                current = self.tree.currentItem()
+                if current is not None and self.tree.itemAt(event.position().toPoint()) is not current:
+                    return True
+            elif self.tree.itemAt(event.position().toPoint()) is None:
+                self.tree.clearSelection()
         return False
 
 
@@ -1072,7 +1105,10 @@ class UserManagementPanel(QWidget):
         # Qt's default auto-hide-when-not-needed policy.
         self.tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.tree.itemClicked.connect(self._on_item_clicked)
-        _BlankClickDeselecter(self.tree)
+        _BlankClickDeselecter(
+            self.tree,
+            guard_fn=lambda: self.main_window._tour is not None and self.main_window._tour._callout is not None,
+        )
         layout.addWidget(self.tree, 1)
 
         # Pinned "+" row inside the tree - matches gui.py's own
@@ -1513,7 +1549,17 @@ class MainWindow(QMainWindow):
         # parent share was collapsed and clicked open again. Re-asserts
         # it on every expand rather than trying to chase why Qt drops it.
         self.shares_tree.itemExpanded.connect(self._on_share_item_expanded)
-        _BlankClickDeselecter(self.shares_tree)
+        # See _SHARES_TOUR_FREE_PICK_EVENTS's own comment for why those
+        # two wait_events stay unlocked while every other active tour
+        # step locks selection to whatever row is already selected.
+        _BlankClickDeselecter(
+            self.shares_tree,
+            guard_fn=lambda: (
+                self._tour is not None
+                and self._tour._callout is not None
+                and self._tour._wait_event not in _SHARES_TOUR_FREE_PICK_EVENTS
+            ),
+        )
         layout.addWidget(self.shares_tree, 1)
 
         # Pinned "+" row INSIDE the tree, not a separate button below it -
