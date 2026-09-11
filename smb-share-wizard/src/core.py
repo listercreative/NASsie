@@ -882,28 +882,64 @@ class SMBWizard:
                 print(proc.stdout, end="")
             if proc.stderr:
                 print(proc.stderr, end="", file=sys.stderr)
-            return proc.returncode == 0
+            return proc.returncode
 
         try:
             if self.system == "Windows":
-                arg_str = " ".join(f'\\"{a}\\"' for a in relaunch_args)
+                # -PassThru + exit $p.ExitCode is load-bearing: plain
+                # `Start-Process -Verb RunAs -Wait` (no -PassThru) makes
+                # powershell.exe itself exit 0 the instant the elevated
+                # child exits, REGARDLESS of that child's own exit code -
+                # there's nothing else here to check. Without this,
+                # _run_capturing()'s returncode was always 0 (confirmed
+                # live: it printed "Elevated operation completed." even
+                # when the UAC prompt was cancelled outright), so
+                # "success" below was true unconditionally on Windows.
+                # The try/catch covers UAC being cancelled/denied - that
+                # raises a .NET exception INSIDE the -Command script
+                # before $p is ever assigned, not a nonzero exit on its
+                # own; 1223 is Windows' own ERROR_CANCELLED, reused here
+                # as an unambiguous sentinel distinct from a real
+                # elevated-operation failure.
+                # A REAL (unescaped) double quote around each argument -
+                # not "\"" (backslash-quote) - pre-existing bug found
+                # live: backslash-quote is the Win32 CRT's ESCAPED-quote
+                # sequence (a literal " character embedded IN an
+                # argument), not a quote-delimiter toggle, so the
+                # elevated child's sys.argv[1] came back as the 9-char
+                # string '"--apply"' (quote characters included) instead
+                # of '--apply' - failing main.py's RELAUNCH_HANDLERS
+                # lookup, printing "Unknown option" to its devnull'd
+                # stderr, and exiting 2 before ever reaching real work.
+                # Silently masked until just now by the exit-code bug
+                # fixed above (success was always True regardless), so
+                # share/user creation elevating via UAC never actually
+                # worked - confirmed live via a standalone argv dump.
+                # _ps_quote() escapes any embedded single quote so an
+                # argument can't prematurely close the surrounding PS
+                # single-quoted string below.
+                arg_str = " ".join(f'"{self._ps_quote(a)}"' for a in relaunch_args)
                 cmd = (
-                    f"Start-Process -FilePath '{relaunch_target}' "
-                    f"-ArgumentList '{arg_str}' "
-                    f"-Verb RunAs -Wait"
+                    f"try {{ $p = Start-Process -FilePath '{relaunch_target}' "
+                    f"-ArgumentList '{arg_str}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode }} "
+                    f"catch {{ exit 1223 }}"
                 )
-                success = _run_capturing(["powershell", "-Command", cmd])
+                code = _run_capturing(["powershell", "-Command", cmd])
+                if code == 1223:
+                    print("Elevation was cancelled.")
+                    return False
+                success = code == 0
 
             elif self.system == "Darwin":
                 quoted_args = " ".join(f'"{a}"' for a in relaunch_args)
                 apply_cmd = f'{relaunch_target} {quoted_args}'
                 escaped = apply_cmd.replace('\\', '\\\\').replace('"', '\\"')
                 osa_cmd = f'do shell script "{escaped}" with administrator privileges'
-                success = _run_capturing(["osascript", "-e", osa_cmd])
+                success = _run_capturing(["osascript", "-e", osa_cmd]) == 0
 
             else:  # Linux
                 if shutil.which("pkexec"):
-                    success = _run_capturing(["pkexec", relaunch_target, *relaunch_args])
+                    success = _run_capturing(["pkexec", relaunch_target, *relaunch_args]) == 0
                 else:
                     print("No GUI privilege helper (pkexec) found; falling back to a terminal sudo prompt.")
                     _run(["sudo", relaunch_target, *relaunch_args], check=True)
@@ -938,13 +974,22 @@ class SMBWizard:
         tmp_path, relaunch_target, relaunch_args = self._prepare_relaunch(arg_flag, payload)
         try:
             if self.system == "Windows":
-                arg_str = " ".join(f'\\"{a}\\"' for a in relaunch_args)
+                # See _elevated_relaunch()'s identical fix for why
+                # -PassThru + exit $p.ExitCode, and real (not
+                # backslash-escaped) quotes around each argument, are
+                # both required here too - same two bugs, same shape,
+                # just returned instead of printed.
+                arg_str = " ".join(f'"{self._ps_quote(a)}"' for a in relaunch_args)
                 cmd = (
-                    f"Start-Process -FilePath '{relaunch_target}' "
-                    f"-ArgumentList '{arg_str}' "
-                    f"-Verb RunAs -Wait"
+                    f"try {{ $p = Start-Process -FilePath '{relaunch_target}' "
+                    f"-ArgumentList '{arg_str}' -Verb RunAs -Wait -PassThru; exit $p.ExitCode }} "
+                    f"catch {{ exit 1223 }}"
                 )
                 proc = _run(["powershell", "-Command", cmd], capture_output=True, text=True)
+                output = (proc.stdout or "") + (proc.stderr or "")
+                if proc.returncode == 1223:
+                    return False, (output + "\nElevation was cancelled.")
+                return proc.returncode == 0, output
             elif self.system == "Darwin":
                 quoted_args = " ".join(f'"{a}"' for a in relaunch_args)
                 apply_cmd = f'{relaunch_target} {quoted_args}'
