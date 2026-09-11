@@ -57,15 +57,26 @@ Assert-LastExitCode "Dependency check (pip install and PyInstaller may be seeing
 # so without this the QR feature's PNG save silently fails and leaves a
 # blank dialog on screen instead of a visible error.
 #
-# gui_qt/tour_qt + --collect-all=PySide6: the in-progress PySide6
-# rewrite, reachable only via the explicit `NASsie.exe --gui-qt` flag
-# (main.py never launches it by default) - bundled into this SAME exe
-# rather than a separate build, same as gui/tour already are for the
-# default Tk path, so `--gui-qt` works out of the box with nothing
-# extra to install. Without --collect-all=PySide6, PyInstaller's static
-# analysis misses the Qt plugin DLLs (platform backend, image formats,
-# ...) it loads dynamically at runtime - confirmed live in an earlier
-# standalone test build of just the Qt GUI.
+# gui_qt/tour_qt + --collect-all=PySide6.Qt{Core,Gui,Widgets}: the
+# in-progress PySide6 rewrite, reachable only via the explicit
+# `NASsie.exe --gui-qt` flag (main.py never launches it by default) -
+# bundled into this SAME exe rather than a separate build, same as
+# gui/tour already are for the default Tk path, so `--gui-qt` works out
+# of the box with nothing extra to install. A PLAIN --collect-all=PySide6
+# (no submodule suffix, what this used to say) was tried first and
+# confirmed live to bloat NASsie.msi past 250MB - it bundles the ENTIRE
+# PySide6 package regardless of what's actually imported, QtWebEngine
+# (its own bundled Chromium), Qt3D, QtQml/QtQuick, QtMultimedia, QtPdf,
+# and dozens of language translation files included, none of which
+# gui_qt.py/tour_qt.py import (confirmed via grep - only QtCore, QtGui,
+# QtWidgets). Scoped to just those three submodules instead: each
+# --collect-all=PySide6.<X> below still pulls in that submodule's own
+# required plugin DLLs (platform backend, image formats, ...) exactly
+# the way the unscoped flag did - it's PySide6 in full that's the
+# unnecessary part, not --collect-all itself - so this should still
+# avoid the missing-plugin-DLL failure an earlier no-collect-all attempt
+# hit (see the migration plan for that), just without pulling in the
+# ~10 unrelated multi-hundred-MB modules alongside it.
 python -m PyInstaller `
   --onefile `
   --windowed `
@@ -79,7 +90,9 @@ python -m PyInstaller `
   --collect-all=rich `
   --collect-all=qrcode `
   --collect-all=PIL `
-  --collect-all=PySide6 `
+  --collect-all=PySide6.QtCore `
+  --collect-all=PySide6.QtGui `
+  --collect-all=PySide6.QtWidgets `
   --distpath $PSScriptRoot `
   --workpath (Join-Path $PSScriptRoot "build") `
   --specpath (Join-Path $PSScriptRoot "build") `
