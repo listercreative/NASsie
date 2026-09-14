@@ -1,0 +1,59 @@
+NASsie - Third-Party Notices
+=============================
+
+NASsie's own source is licensed under the MIT License (see the
+"copyright" file in smb-share-wizard/packaging/deb/nassie/usr/share/doc/nassie/,
+and License.rtf in the Windows installer).
+
+This file lists the third-party, open-source components NASsie uses and,
+where applicable, actually bundles into a distributed build. It's provided
+as a standard third-party notice, not a legal opinion - if you need a
+formal license compliance review, get one from someone qualified to give it.
+
+Scope
+-----
+- Windows (NASsie.msi / NASsie.exe): built with PyInstaller (--onefile),
+  which bundles the components below directly into the distributed
+  executable - see packaging/windows/build.ps1's --collect-all flags for
+  the exact list.
+- Linux (the .deb package): none of these are bundled into the .deb at
+  all. python3-pyside6.*, python3-rich, and python3-qrcode are installed
+  as separate apt dependencies (see the "Depends"/"Recommends" fields in
+  packaging/deb/nassie/DEBIAN/control) - apt and each package's own
+  Debian maintainer handle that packaging and its own license compliance,
+  independent of NASsie. Nothing here needs a notice on that platform.
+- macOS: no packaging currently exists (source-only).
+
+Bundled components (Windows build only)
+----------------------------------------
+
+PySide6 (Qt for Python)
+  https://www.qt.io/qt-for-python
+  License: GNU Lesser General Public License v3 (LGPLv3)
+  Copyright (C) The Qt Company Ltd. and other contributors.
+  Used unmodified, as a normal Python import - NASsie does not alter
+  PySide6/Qt's own source. LGPLv3 is specifically designed to permit
+  using the library from software under other licenses (including MIT),
+  provided the library itself isn't modified and this kind of notice is
+  given. Full license text: https://www.gnu.org/licenses/lgpl-3.0.html
+
+PyInstaller
+  https://pyinstaller.org/
+  License: GNU General Public License v2.0, with an explicit bootloader
+  exception that permits the compiled bootloader (the part actually
+  embedded in NASsie.exe) to be used in software under any license,
+  including proprietary and other permissive licenses like MIT - see
+  https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt
+
+rich
+  https://github.com/Textualize/rich
+  License: MIT License
+
+qrcode
+  https://github.com/lincolnloop/python-qrcode
+  License: BSD 3-Clause License
+
+Pillow (PIL)
+  https://python-pillow.org/
+  License: MIT-CMU (a permissive license, historically referred to as
+  HPND) - see https://github.com/python-pillow/Pillow/blob/main/LICENSE
