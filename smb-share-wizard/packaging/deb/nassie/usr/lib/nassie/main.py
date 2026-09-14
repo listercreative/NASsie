@@ -35,8 +35,19 @@ if __name__ == "__main__":
         # failure (unlike run_gui_then_tui's fallback to the TUI) - a
         # crash here should be loud during development, not silently
         # swallowed into the old GUI.
-        from gui_qt import run
-        run()
+        #
+        # Runs as a subprocess (launch_gui_qt()) rather than importing and
+        # calling gui_qt.run() directly - a native crash in PySide6's
+        # compiled bindings kills the process it runs in with no Python
+        # traceback at all, so in-process that used to take this whole
+        # invocation down silently. Out of process, the exit status is
+        # inspectable and reportable instead.
+        from core import launch_gui_qt, describe_gui_qt_failure
+        result = launch_gui_qt()
+        failure = describe_gui_qt_failure(result)
+        if failure:
+            print(failure, file=sys.stderr)
+        sys.exit(result.returncode)
 
     def run_basic_cli():
         from cli import CLIWizard
