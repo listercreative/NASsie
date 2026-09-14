@@ -5,3 +5,12 @@ Source: local build
 Files: *
 Copyright: 2026 Caden Lister <cadenlister@gmail.com>
 License: MIT
+
+Comment: This package depends on (but does not bundle) python3-pyside6.*,
+ python3-rich, and python3-qrcode via apt - see the Depends/Recommends
+ fields in this package's own control file. Their licensing (PySide6/Qt is
+ LGPLv3) and compliance is handled by their own Debian packaging, not by
+ NASsie. See THIRD-PARTY-NOTICES.txt in the NASsie source repository
+ (github.com/listercreative/NASsie) for the full list of third-party
+ components used across all platforms, including the ones actually
+ bundled into the Windows build.
