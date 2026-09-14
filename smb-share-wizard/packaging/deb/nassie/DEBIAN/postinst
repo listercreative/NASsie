@@ -10,7 +10,7 @@ if [ "$1" = "configure" ]; then
         echo
         /usr/bin/nassie < /dev/tty > /dev/tty 2> /dev/tty || true
     else
-        echo "NASsie installed. Run 'nassie' (or 'nassie --gui' for the desktop UI) to configure a share."
+        echo "NASsie installed. Run 'nassie' (or 'nassie --gui-qt' for the desktop UI) to configure a share."
     fi
 fi
 

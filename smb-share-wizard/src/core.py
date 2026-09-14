@@ -79,8 +79,8 @@ def describe_gui_qt_failure(result):
         return (
             f"The desktop Qt UI crashed ({sig_name}) with no error output of its own - "
             f"this usually means the installed PySide6 build isn't yet compatible with "
-            f"this system's Python ({platform.python_version()}). Try `nassie --gui` or "
-            f"`nassie --cli` instead until that's resolved."
+            f"this system's Python ({platform.python_version()}). Try `nassie --cli` "
+            f"instead until that's resolved."
         )
     return f"The desktop Qt UI exited with an error (code {result.returncode})."
 
@@ -842,6 +842,19 @@ class SMBWizard:
         ok, message = _validate_against(check_path, SHARE_PATH_MAX_LEN, SHARE_PATH_RE, "Path")
         if not ok:
             return False, message
+        # A path picked via Browse (QFileDialog/pick_directory_native on
+        # Qt, tkinter's filedialog before it) is always absolute - only a
+        # manually-typed one can be relative, and this is the one guard
+        # that distinguished those two entry paths until now. A relative
+        # path resolves against whatever the process's CWD happens to be
+        # at apply time (dispatch_execution()/the elevated relaunch,
+        # neither of which the user watching this dialog controls or can
+        # predict) rather than anywhere they actually chose - confirmed
+        # live: check_share_path("relative/path") returned ok=True with
+        # no warning at all, exactly the "not guarding against manual
+        # entry" gap it exists to close.
+        if not os.path.isabs(os.path.expanduser(check_path)):
+            return False, f"'{check_path}' isn't a full path - use Browse, or type a full path starting from {'a drive letter' if self.system == 'Windows' else '/'}."
         resolved = os.path.abspath(os.path.expanduser(check_path))
         if resolved in self._unsafe_share_paths():
             return False, (
@@ -1479,20 +1492,21 @@ class SMBWizard:
         # no data-loss risk in doing that automatically.
         #
         # Fail-safe by construction: any failure here (dialog can't show,
-        # tkinter unavailable, exception of any kind, user closes the
-        # window without choosing) results in no result file being written
-        # - uninstall_cleanup_windows() treats a missing/unreadable file as
-        # "delete nothing," never the reverse. A confirmation prompt that
-        # might not always work is acceptable; folders vanishing without
-        # one is not.
+        # exception of any kind, user answers No or closes the window)
+        # results in no result file being written - uninstall_cleanup_
+        # windows() treats a missing/unreadable file as "delete nothing,"
+        # never the reverse. A confirmation prompt that might not always
+        # work is acceptable; folders vanishing without one is not.
         # The tour's own "has this been seen before" marker gets deleted
         # by the separate, headless delete_tour_marker_windows() action
         # instead of here - see its own comment for why: this function's
-        # tk.Tk() call is unreliable under the execution context an
-        # uninstall's immediate custom actions run in, confirmed (via a
-        # verbose MSI log) to fail outright before ever reaching a user-
-        # visible dialog. Nothing marker-related belongs in this function
-        # since anything here can be taken down by that same failure.
+        # dialog (a tk.Tk() window originally; MessageBoxW now, see below
+        # - either way, something that shows real UI) is unreliable under
+        # the execution context an uninstall's immediate custom actions
+        # run in, confirmed (via a verbose MSI log) to fail outright
+        # before ever reaching a user-visible dialog. Nothing marker-
+        # related belongs in this function since anything here can be
+        # taken down by that same failure.
         result_path = os.path.join(tempfile.gettempdir(), SMBWizard._UNINSTALL_FOLDERS_RESULT_FILE)
         try:
             os.remove(result_path)
@@ -1505,45 +1519,40 @@ class SMBWizard:
             if not shares:
                 return
 
-            import tkinter as tk
-            from tkinter import ttk
-
-            root = tk.Tk()
-            root.title("NASsie Uninstall")
-            root.resizable(False, False)
-            root.attributes("-topmost", True)
-
-            ttk.Label(
-                root, padding=10, justify="center",
-                text="Delete these share folders and their data too?\nThis cannot be undone.",
-            ).pack()
-
-            list_frame = ttk.Frame(root, padding=(10, 0))
-            list_frame.pack()
-            checks = []
-            for s in shares:
-                var = tk.BooleanVar(value=False)
-                ttk.Checkbutton(list_frame, text=f"{s['name']}  ({s['path']})", variable=var).pack(anchor="w")
-                checks.append((var, s["path"]))
-
-            chosen = []
-
-            def on_continue():
-                chosen.extend(path for var, path in checks if var.get())
-                root.destroy()
-
-            ttk.Button(root, text="Continue Uninstall", command=on_continue).pack(pady=10)
-
-            root.update_idletasks()
-            w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-            x = (root.winfo_screenwidth() - w) // 2
-            y = (root.winfo_screenheight() - h) // 2
-            root.geometry(f"+{x}+{y}")
-            root.mainloop()
-
-            if chosen:
+            # Was a tkinter dialog with one checkbox per share (pick
+            # WHICH folders to delete) - tkinter is no longer bundled
+            # into the Windows build at all now (gui.py, its only
+            # importer, was removed entirely - see build.ps1's own
+            # --exclude-module=tkinter), so `import tkinter` here would
+            # now always raise, caught by the except below same as any
+            # other failure here, meaning this prompt could no longer
+            # run under ANY invocation path - not just the already-
+            # accepted Settings>Apps gap - and folder data would always
+            # be silently kept with no way to opt into deleting it.
+            # ctypes/MessageBoxW needs no bundled toolkit at all (same
+            # pattern already used for main.py's own crash-report
+            # dialog), so it can't fail the way tkinter just did - at
+            # the cost of per-share selection: this is one all-or-
+            # nothing Yes/No now, not a checklist. Still fails safe the
+            # same way as before (No, or any exception here, writes no
+            # result file, and uninstall_cleanup_windows() treats that
+            # as "delete nothing").
+            import ctypes
+            names = "\n".join(f"  {s['name']}  ({s['path']})" for s in shares)
+            message = (
+                "Delete these share folders and their data too? This cannot be undone.\n\n"
+                f"{names}"
+            )
+            MB_YESNO = 0x4
+            MB_ICONWARNING = 0x30
+            MB_TOPMOST = 0x40000
+            IDYES = 6
+            answer = ctypes.windll.user32.MessageBoxW(
+                0, message, "NASsie Uninstall", MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
+            )
+            if answer == IDYES:
                 with open(result_path, "w") as f:
-                    json.dump(chosen, f)
+                    json.dump([s["path"] for s in shares], f)
         except Exception as e:
             print(f"[Windows] Couldn't show folder-deletion prompt (nothing will be deleted): {e}")
 
