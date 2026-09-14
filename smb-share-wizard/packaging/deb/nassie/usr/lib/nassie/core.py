@@ -44,6 +44,18 @@ def launch_gui_qt():
     # what happened. Out of process, only this child dies, and the caller
     # can inspect its exit status and report something useful - see
     # describe_gui_qt_failure() below.
+    if getattr(sys, "frozen", False):
+        # A frozen PyInstaller build (how NASsie.exe ships on Windows -
+        # see packaging/windows/build.ps1) IS the interpreter -
+        # sys.executable is the app itself, not a general-purpose
+        # `python`, so it can't be handed a loose gui_qt.py path the way
+        # an unfrozen source run can be below (there IS no loose .py file
+        # on disk in a frozen build, hidden-imports are compiled into the
+        # executable). Relaunching itself with the internal --gui-qt-child
+        # flag re-enters this same executable instead - see main.py's own
+        # handler for that flag, deliberately separate from --gui-qt's
+        # own (this function's caller) so relaunching doesn't recurse.
+        return _run([sys.executable, "--gui-qt-child"])
     script_dir = os.path.dirname(os.path.abspath(__file__))
     gui_qt_path = os.path.join(script_dir, "gui_qt.py")
     return _run([sys.executable, gui_qt_path])
@@ -1004,6 +1016,20 @@ class SMBWizard:
         except subprocess.CalledProcessError:
             print("Elevation was cancelled or failed.")
             return False
+        except OSError as e:
+            # The elevation helper itself (powershell.exe, osascript,
+            # pkexec, sudo) failing to even launch - missing, quarantined,
+            # a broken PATH - is a different failure mode from the helper
+            # running and then failing/being cancelled
+            # (CalledProcessError above, from the sudo fallback's own
+            # check=True). Uncaught, this propagates all the way up to
+            # whatever UI called in here - on the Windows Qt default
+            # (main.py's run_gui_qt()/report_failure(), a --windowed
+            # build with devnull'd stderr) that means dying completely
+            # silently, the same failure mode report_failure() exists to
+            # prevent for the gui_qt subprocess launch itself.
+            print(f"Could not start the elevation helper: {e}")
+            return False
         finally:
             if os.path.exists(tmp_path):
                 try:
@@ -1056,6 +1082,22 @@ class SMBWizard:
                 )
             output = (proc.stdout or "") + (proc.stderr or "")
             return proc.returncode == 0, output
+        except OSError as e:
+            # The elevation helper itself (powershell.exe, osascript,
+            # pkexec) failing to even launch - missing, quarantined, a
+            # broken PATH - previously had no handling here at all
+            # (unlike _elevated_relaunch()'s own try/except for the
+            # identical failure). Uncaught, this would propagate straight
+            # into whatever curses call site is waiting on this (see
+            # tui.py's own callers, all of which unpack a plain
+            # (ok, output) tuple) while curses still owns the terminal -
+            # the same class of "an unhandled exception mid-curses leaves
+            # the terminal broken" problem already fixed elsewhere this
+            # session for the TUI-to-gui_qt handoff. Returning the same
+            # (False, output) shape every caller already expects, rather
+            # than raising, is what keeps this a normal "the operation
+            # failed" case instead of a crash.
+            return False, f"Could not start the elevation helper: {e}"
         finally:
             if os.path.exists(tmp_path):
                 try:
