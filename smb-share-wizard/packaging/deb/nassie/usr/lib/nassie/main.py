@@ -20,6 +20,12 @@ if __name__ == "__main__":
             CLIWizard().start()
 
     def run_gui_then_tui():
+        # Tk GUIWizard - kept reachable only as an explicit manual escape
+        # hatch (the --gui flag) now that Qt is the Windows production
+        # default (see the os.name == "nt" branch below) and the plan's
+        # own Phase 7 says gui.py/nassie_ttk stay in the tree, untouched
+        # beyond correctness fixes, until full parity is validated on all
+        # 3 platforms - not deleted, just no longer anyone's default.
         try:
             from gui import GUIWizard
             GUIWizard().run()
@@ -28,13 +34,13 @@ if __name__ == "__main__":
             run_tui_then_basic()
 
     def run_gui_qt():
-        # The in-progress PySide6 rewrite (see the migration plan) - not
-        # the default GUI yet. Gated behind an explicit flag rather than
-        # replacing --gui, so the shipping Tk build stays untouched while
-        # this reaches feature parity. No fallback to the Tk GUI on
+        # The Windows production default now (see the os.name == "nt"
+        # branch below) and still reachable directly via --gui-qt on
+        # every platform. Deliberately NO fallback to the Tk GUIWizard on
         # failure (unlike run_gui_then_tui's fallback to the TUI) - a
-        # crash here should be loud during development, not silently
-        # swallowed into the old GUI.
+        # crash here should be loud and visible, not silently swallowed
+        # into a different UI the user didn't ask for. See the migration
+        # plan and gui_qt.py's own module docstring for what's landed.
         #
         # Runs as a subprocess (launch_gui_qt()) rather than importing and
         # calling gui_qt.run() directly - a native crash in PySide6's
@@ -42,11 +48,45 @@ if __name__ == "__main__":
         # traceback at all, so in-process that used to take this whole
         # invocation down silently. Out of process, the exit status is
         # inspectable and reportable instead.
+        def report_failure(message):
+            print(message, file=sys.stderr)
+            if os.name == "nt":
+                # A --windowed PyInstaller build's stderr is devnull (see
+                # the top of this file) - the print() above reaches no
+                # one on the one platform this is now the default for, so
+                # the actual crash-visibility guarantee launch_gui_qt()
+                # exists to provide needs a real, visible surface here
+                # too. A native MessageBoxW needs no GUI toolkit of its
+                # own to already be working (unlike, say, a Tk or Qt
+                # dialog - PySide6 may be exactly what just failed to
+                # import), so it can't fail the same way the thing it's
+                # reporting on just did.
+                try:
+                    import ctypes
+                    ctypes.windll.user32.MessageBoxW(0, message, "NASsie", 0x10)
+                except Exception:
+                    pass
+
         from core import launch_gui_qt, describe_gui_qt_failure
-        result = launch_gui_qt()
+        try:
+            result = launch_gui_qt()
+        except OSError as e:
+            # subprocess.run() itself failing to spawn the child at all -
+            # antivirus quarantine, a corrupted/missing self-exe, a
+            # permissions issue - is a different failure mode from the
+            # child spawning and then crashing (what describe_gui_qt_
+            # failure() below handles). Without this, it would propagate
+            # all the way up through main.py's own top-level try/except
+            # (which only catches KeyboardInterrupt) and die completely
+            # silently on a --windowed build - exactly the failure mode
+            # report_failure() exists to prevent. Matches core.py's
+            # _elevated_relaunch()/_elevated_relaunch_capturing(), which
+            # now catch this same OSError spawn-failure case too.
+            report_failure(f"Could not launch the desktop UI: {e}")
+            sys.exit(1)
         failure = describe_gui_qt_failure(result)
         if failure:
-            print(failure, file=sys.stderr)
+            report_failure(failure)
         sys.exit(result.returncode)
 
     def run_basic_cli():
@@ -57,9 +97,9 @@ if __name__ == "__main__":
         print("""NASsie - cross-platform SMB share configuration wizard
 
 Usage:
-  nassie                Launch the terminal UI (TUI)
-  nassie --gui           Launch the graphical desktop UI
-  nassie --gui-qt         [dev] Launch the in-progress PySide6 GUI rewrite
+  nassie                Launch the terminal UI (TUI) - the Qt GUI on Windows
+  nassie --gui-qt        Launch the desktop UI (PySide6/Qt)
+  nassie --gui           Launch the desktop UI (Tk) - kept as a manual escape hatch
   nassie --cli           Launch the basic prompt-based wizard
   nassie --help, -h      Show this help message and exit""")
 
@@ -114,6 +154,19 @@ Usage:
             # user-facing.
             from core import SMBWizard
             SMBWizard.create_desktop_shortcut_windows()
+        elif len(sys.argv) >= 2 and sys.argv[1] == "--gui-qt-child":
+            # Internal only - the actual in-process PySide6 entry point,
+            # reached only via launch_gui_qt()'s subprocess relaunch (see
+            # core.py) on a frozen build, where sys.executable is this
+            # same app rather than a general-purpose interpreter that
+            # could be handed gui_qt.py's path directly (the unfrozen/
+            # source-install path core.py falls back to instead). Kept
+            # separate from run_gui_qt() (the public --gui-qt flag's own
+            # handler, which is what SPAWNS this) so relaunching doesn't
+            # recurse - this branch calls gui_qt.run() directly, with
+            # nothing further to relaunch. Not user-facing.
+            from gui_qt import run
+            run()
         elif len(sys.argv) >= 3 and sys.argv[1] in RELAUNCH_HANDLERS:
             from core import SMBWizard
             getattr(SMBWizard, RELAUNCH_HANDLERS[sys.argv[1]])(sys.argv[2])
@@ -139,8 +192,16 @@ Usage:
                 # has no console to attach a curses TUI to, whether it was
                 # launched by double-click or from a terminal - GUI is the
                 # only usable default here until/unless a separate
-                # console-subsystem Windows build exists.
-                run_gui_then_tui()
+                # console-subsystem Windows build exists. The Qt rewrite,
+                # not the Tk GUIWizard - Phases 1-6 are done (app shell,
+                # panels/animation, dialogs, tour, theming, packaging -
+                # see gui_qt.py's own module docstring and the migration
+                # plan) and this is the actual point of the whole
+                # rewrite: the panel-animation work that started it hit a
+                # real structural ceiling in Tk (no compositor-backed
+                # resize primitive on Windows). `--gui` still reaches Tk
+                # directly as a manual escape hatch if it's ever needed.
+                run_gui_qt()
             else:
                 run_tui_then_basic()
     except KeyboardInterrupt:

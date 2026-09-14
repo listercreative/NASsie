@@ -7,11 +7,18 @@ are never active in the same process.
 Scope landed so far: app shell (Phase 1), the shares list with a real
 sortable tree and per-share action bar, the Users/Log panels with a real
 QPropertyAnimation-driven toggle (the actual point of this migration -
-see the plan's Phase 0 proof-of-concept for why), and the core dialogs
-(Phase 2/3). NOT yet ported: the guided tour (Phase 4 - flagged as the
-highest-risk piece, deliberately deferred rather than rushed), the full
-dark-mode/QSS theme (Phase 5 - only a base light palette exists so far),
-and Qt-specific packaging (Phase 6).
+see the plan's Phase 0 proof-of-concept for why), the core dialogs
+(Phase 2/3), the guided tour (Phase 4 - see tour_qt.py), light/dark
+theming with a real toggle switch (Phase 5 - see _LIGHT_COLORS/
+_DARK_COLORS/_ThemeToggle below; deliberately a second hand-authored
+palette rather than a Qt theme library - see this session's own
+license/branding findings on PySide6-Fluent-Widgets vs qt-material vs
+keeping the existing hand-tuned QSS), and Qt-specific packaging
+(Phase 6 - both platforms already bundle/depend on PySide6, see
+packaging/windows/build.ps1 and the .deb control file). Phase 3's
+create-share/create-user mutation paths and the dark theme are both
+new/lightly-exercised - hasn't yet had a full pass on real hardware on
+all 3 platforms (see the plan's own Phase 7 gate before any Tk removal).
 """
 from __future__ import annotations
 
@@ -23,8 +30,8 @@ import platform
 import sys
 
 from PySide6.QtCore import (
-    Qt, QSize, QRect, QPropertyAnimation, QEasingCurve, QThread, Signal, QTimer, QObject, QEvent,
-    QRegularExpression, QModelIndex, QPoint,
+    Qt, QSize, QRect, QRectF, QPropertyAnimation, QEasingCurve, QThread, Signal, QTimer, QObject, QEvent,
+    QRegularExpression, QModelIndex, QPoint, Property,
 )
 from PySide6.QtGui import (
     QIcon, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator, QPainter, QPolygon,
@@ -62,11 +69,21 @@ _BASE_HEIGHT = 600
 _PANEL_WIDTH = 280
 _GLIDE_MS = 220
 
-# Exact values from nassie_ttk/theme/light.tcl's own `colors` array and
-# gui.py's own hardcoded constants - read directly from source, not
-# eyeballed off a screenshot (screenshots are for layout/spacing
-# reference only - see the migration plan's Phase 5 notes).
-_COLORS = {
+# Two full palettes rather than one _COLORS dict with dark overrides -
+# every key exists in both so a lookup can never silently fall through
+# to the wrong theme's value. Light is the exact values from
+# nassie_ttk/theme/light.tcl's own `colors` array and gui.py's own
+# hardcoded constants - read directly from source, not eyeballed off a
+# screenshot. Dark mirrors nassie_ttk/theme/dark.tcl's own `colors`
+# array the same way for the keys that theme package defines (fg/bg/
+# disfg/selfg/selbg/accent); the rest (tree_selbg, add_row_bg,
+# stripe_bg, border, row_hover_bg, row_pressed_bg, surface, the button
+# gradient stops, error_fg) are NASsie's own additions on top of that
+# ttk theme, not tracked in dark.tcl at all - chosen here to read
+# correctly against dark.tcl's #1c1c1c background rather than ported
+# from anywhere, since no prior NASsie build has ever actually shown a
+# dark desktop GUI to verify colors against a real screen.
+_LIGHT_COLORS = {
     "fg": "#1c1c1c",
     "bg": "#fafafa",
     "disfg": "#a0a0a0",
@@ -88,15 +105,66 @@ _COLORS = {
     # pressed while its panel is open" fill color.
     "toggle_pressed_bg": "#37474f",
     "border": "#d0d0d0",
+    # The single hover color the whole shares tree uses - _AddRowOverlay's
+    # own idle/hover pairing was confirmed live as the one people are
+    # actually happy with, so real row hover (_RowHoverDelegate,
+    # _SharesTree.drawBranches()) reuses this exact value instead of a
+    # second, similar-but-different one of its own.
+    "row_hover_bg": "#d7eef2",
+    "row_pressed_bg": "#c2e6ec",
+    # QLineEdit/QTreeWidget/QHeaderView field backgrounds and the
+    # QPalette Base role - a plain white surface sitting on top of the
+    # slightly-off-white window background above.
+    "surface": "#ffffff",
+    "error_fg": "#c0392b",
+    # _build_stylesheet()'s button/toolbutton gradient stops - previously
+    # hardcoded literals repeated across QToolButton/QPushButton's
+    # rest/hover/pressed states.
+    "btn_top": "#ffffff", "btn_bottom": "#ececec",
+    "btn_hover_top": "#f7f7f7", "btn_hover_bottom": "#e4e4e4",
+    "btn_pressed_top": "#dcdcdc", "btn_pressed_bottom": "#eeeeee",
+    "btn_pressed_border": "#a8a8a8",
 }
-# The single hover color the whole shares tree uses - _AddRowOverlay's
-# own idle/hover pairing (below) was confirmed live as the one people
-# are actually happy with, so real row hover (_RowHoverDelegate,
-# _SharesTree.drawBranches()) reuses this exact value instead of a
-# second, similar-but-different one of its own. One constant instead of
-# a plain string literal repeated three times so all four places can
-# never quietly drift apart from each other again.
-_ROW_HOVER_BG = "#d7eef2"
+_DARK_COLORS = {
+    "fg": "#fafafa",
+    "bg": "#1c1c1c",
+    "disfg": "#595959",
+    "selfg": "#ffffff",
+    "selbg": "#0e92ab",
+    "accent": "#5cdaf2",
+    # Same logo green as light, at slightly higher lightness so it still
+    # reads as distinct from the dark background rather than muddying
+    # into it.
+    "tree_selbg": "#5a9c46",
+    "tree_selfg": "#ffffff",
+    "add_row_bg": "#17313a",
+    "stripe_bg": "#262626",
+    # Accent teal instead of light's dark navy - light's #37474f pops
+    # against a near-white background; against dark.tcl's own #1c1c1c
+    # it would barely read as "pressed" at all, so the pressed toolbar
+    # toggle uses the same bright accent dark.tcl itself reserves for
+    # -accent instead.
+    "toggle_pressed_bg": "#0e92ab",
+    "border": "#3a3a3a",
+    "row_hover_bg": "#234047",
+    "row_pressed_bg": "#2b5560",
+    # One step lighter than "bg" - the common dark-theme convention of
+    # giving input/tree surfaces slight elevation over the window
+    # background instead of disappearing flush into it.
+    "surface": "#262626",
+    "error_fg": "#ff6b5b",
+    "btn_top": "#333333", "btn_bottom": "#262626",
+    "btn_hover_top": "#3d3d3d", "btn_hover_bottom": "#2c2c2c",
+    "btn_pressed_top": "#1a1a1a", "btn_pressed_bottom": "#333333",
+    "btn_pressed_border": "#555555",
+}
+# The live, active palette - always one of the two dicts above, MUTATED
+# in place (see _set_dark_mode()) rather than reassigned, so every
+# `_COLORS["key"]` lookup scattered through this file (evaluated at
+# call/paint time, not cached at import time) picks up a theme toggle
+# without every call site needing to re-import or re-fetch anything.
+_COLORS = dict(_LIGHT_COLORS)
+_dark_mode = False
 # The shares tree's own tour-selection-lock guard (see its
 # _BlankClickDeselecter(self.shares_tree, guard_fn=...) call) leaves
 # these two wait_events unlocked - both are steps asking for a row
@@ -112,58 +180,68 @@ _TREE_ROW_HEIGHT = 36
 
 
 def _build_stylesheet() -> str:
+    # Reads _COLORS fresh on every call (not captured at import time),
+    # so re-calling this after _set_dark_mode() mutates _COLORS in place
+    # is what actually applies a theme toggle to every QSS-driven widget
+    # in one shot.
     c = _COLORS
     return f"""
         QMainWindow, QWidget {{ background: {c['bg']}; color: {c['fg']}; }}
         QTreeWidget {{
-            background: #ffffff;
+            background: {c['surface']};
             border: 1px solid {c['border']};
             outline: none;
             selection-background-color: {c['tree_selbg']};
             selection-color: {c['tree_selfg']};
         }}
-        QTreeWidget::item {{ height: {_TREE_ROW_HEIGHT}px; outline: none; }}
+        QTreeWidget::item {{ height: {_TREE_ROW_HEIGHT}px; color: {c['fg']}; outline: none; }}
         QTreeWidget::item:selected {{ background: {c['tree_selbg']}; color: {c['tree_selfg']}; outline: none; border: none; }}
         QTreeWidget::item:focus {{ outline: none; border: none; }}
         QHeaderView::section {{
-            background: #ffffff;
+            background: {c['surface']};
+            color: {c['fg']};
             border: none;
             border-bottom: 1px solid {c['border']};
             border-right: 1px solid {c['border']};
             padding: 4px 6px;
         }}
         QToolButton {{
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #ececec);
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c['btn_top']}, stop:1 {c['btn_bottom']});
             border: 1px solid {c['border']};
             border-radius: 4px;
         }}
         QToolButton:hover {{
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f7f7f7, stop:1 #e4e4e4);
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c['btn_hover_top']}, stop:1 {c['btn_hover_bottom']});
         }}
         QToolButton:pressed {{
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #dcdcdc, stop:1 #eeeeee);
-            border-color: #a8a8a8;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c['btn_pressed_top']}, stop:1 {c['btn_pressed_bottom']});
+            border-color: {c['btn_pressed_border']};
         }}
         QToolButton:checked {{ background: {c['toggle_pressed_bg']}; border-color: {c['toggle_pressed_bg']}; }}
         QPushButton {{
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #ececec);
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c['btn_top']}, stop:1 {c['btn_bottom']});
+            color: {c['fg']};
             border: 1px solid {c['border']};
             border-radius: 4px;
             padding: 6px 10px;
         }}
         QPushButton:hover {{
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f7f7f7, stop:1 #e4e4e4);
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c['btn_hover_top']}, stop:1 {c['btn_hover_bottom']});
         }}
         QPushButton:pressed {{
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #dcdcdc, stop:1 #eeeeee);
-            border-color: #a8a8a8;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c['btn_pressed_top']}, stop:1 {c['btn_pressed_bottom']});
+            border-color: {c['btn_pressed_border']};
         }}
         QLineEdit, QComboBox, QPlainTextEdit {{
-            background: #ffffff;
+            background: {c['surface']};
+            color: {c['fg']};
             border: 1px solid {c['border']};
             border-radius: 3px;
             padding: 3px;
         }}
+        QLabel {{ color: {c['fg']}; }}
+        QMenu {{ background: {c['surface']}; color: {c['fg']}; border: 1px solid {c['border']}; }}
+        QMenu::item:selected {{ background: {c['selbg']}; color: {c['selfg']}; }}
     """
 
 
@@ -177,19 +255,25 @@ def _restripe_tree(tree: "QTreeWidget", pinned_item=None):
     # restarting the count fresh per parent.
     top_tint = QColor(_COLORS["add_row_bg"])
     child_tint = QColor(_COLORS["stripe_bg"])
-    white = QColor("#ffffff")
+    # The "un-tinted" alternate row - was a bare hardcoded "#ffffff",
+    # which is correct for light mode (it matches "surface" there) but
+    # left every other row a bright white slab inside an otherwise dark
+    # tree once dark mode existed - reading _COLORS["surface"] instead
+    # keeps it matching whatever the tree's own QSS background actually
+    # is in either theme.
+    surface = QColor(_COLORS["surface"])
     top_index = 0
     for i in range(tree.topLevelItemCount()):
         item = tree.topLevelItem(i)
         if item is pinned_item:
             continue
-        bg = top_tint if top_index % 2 == 1 else white
+        bg = top_tint if top_index % 2 == 1 else surface
         for col in range(tree.columnCount()):
             item.setBackground(col, bg)
         top_index += 1
         for j in range(item.childCount()):
             child = item.child(j)
-            cbg = child_tint if j % 2 == 0 else white
+            cbg = child_tint if j % 2 == 0 else surface
             for col in range(tree.columnCount()):
                 child.setBackground(col, cbg)
 
@@ -234,15 +318,19 @@ class _AddRowOverlay(QLabel):
     - a bare tree row gives no cursor change or visible click response
     of its own, and there is no way to tell it's a button otherwise.
     """
-    _HOVER_BG = _ROW_HOVER_BG
-    _PRESSED_BG = "#c2e6ec"
-
     def __init__(self, tree: "QTreeWidget", item: "QTreeWidgetItem", on_click):
         super().__init__(tree.viewport())
         self._tree = tree
         self._item = item
         self._on_click = on_click
+        # Read fresh per instance (not class attributes - a theme toggle
+        # recreates this overlay via _populate_shares() rather than
+        # mutating an existing one, see that function's own comment on
+        # why one can't just be kept alive across a refresh) so each new
+        # instance always reflects whichever theme is active right now.
         self._idle_bg = _COLORS["add_row_bg"]
+        self._HOVER_BG = _COLORS["row_hover_bg"]
+        self._PRESSED_BG = _COLORS["row_pressed_bg"]
         self._pressed = False
         icon = _icon("icon_add")
         if not icon.isNull():
@@ -452,8 +540,8 @@ class _RowActionBar(QWidget):
 
 
 class _RowHoverDelegate(QStyledItemDelegate):
-    """Paints a hovered, non-selected cell with _ROW_HOVER_BG instead
-    of QTreeWidget's own "::item:hover" stylesheet rule (see
+    """Paints a hovered, non-selected cell with _COLORS["row_hover_bg"]
+    instead of QTreeWidget's own "::item:hover" stylesheet rule (see
     _SharesTree.drawBranches()'s own docstring for why a plain QSS rule
     doesn't reach the branch/indent strip at all). Works by temporarily
     swapping the item's own background brush for the hover color and
@@ -473,7 +561,7 @@ class _RowHoverDelegate(QStyledItemDelegate):
         ):
             col = index.column()
             original = item.background(col)
-            item.setBackground(col, QColor(_ROW_HOVER_BG))
+            item.setBackground(col, QColor(_COLORS["row_hover_bg"]))
             opt = QStyleOptionViewItem(option)
             # Clearing the native hover flag is load-bearing - left
             # set, the style's own default paint layers ITS OWN hover
@@ -568,7 +656,7 @@ class _SharesTree(QTreeWidget):
             painter.fillRect(rect, QColor(_COLORS["tree_selbg"]))
             fg = QColor(_COLORS["tree_selfg"])
         elif index == self._hover_index:
-            painter.fillRect(rect, QColor(_ROW_HOVER_BG))
+            painter.fillRect(rect, QColor(_COLORS["row_hover_bg"]))
             fg = QColor(_COLORS["fg"])
         else:
             brush = item.background(0)
@@ -673,12 +761,160 @@ def _apply_base_palette(app: QApplication):
     palette = app.palette()
     palette.setColor(QPalette.ColorRole.Window, QColor(_COLORS["bg"]))
     palette.setColor(QPalette.ColorRole.WindowText, QColor(_COLORS["fg"]))
-    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Base, QColor(_COLORS["surface"]))
     palette.setColor(QPalette.ColorRole.Text, QColor(_COLORS["fg"]))
     palette.setColor(QPalette.ColorRole.Highlight, QColor(_COLORS["selbg"]))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor(_COLORS["selfg"]))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(_COLORS["disfg"]))
     app.setPalette(palette)
+
+
+def _set_dark_mode(dark: bool):
+    # Mutates _COLORS in place (see its own module-level comment on why
+    # in-place, not reassignment) - every `_COLORS["key"]` lookup
+    # elsewhere in this file reads fresh at call/paint time, so this
+    # alone is what a toggle needs to change. Callers are still
+    # responsible for reapplying anything that only reads _COLORS once
+    # at construction time rather than on every paint - see
+    # MainWindow._on_theme_toggled()'s own comment for the full list (the
+    # global stylesheet/palette, already-populated tree item brushes,
+    # and the add-row overlay).
+    global _dark_mode
+    _dark_mode = dark
+    _COLORS.clear()
+    _COLORS.update(_DARK_COLORS if dark else _LIGHT_COLORS)
+
+
+def _theme_pref_dir():
+    # Same %APPDATA%\NASsie / ~/.config/nassie convention tour.py's own
+    # _first_run_marker_path() uses - kept as a small self-contained copy
+    # here rather than importing that module's private helpers, matching
+    # how anim_debug.py/tty_debug.py each keep their own independent copy
+    # of this same directory-resolution logic rather than sharing one.
+    # Unlike tour.py's version, this deliberately skips the SUDO_USER
+    # real-home resolution: postinst's first-run wizard launch (the one
+    # real case that runs as root) only ever reaches gui_qt.py via
+    # --gui-qt or the TUI's "Launch Desktop UI", neither of which is
+    # postinst's own auto-launched flow (that's the plain curses TUI) -
+    # so root actually owning ~root/.config/nassie/theme_pref in the one
+    # case this ever runs elevated is the correct behavior, not a bug to
+    # route around.
+    if platform.system() == "Windows" and os.environ.get("APPDATA"):
+        return os.path.join(os.environ["APPDATA"], "NASsie")
+    return os.path.join(os.path.expanduser("~"), ".config", "nassie")
+
+
+def _theme_pref_path():
+    return os.path.join(_theme_pref_dir(), "theme_pref")
+
+
+def load_theme_preference() -> bool:
+    """True for dark, False for light (the default, and whatever a
+    missing/unreadable/corrupt file falls back to). Called from run()
+    before the QApplication/MainWindow exist at all - an unhandled
+    exception here fails the whole launch, not just the theme choice, so
+    this must degrade to the light default rather than propagate.
+    UnicodeDecodeError (a ValueError, not an OSError) is the real one to
+    catch alongside it: a torn write from two NASsie processes racing on
+    save_theme_preference() (the TUI's "Launch Desktop UI" and a
+    directly-launched --gui-qt, say) can leave invalid-UTF-8 bytes in
+    the file, which plain OSError doesn't cover."""
+    try:
+        with open(_theme_pref_path()) as f:
+            return f.read().strip() == "dark"
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def save_theme_preference(dark: bool):
+    # Best-effort - a failed save just means the next launch defaults
+    # back to light rather than a broken app.
+    path = _theme_pref_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("dark" if dark else "light")
+    except OSError:
+        pass
+
+
+class _ThemeToggle(QWidget):
+    """A sliding light/dark switch - the migration plan's own explicit
+    Phase 5 ask ("toggle-switch custom widget"), since Qt ships no stock
+    widget for this shape. QPropertyAnimation drives the thumb's slide,
+    the same compositor-backed mechanism _animate_panel() already uses
+    for the Log/Users glide - the actual reason this whole rewrite
+    exists (see the migration plan's Phase 0 note) - rather than a
+    QCheckBox with a custom style, which has no thumb position of its
+    own to animate at all.
+    """
+
+    toggled = Signal(bool)
+
+    _WIDTH = 44
+    _HEIGHT = 24
+    _MARGIN = 3
+
+    def __init__(self, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self._WIDTH, self._HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Dark mode")
+        self._checked = checked
+        self._thumb_x = self._thumb_target(checked)
+        self._anim = QPropertyAnimation(self, b"thumb_x")
+        self._anim.setDuration(150)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+
+    def _thumb_target(self, checked: bool) -> float:
+        thumb_d = self._HEIGHT - 2 * self._MARGIN
+        return float(self._WIDTH - self._MARGIN - thumb_d) if checked else float(self._MARGIN)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool, animate: bool = True):
+        if checked == self._checked:
+            return
+        self._checked = checked
+        target = self._thumb_target(checked)
+        if animate:
+            self._anim.stop()
+            self._anim.setStartValue(self._thumb_x)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self.thumb_x = target
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setChecked(not self._checked)
+            self.toggled.emit(self._checked)
+        super().mousePressEvent(event)
+
+    def _get_thumb_x(self):
+        return self._thumb_x
+
+    def _set_thumb_x(self, value):
+        self._thumb_x = value
+        self.update()
+
+    # A Qt property (not a plain attribute) - QPropertyAnimation only
+    # knows how to animate these, by name (the b"thumb_x" passed to its
+    # constructor above), calling this setter once per frame itself.
+    thumb_x = Property(float, _get_thumb_x, _set_thumb_x)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        track = QColor(_COLORS["accent"] if self._checked else _COLORS["border"])
+        painter.setBrush(track)
+        painter.drawRoundedRect(0, 0, self._WIDTH, self._HEIGHT, self._HEIGHT / 2, self._HEIGHT / 2)
+        thumb_d = self._HEIGHT - 2 * self._MARGIN
+        painter.setBrush(QColor(_COLORS["selfg"]))
+        painter.drawEllipse(QRectF(self._thumb_x, self._MARGIN, thumb_d, thumb_d))
+        painter.end()
 
 
 def _round_window_corners(window: QWidget):
@@ -1017,7 +1253,7 @@ class QrCodeDialog(QDialog):
             "on screen or let anyone photograph it who shouldn't have access."
         )
         warning.setWordWrap(True)
-        warning.setStyleSheet("color: #b00000;")
+        warning.setStyleSheet(f"color: {_COLORS['error_fg']};")
         warning.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(warning)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
@@ -1054,7 +1290,7 @@ class AddUserDialog(QDialog):
         layout.addLayout(form)
 
         self.error_label = QLabel()
-        self.error_label.setStyleSheet("color: #c0392b;")
+        self.error_label.setStyleSheet(f"color: {_COLORS['error_fg']};")
         layout.addWidget(self.error_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -1149,7 +1385,7 @@ class CreateShareDialog(QDialog):
         )
         name_layout.addWidget(self.name_entry)
         self.name_error = QLabel()
-        self.name_error.setStyleSheet("color: #c0392b;")
+        self.name_error.setStyleSheet(f"color: {_COLORS['error_fg']};")
         name_layout.addWidget(self.name_error)
         next_btn = QPushButton("Next")
         next_btn.clicked.connect(self._go_to_path_page)
@@ -1168,7 +1404,7 @@ class CreateShareDialog(QDialog):
         path_row.addWidget(browse_btn)
         path_layout.addLayout(path_row)
         self.path_error = QLabel()
-        self.path_error.setStyleSheet("color: #c0392b;")
+        self.path_error.setStyleSheet(f"color: {_COLORS['error_fg']};")
         path_layout.addWidget(self.path_error)
         buttons_row = QHBoxLayout()
         back_btn = QPushButton("Back")
@@ -1667,6 +1903,11 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(header)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        self.theme_toggle = _ThemeToggle(checked=_dark_mode)
+        self.theme_toggle.toggled.connect(self._on_theme_toggled)
+        layout.addWidget(self.theme_toggle)
+        layout.addSpacing(10)
+
         self.log_btn = self._toolbar_toggle_button("icon_log", "View Log", "log")
         layout.addWidget(self.log_btn)
 
@@ -1931,6 +2172,63 @@ class MainWindow(QMainWindow):
         # _start_tour() (see its own comment for why).
         self._tour = GuiTourQt(self)
         self._tour.start(resume_index=resume_index)
+
+    def _on_theme_toggled(self, dark: bool):
+        # _set_dark_mode() mutates _COLORS in place, which covers every
+        # `_COLORS["key"]` lookup that reads it fresh at paint/call time
+        # (see that function's own comment) - but the global stylesheet/
+        # palette and every already-populated tree item's own brush (set
+        # once, per item, back when the tree was last built - see
+        # _populate_shares()'s own item.setBackground() calls) only ever
+        # got their color at THAT moment, not on every repaint, so both
+        # need an explicit refresh here. Re-tints existing items in place
+        # via the sorters' own apply() (which calls _restripe_tree() on
+        # whatever's already in the tree) rather than refresh_all() - the
+        # first version of this called that, which re-fetches shares/
+        # groups/users from the OS on every toggle purely to repaint
+        # colors, a real (if usually small) delay for data that didn't
+        # change. self._add_share_row can still be None here if a toggle
+        # somehow lands before the very first refresh_all() (kicked off
+        # at the end of __init__) has completed its async populate -
+        # nothing to re-tint yet in that case, so this is a no-op rather
+        # than reaching into a None item.
+        _set_dark_mode(dark)
+        app = QApplication.instance()
+        _apply_base_palette(app)
+        app.setStyleSheet(_build_stylesheet())
+        save_theme_preference(dark)
+
+        if self._add_share_row is not None:
+            if self._add_share_row_overlay is not None:
+                self._add_share_row_overlay.deleteLater()
+            self._add_share_row_overlay = _attach_add_row_icon(
+                self.shares_tree, self._add_share_row, self._on_new_share
+            )
+            self._shares_sorter.apply()
+        self.shares_tree.viewport().update()
+
+        # The Users panel's own pinned "+" row has an identical overlay
+        # (UserManagementPanel._add_user_row_overlay, built the same way
+        # via _attach_add_row_icon()) with its OWN idle/hover/pressed
+        # colors captured once at construction - missed in an earlier
+        # version of this method, which only re-tinted the panel's tree
+        # rows via _sorter.apply() and left that overlay showing the old
+        # theme's colors as a mismatched square until the panel was next
+        # closed and reopened (refresh() rebuilds it fresh). Same
+        # None-guard reasoning as the shares row above - the panel may
+        # never have been opened yet, in which case there's nothing to
+        # recreate.
+        if self._panel_state["users"]:
+            if self.user_mgmt_panel._add_user_row is not None:
+                if self.user_mgmt_panel._add_user_row_overlay is not None:
+                    self.user_mgmt_panel._add_user_row_overlay.deleteLater()
+                self.user_mgmt_panel._add_user_row_overlay = _attach_add_row_icon(
+                    self.user_mgmt_panel.tree,
+                    self.user_mgmt_panel._add_user_row,
+                    self.user_mgmt_panel._on_new_user,
+                )
+            self.user_mgmt_panel._sorter.apply()
+            self.user_mgmt_panel.tree.viewport().update()
 
     # -- data refresh ---------------------------------------------------
 
@@ -2381,6 +2679,7 @@ def run():
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     app = QApplication(sys.argv)
     app.setFont(QFont(_DEFAULT_FONT_FAMILY, _DEFAULT_FONT_SIZE))
+    _set_dark_mode(load_theme_preference())
     _apply_base_palette(app)
     app.setStyleSheet(_build_stylesheet())
     win = MainWindow()
