@@ -15,6 +15,12 @@ try:
 except ImportError:
     TKINTER_AVAILABLE = False
 
+try:
+    import PySide6  # noqa: F401
+    PYSIDE6_AVAILABLE = True
+except ImportError:
+    PYSIDE6_AVAILABLE = False
+
 
 def _run(args, **kwargs):
     # A --windowed PyInstaller build has no console of its own, so any
@@ -24,6 +30,47 @@ def _run(args, **kwargs):
     if platform.system() == "Windows":
         kwargs.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
     return subprocess.run(args, **kwargs)
+
+
+def launch_gui_qt():
+    # Runs gui_qt.py as its own process rather than importing and calling
+    # run() in-process (how this worked before). A native crash inside
+    # PySide6's compiled bindings - e.g. the segfault seen live on a
+    # freshly-bumped system Python (3.14) paired with the distro's
+    # python3-pyside6 build, which prints nothing Python-visible at all,
+    # just an apport dialog - kills whatever process called into it. In
+    # process, that was the whole `nassie` invocation (the --gui-qt flag
+    # itself, or the TUI menu underneath it), with zero chance to explain
+    # what happened. Out of process, only this child dies, and the caller
+    # can inspect its exit status and report something useful - see
+    # describe_gui_qt_failure() below.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    gui_qt_path = os.path.join(script_dir, "gui_qt.py")
+    return _run([sys.executable, gui_qt_path])
+
+
+def describe_gui_qt_failure(result):
+    # None for a normal exit (closing the window exits 0, same as before).
+    # A negative returncode is POSIX subprocess's signal-death encoding
+    # (e.g. -11 = SIGSEGV) - the case a plain Python exception handler can
+    # never catch, since the interpreter itself was killed, not raised
+    # into. Windows crashes surface as a large positive code instead, so
+    # they fall through to the generic message below rather than this one.
+    if result.returncode == 0:
+        return None
+    if result.returncode < 0:
+        import signal
+        try:
+            sig_name = signal.Signals(-result.returncode).name
+        except ValueError:
+            sig_name = f"signal {-result.returncode}"
+        return (
+            f"The desktop Qt UI crashed ({sig_name}) with no error output of its own - "
+            f"this usually means the installed PySide6 build isn't yet compatible with "
+            f"this system's Python ({platform.python_version()}). Try `nassie --gui` or "
+            f"`nassie --cli` instead until that's resolved."
+        )
+    return f"The desktop Qt UI exited with an error (code {result.returncode})."
 
 
 def pick_directory_native(title):
@@ -687,12 +734,19 @@ class SMBWizard:
             return None
 
     def gui_available(self):
-        # Windows/macOS are desktop-first platforms - if tkinter imported,
+        # Gates the TUI's "Launch Desktop UI" entry, which launches
+        # gui_qt.py (PySide6) via _launch_gui_outside_curses - not the Tk
+        # GUIWizard - so this must check PySide6, not tkinter. (It used to
+        # check TKINTER_AVAILABLE, a leftover from before that call site
+        # switched from gui.py to gui_qt.py - see 7373d2e - which meant a
+        # box with PySide6 but no tkinter installed lost the menu entry
+        # entirely even though the Qt GUI would launch fine.)
+        # Windows/macOS are desktop-first platforms - if PySide6 imported,
         # assume a display exists. Linux is routinely run headless (servers,
         # containers, SSH-only boxes), so check for an actual display server
         # too - a Linux install with no desktop environment must not offer
         # to launch one.
-        if not TKINTER_AVAILABLE:
+        if not PYSIDE6_AVAILABLE:
             return False
         if self.system == "Linux":
             return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))

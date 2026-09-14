@@ -1,5 +1,5 @@
 #!/bin/sh
-# Rebuild nassie_0.1.30_all.deb from current source. Run from anywhere;
+# Rebuild nassie_0.1.31_all.deb from current source. Run from anywhere;
 # paths are resolved relative to this script's location.
 #
 # Requires: dpkg-deb (part of the base `dpkg` package on any Debian/Ubuntu
@@ -20,7 +20,7 @@ PKGLIB="$PKG/usr/lib/nassie"
 # for; leaving them out landed as a live ModuleNotFoundError the moment
 # `--gui-qt` was used from an installed package, not a graceful "not
 # supported here" message.
-cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/gui_qt.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/tour_qt.py" "$SRC/window_corners.py" "$SRC/anim_debug.py" "$SRC/nassie_icon.png" "$PKGLIB/"
+cp "$SRC/main.py" "$SRC/core.py" "$SRC/cli.py" "$SRC/gui.py" "$SRC/gui_qt.py" "$SRC/tui.py" "$SRC/tour.py" "$SRC/tour_qt.py" "$SRC/window_corners.py" "$SRC/anim_debug.py" "$SRC/tty_debug.py" "$SRC/nassie_icon.png" "$PKGLIB/"
 cp "$PROJECT_ROOT/assets/nassie_icon.png" "$PKG/usr/share/pixmaps/nassie.png"
 
 # nassie_ttk/ is a real package (theme/*.tcl, theme/*.png, sv.tcl,
@@ -55,5 +55,5 @@ chmod 644 "$PKG/DEBIAN/control" \
 chmod +x "$SCRIPT_DIR/install.sh"
 chmod 644 "$SCRIPT_DIR/preview.py"
 
-dpkg-deb --build --root-owner-group "$PKG" "$SCRIPT_DIR/nassie_0.1.30_all.deb"
-echo "Built $SCRIPT_DIR/nassie_0.1.30_all.deb"
+dpkg-deb --build --root-owner-group "$PKG" "$SCRIPT_DIR/nassie_0.1.31_all.deb"
+echo "Built $SCRIPT_DIR/nassie_0.1.31_all.deb"

@@ -6,6 +6,7 @@ import textwrap
 import threading
 
 from core import SMBWizard, QR_PASSWORD_RESET_NOTE
+import tty_debug
 
 # Block-letter "NASSIE" wordmark shown above the sea-serpent banner.
 # pyfiglet's stock "univers" font, unedited. Went through several other
@@ -308,17 +309,57 @@ class TUIWizard:
             else:
                 print("Failed to delete user (or elevation was cancelled).")
 
+    @staticmethod
+    def _reset_terminal_tracking_modes():
+        # Disables the xterm DECSET modes behind mouse tracking
+        # (1000/1002/1003, plus SGR encoding 1006 and urxvt encoding 1015)
+        # and focus-event reporting (1004). Observed live: on this
+        # terminal, curses.wrapper()'s own endwin() doesn't symmetrically
+        # undo whatever its stdscr.keypad(True) turned on (this specific
+        # terminfo entry apparently bundles mouse+focus tracking into
+        # keypad-transmit mode) - once curses exits, every mouse move or
+        # window focus change gets echoed to the tty as raw escape bytes
+        # instead of being consumed by anything, for as long as nothing
+        # explicitly turns it back off. This exit-to-subprocess path was
+        # unreachable before gui_available() started recognizing PySide6
+        # (see core.py), so it never got exercised on Linux until now.
+        tty_debug.log("sending tracking-mode reset (1000/1002/1003/1004/1006/1015 off)")
+        print("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l", end="", flush=True)
+
     def _launch_gui_outside_curses(self):
+        # Runs gui_qt.py as a subprocess (launch_gui_qt()) rather than
+        # importing and calling run() in-process - a native crash in
+        # PySide6's compiled bindings kills whatever process it runs in
+        # with no Python-visible error at all, which in-process meant
+        # taking the whole TUI down silently. Out of process, only the
+        # child dies and describe_gui_qt_failure() can explain what
+        # happened before returning to the menu.
+        #
+        # The tracking-mode reset below runs BEFORE launch_gui_qt() too,
+        # not just after - live testing showed the leak happens the
+        # instant curses hands off control, not when the subprocess exits,
+        # so a reset only in `finally` left the garbage flooding the
+        # whole time the Qt window was open.
+        print(f"(tty diagnostics: {tty_debug.path()})")
+        tty_debug.log("_launch_gui_outside_curses entered - curses has handed off control")
+        self._reset_terminal_tracking_modes()
         try:
-            from gui_qt import run
-            run()
-        except SystemExit:
-            # gui_qt.run() ends normally (the user closing its window)
-            # via its own sys.exit(app.exec()), same as any other clean
-            # process exit - not an error to report.
-            pass
+            from core import launch_gui_qt, describe_gui_qt_failure
+            tty_debug.log("launch_gui_qt() subprocess starting")
+            result = launch_gui_qt()
+            tty_debug.log(f"launch_gui_qt() subprocess returned rc={result.returncode}")
+            failure = describe_gui_qt_failure(result)
+            if failure:
+                tty_debug.log(f"describe_gui_qt_failure -> {failure!r}")
+                print(f"\n{failure}")
+                input("\nPress Enter to return to the menu...")
         except Exception as e:
+            tty_debug.log(f"exception launching desktop UI: {e!r}")
             print(f"Could not launch the desktop UI: {e}")
+            input("\nPress Enter to return to the menu...")
+        finally:
+            self._reset_terminal_tracking_modes()
+            tty_debug.log("_launch_gui_outside_curses returning to TUI menu")
 
     # ---- in-curses privileged actions (already root, or elevation that
     # doesn't need the terminal - see elevation_needs_terminal()) ----
