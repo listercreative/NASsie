@@ -10,6 +10,22 @@ if __name__ == "__main__":
         sys.stderr = open(os.devnull, "w")
 
 
+    def report_failure(message):
+        # Used by run_gui_qt() below - can fail on the one platform
+        # (--windowed Windows) where a plain print() reaches no one,
+        # since stdout/stderr are devnull (see the top of this file).
+        print(message, file=sys.stderr)
+        if os.name == "nt":
+            # A native MessageBoxW needs no GUI toolkit of its own to
+            # already be working (PySide6 may be exactly what just
+            # failed to import), so it can't fail the same way the
+            # thing it's reporting on just did.
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, message, "NASsie", 0x10)
+            except Exception:
+                pass
+
     def run_tui_then_basic():
         try:
             from tui import TUIWizard
@@ -19,28 +35,15 @@ if __name__ == "__main__":
             from cli import CLIWizard
             CLIWizard().start()
 
-    def run_gui_then_tui():
-        # Tk GUIWizard - kept reachable only as an explicit manual escape
-        # hatch (the --gui flag) now that Qt is the Windows production
-        # default (see the os.name == "nt" branch below) and the plan's
-        # own Phase 7 says gui.py/nassie_ttk stay in the tree, untouched
-        # beyond correctness fixes, until full parity is validated on all
-        # 3 platforms - not deleted, just no longer anyone's default.
-        try:
-            from gui import GUIWizard
-            GUIWizard().run()
-        except Exception as e:
-            print(f"GUI unavailable ({e}); falling back to the terminal wizard.")
-            run_tui_then_basic()
-
     def run_gui_qt():
-        # The Windows production default now (see the os.name == "nt"
-        # branch below) and still reachable directly via --gui-qt on
-        # every platform. Deliberately NO fallback to the Tk GUIWizard on
-        # failure (unlike run_gui_then_tui's fallback to the TUI) - a
-        # crash here should be loud and visible, not silently swallowed
-        # into a different UI the user didn't ask for. See the migration
-        # plan and gui_qt.py's own module docstring for what's landed.
+        # The Windows production default (see the os.name == "nt"
+        # branch below) and reachable directly via --gui-qt on every
+        # platform - the only desktop GUI now that Tk (gui.py/tour.py/
+        # nassie_ttk/window_corners.py/anim_debug.py) has been removed
+        # entirely (see the migration plan's Phase 7 and gui_qt.py's own
+        # module docstring for the phase history that led here). No
+        # fallback on failure - a crash here should be loud and visible,
+        # not silently swallowed into a different UI.
         #
         # Runs as a subprocess (launch_gui_qt()) rather than importing and
         # calling gui_qt.run() directly - a native crash in PySide6's
@@ -48,25 +51,6 @@ if __name__ == "__main__":
         # traceback at all, so in-process that used to take this whole
         # invocation down silently. Out of process, the exit status is
         # inspectable and reportable instead.
-        def report_failure(message):
-            print(message, file=sys.stderr)
-            if os.name == "nt":
-                # A --windowed PyInstaller build's stderr is devnull (see
-                # the top of this file) - the print() above reaches no
-                # one on the one platform this is now the default for, so
-                # the actual crash-visibility guarantee launch_gui_qt()
-                # exists to provide needs a real, visible surface here
-                # too. A native MessageBoxW needs no GUI toolkit of its
-                # own to already be working (unlike, say, a Tk or Qt
-                # dialog - PySide6 may be exactly what just failed to
-                # import), so it can't fail the same way the thing it's
-                # reporting on just did.
-                try:
-                    import ctypes
-                    ctypes.windll.user32.MessageBoxW(0, message, "NASsie", 0x10)
-                except Exception:
-                    pass
-
         from core import launch_gui_qt, describe_gui_qt_failure
         try:
             result = launch_gui_qt()
@@ -99,7 +83,6 @@ if __name__ == "__main__":
 Usage:
   nassie                Launch the terminal UI (TUI) - the Qt GUI on Windows
   nassie --gui-qt        Launch the desktop UI (PySide6/Qt)
-  nassie --gui           Launch the desktop UI (Tk) - kept as a manual escape hatch
   nassie --cli           Launch the basic prompt-based wizard
   nassie --help, -h      Show this help message and exit""")
 
@@ -172,7 +155,7 @@ Usage:
             getattr(SMBWizard, RELAUNCH_HANDLERS[sys.argv[1]])(sys.argv[2])
         else:
             args = sys.argv[1:]
-            recognized = {"--gui", "--gui-qt", "--cli", "--help", "-h"}
+            recognized = {"--gui-qt", "--cli", "--help", "-h"}
             unknown = [a for a in args if a not in recognized]
             if unknown:
                 print(f"Unknown option: {unknown[0]}", file=sys.stderr)
@@ -183,8 +166,6 @@ Usage:
                 print_help()
             elif "--gui-qt" in args:
                 run_gui_qt()
-            elif "--gui" in args:
-                run_gui_then_tui()
             elif "--cli" in args:
                 run_basic_cli()
             elif os.name == "nt":
@@ -192,15 +173,16 @@ Usage:
                 # has no console to attach a curses TUI to, whether it was
                 # launched by double-click or from a terminal - GUI is the
                 # only usable default here until/unless a separate
-                # console-subsystem Windows build exists. The Qt rewrite,
-                # not the Tk GUIWizard - Phases 1-6 are done (app shell,
-                # panels/animation, dialogs, tour, theming, packaging -
-                # see gui_qt.py's own module docstring and the migration
-                # plan) and this is the actual point of the whole
-                # rewrite: the panel-animation work that started it hit a
-                # real structural ceiling in Tk (no compositor-backed
-                # resize primitive on Windows). `--gui` still reaches Tk
-                # directly as a manual escape hatch if it's ever needed.
+                # console-subsystem Windows build exists. The Qt rewrite -
+                # Phases 1-6 are done (app shell, panels/animation,
+                # dialogs, tour, packaging - see gui_qt.py's own module
+                # docstring and the migration plan) and this is the
+                # actual point of the whole rewrite: the panel-animation
+                # work that started it hit a real structural ceiling in
+                # Tk (no compositor-backed resize primitive on Windows).
+                # Tk itself (gui.py/tour.py/nassie_ttk/window_corners.py/
+                # anim_debug.py) has since been removed entirely - see
+                # the migration plan's Phase 7.
                 run_gui_qt()
             else:
                 run_tui_then_basic()

@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=NASsie
 Comment=Create and manage SMB (Samba) shares
-Exec=nassie --gui
+Exec=nassie --gui-qt
 Icon=nassie
 StartupWMClass=NASsie
 Terminal=false

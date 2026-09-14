@@ -338,9 +338,19 @@ class CLIWizard(SMBWizard):
             elif selected == "Manage Users":
                 self._manage_users_screen()
             elif selected == "Launch Desktop UI":
+                # Matches tui.py's own _launch_gui_outside_curses(): runs
+                # as a subprocess (launch_gui_qt()) rather than importing
+                # and calling gui_qt.run() in-process, so a native crash
+                # in PySide6's compiled bindings kills only the child,
+                # not this whole CLI session - see that function's own
+                # comment for the full reasoning. This used to launch the
+                # now-removed Tk gui.py directly instead.
                 try:
-                    from gui import GUIWizard
-                    GUIWizard().run()
+                    from core import launch_gui_qt, describe_gui_qt_failure
+                    result = launch_gui_qt()
+                    failure = describe_gui_qt_failure(result)
+                    if failure:
+                        print(failure)
                 except Exception as e:
                     print(f"Could not launch the desktop UI: {e}")
             elif selected == "Exit":

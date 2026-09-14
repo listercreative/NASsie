@@ -5,9 +5,14 @@ state) is UI-framework-agnostic and ports conceptually intact - see the
 migration plan's own note. The persistence functions (tour_state(),
 mark_tour_started(), mark_tour_completed(), tour_progress_index(), and
 their own helpers) have zero tkinter dependency at all and are reused
-directly from tour.py rather than duplicated here - only the visual
-pieces (highlight box, callout bubble, confirmation dialog) and the
-step machine itself needed a real port.
+from tour_state.py rather than duplicated here - only the visual pieces
+(highlight box, callout bubble, confirmation dialog) and the step
+machine itself needed a real port. Originally these lived directly in
+tour.py and were imported from there, but that meant importing tour.py's
+own top-level `import tkinter` too - moved to their own module
+specifically so this file (and gui_qt.py) can use them without pulling
+tkinter into a Qt-only build at all; tour.py itself still re-exports the
+same names for gui.py's sake.
 
 Deliberately simpler than tour.py in a few places, not just translated:
 - No _ConfirmDialog port - a plain QMessageBox.question() replaces it.
@@ -38,7 +43,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialogButtonBox, QMessageBox, QApplication,
 )
 
-from tour import (
+from tour_state import (
     tour_state, mark_tour_started, mark_tour_completed, tour_progress_index,
 )
 
@@ -193,15 +198,30 @@ class _Callout(QWidget):
         inner.setStyleSheet(f"background: {_CALLOUT_BG};")
         outer.addWidget(inner)
 
+        # Matches tour.py's own pack() padding exactly - title
+        # (padx=10, pady=(10, 2)), text (padx=10, pady=(0, 8)), button
+        # row (padx=10, pady=(0, 10)) - rather than Qt's own default
+        # QVBoxLayout margins/spacing, which don't reproduce that same
+        # asymmetric top/bottom rhythm (10 before the title, a tight 2
+        # under it, a looser 8 under the body text, 10 after the
+        # button row) and read as visibly different spacing side by
+        # side with the Tk original. Explicit 0 spacing plus
+        # addSpacing() calls between widgets is what actually
+        # reproduces PER-WIDGET pady, since QVBoxLayout only offers one
+        # uniform inter-widget gap on its own.
         inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(10, 10, 10, 10)
+        inner_layout.setSpacing(0)
         title_label = QLabel(title)
         title_label.setFont(QFont(title_label.font().family(), 11, QFont.Weight.Bold))
         inner_layout.addWidget(title_label)
+        inner_layout.addSpacing(2)
 
         self.text_label = QLabel(text)
         self.text_label.setWordWrap(True)
         self.text_label.setFixedWidth(260)
         inner_layout.addWidget(self.text_label)
+        inner_layout.addSpacing(8)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)

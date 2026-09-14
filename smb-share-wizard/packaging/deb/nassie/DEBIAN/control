@@ -3,15 +3,16 @@ Version: 0.1.31
 Section: admin
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.8), python3-rich, python3-tk, python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, samba
+Depends: python3 (>= 3.8), python3-rich, python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, samba
 Recommends: policykit-1, python3-qrcode
 Maintainer: Caden Lister <cadenlister@gmail.com>
 Description: NASsie - cross-platform SMB share configuration wizard
- A terminal-UI wizard by default ('nassie'), with a graphical desktop UI
- available via 'nassie --gui', for creating and managing SMB (Samba)
- shares. Walks the user through share name, path, and
- user credentials, then applies the configuration on Linux by
- installing Samba if needed, writing the smb.conf share block,
- creating the system user, and restarting the Samba services.
+ A terminal-UI wizard by default ('nassie'), with a PySide6/Qt desktop UI
+ available via 'nassie --gui-qt' (or the TUI's/basic CLI's own "Launch
+ Desktop UI" entry), for creating and managing SMB (Samba) shares. Walks
+ the user through share name, path, and user credentials, then applies
+ the configuration on Linux by installing Samba if needed, writing the
+ smb.conf share block, creating the system user, and restarting the
+ Samba services.
  Requests root privileges via a native polkit (pkexec) prompt when
  not already run as root, falling back to a terminal sudo prompt.

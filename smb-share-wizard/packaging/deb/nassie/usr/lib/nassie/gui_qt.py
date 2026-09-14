@@ -1,24 +1,31 @@
-"""PySide6 (Qt) rewrite of the GUI - in progress, not the shipping default.
-See the migration plan (C:\\Users\\caden\\.claude\\plans\\pure-leaping-lamport.md)
-for full context and phasing. Launched via `nassie --gui-qt`, entirely
-separate from gui.py's Tk GUIWizard - the two share no runtime state and
-are never active in the same process.
+"""PySide6 (Qt) rewrite of the GUI - now the only desktop GUI NASsie
+has. Windows production default (see main.py's os.name == "nt" branch),
+also reachable via `nassie --gui-qt` or the TUI's own "Launch Desktop
+UI" entry. The original Tk GUIWizard (gui.py), its tour classes
+(tour.py), theme package (nassie_ttk/), and Windows/Linux window-chrome
+helpers (window_corners.py, anim_debug.py) were removed entirely per
+the migration plan's Phase 7, once real hardware testing (this session)
+found no reason left to keep them as a fallback - many comments in this
+file still say "matches gui.py's own ..." for historical context on
+design decisions ported from it, even though that file no longer exists.
 
 Scope landed so far: app shell (Phase 1), the shares list with a real
 sortable tree and per-share action bar, the Users/Log panels with a real
 QPropertyAnimation-driven toggle (the actual point of this migration -
 see the plan's Phase 0 proof-of-concept for why), the core dialogs
-(Phase 2/3), the guided tour (Phase 4 - see tour_qt.py), light/dark
-theming with a real toggle switch (Phase 5 - see _LIGHT_COLORS/
-_DARK_COLORS/_ThemeToggle below; deliberately a second hand-authored
-palette rather than a Qt theme library - see this session's own
-license/branding findings on PySide6-Fluent-Widgets vs qt-material vs
-keeping the existing hand-tuned QSS), and Qt-specific packaging
-(Phase 6 - both platforms already bundle/depend on PySide6, see
-packaging/windows/build.ps1 and the .deb control file). Phase 3's
-create-share/create-user mutation paths and the dark theme are both
-new/lightly-exercised - hasn't yet had a full pass on real hardware on
-all 3 platforms (see the plan's own Phase 7 gate before any Tk removal).
+(Phase 2/3), the guided tour (Phase 4 - see tour_qt.py), and packaging
+(Phase 6 - Windows bundles PySide6 via PyInstaller, excluding Tk
+entirely; Linux depends on python3-pyside6.* via apt - see
+packaging/windows/build.ps1 and the .deb control file). Phase 5
+(theming) was tried as a real light/dark toggle with a second hand-
+authored palette, but pulled after live testing on real hardware showed
+only the header background actually followed the toggle - text stayed
+the same color regardless - and it wasn't worth chasing further; back
+to the single light palette below. Phase 3's create-share/create-user
+mutation paths are still lightly-exercised - reviewed against core.py's
+API but not yet clicked through live. macOS is no longer a target
+platform at all (product decision, unrelated to any of the above), so
+Windows and Linux are the only ones that matter for validating this.
 """
 from __future__ import annotations
 
@@ -30,8 +37,8 @@ import platform
 import sys
 
 from PySide6.QtCore import (
-    Qt, QSize, QRect, QRectF, QPropertyAnimation, QEasingCurve, QThread, Signal, QTimer, QObject, QEvent,
-    QRegularExpression, QModelIndex, QPoint, Property,
+    Qt, QSize, QRect, QPropertyAnimation, QEasingCurve, QThread, Signal, QTimer, QObject, QEvent,
+    QRegularExpression, QModelIndex, QPoint,
 )
 from PySide6.QtGui import (
     QIcon, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator, QPainter, QPolygon,
@@ -46,14 +53,18 @@ from PySide6.QtWidgets import (
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core import SMBWizard, QR_PASSWORD_RESET_NOTE, pick_directory_native, SHARE_NAME_MAX_LEN, SHARE_NAME_RE
-from tour import tour_state, mark_tour_completed, tour_progress_index
+from tour_state import tour_state, mark_tour_completed, tour_progress_index
 from tour_qt import GuiTourQt
 # _XRectangle/install_scoped_x_error_handler: pure ctypes/X11 plumbing,
-# no Tk involved despite living in window_corners.py - reused as-is by
-# _round_linux_bottom() below rather than redefined, see that function's
-# own docstring for why a second, Qt-specific X11 Shape port is needed
-# at all instead of just calling window_corners.apply() directly.
-from window_corners import _XRectangle, install_scoped_x_error_handler
+# reused as-is by _round_linux_bottom() below rather than redefined, see
+# that function's own docstring for why a second, Qt-specific X11 Shape
+# port is needed at all instead of just calling window_corners.apply()
+# directly. Imported from x11_error_handler.py, not window_corners.py
+# (which still re-exports the same names for gui.py's sake) - that file
+# has its own unconditional `import tkinter`, which would otherwise
+# drag the whole Tcl/Tk runtime into a Qt-only build for two names that
+# have never actually needed it.
+from x11_error_handler import _XRectangle, install_scoped_x_error_handler
 
 # ---------------------------------------------------------------------------
 # Constants - queried/measured live from this machine's real Tk app rather
@@ -69,21 +80,14 @@ _BASE_HEIGHT = 600
 _PANEL_WIDTH = 280
 _GLIDE_MS = 220
 
-# Two full palettes rather than one _COLORS dict with dark overrides -
-# every key exists in both so a lookup can never silently fall through
-# to the wrong theme's value. Light is the exact values from
-# nassie_ttk/theme/light.tcl's own `colors` array and gui.py's own
-# hardcoded constants - read directly from source, not eyeballed off a
-# screenshot. Dark mirrors nassie_ttk/theme/dark.tcl's own `colors`
-# array the same way for the keys that theme package defines (fg/bg/
-# disfg/selfg/selbg/accent); the rest (tree_selbg, add_row_bg,
-# stripe_bg, border, row_hover_bg, row_pressed_bg, surface, the button
-# gradient stops, error_fg) are NASsie's own additions on top of that
-# ttk theme, not tracked in dark.tcl at all - chosen here to read
-# correctly against dark.tcl's #1c1c1c background rather than ported
-# from anywhere, since no prior NASsie build has ever actually shown a
-# dark desktop GUI to verify colors against a real screen.
-_LIGHT_COLORS = {
+# Exact values from nassie_ttk/theme/light.tcl's own `colors` array and
+# gui.py's own hardcoded constants - read directly from source, not
+# eyeballed off a screenshot. A dark variant was built and shipped
+# briefly (Phase 5) but pulled after live testing showed text wasn't
+# reliably picking up the dark palette - only the header background
+# actually changed - and it wasn't worth chasing further; light-only,
+# same as gui.py's Tk build has always been.
+_COLORS = {
     "fg": "#1c1c1c",
     "bg": "#fafafa",
     "disfg": "#a0a0a0",
@@ -125,46 +129,6 @@ _LIGHT_COLORS = {
     "btn_pressed_top": "#dcdcdc", "btn_pressed_bottom": "#eeeeee",
     "btn_pressed_border": "#a8a8a8",
 }
-_DARK_COLORS = {
-    "fg": "#fafafa",
-    "bg": "#1c1c1c",
-    "disfg": "#595959",
-    "selfg": "#ffffff",
-    "selbg": "#0e92ab",
-    "accent": "#5cdaf2",
-    # Same logo green as light, at slightly higher lightness so it still
-    # reads as distinct from the dark background rather than muddying
-    # into it.
-    "tree_selbg": "#5a9c46",
-    "tree_selfg": "#ffffff",
-    "add_row_bg": "#17313a",
-    "stripe_bg": "#262626",
-    # Accent teal instead of light's dark navy - light's #37474f pops
-    # against a near-white background; against dark.tcl's own #1c1c1c
-    # it would barely read as "pressed" at all, so the pressed toolbar
-    # toggle uses the same bright accent dark.tcl itself reserves for
-    # -accent instead.
-    "toggle_pressed_bg": "#0e92ab",
-    "border": "#3a3a3a",
-    "row_hover_bg": "#234047",
-    "row_pressed_bg": "#2b5560",
-    # One step lighter than "bg" - the common dark-theme convention of
-    # giving input/tree surfaces slight elevation over the window
-    # background instead of disappearing flush into it.
-    "surface": "#262626",
-    "error_fg": "#ff6b5b",
-    "btn_top": "#333333", "btn_bottom": "#262626",
-    "btn_hover_top": "#3d3d3d", "btn_hover_bottom": "#2c2c2c",
-    "btn_pressed_top": "#1a1a1a", "btn_pressed_bottom": "#333333",
-    "btn_pressed_border": "#555555",
-}
-# The live, active palette - always one of the two dicts above, MUTATED
-# in place (see _set_dark_mode()) rather than reassigned, so every
-# `_COLORS["key"]` lookup scattered through this file (evaluated at
-# call/paint time, not cached at import time) picks up a theme toggle
-# without every call site needing to re-import or re-fetch anything.
-_COLORS = dict(_LIGHT_COLORS)
-_dark_mode = False
 # The shares tree's own tour-selection-lock guard (see its
 # _BlankClickDeselecter(self.shares_tree, guard_fn=...) call) leaves
 # these two wait_events unlocked - both are steps asking for a row
@@ -180,10 +144,6 @@ _TREE_ROW_HEIGHT = 36
 
 
 def _build_stylesheet() -> str:
-    # Reads _COLORS fresh on every call (not captured at import time),
-    # so re-calling this after _set_dark_mode() mutates _COLORS in place
-    # is what actually applies a theme toggle to every QSS-driven widget
-    # in one shot.
     c = _COLORS
     return f"""
         QMainWindow, QWidget {{ background: {c['bg']}; color: {c['fg']}; }}
@@ -769,154 +729,6 @@ def _apply_base_palette(app: QApplication):
     app.setPalette(palette)
 
 
-def _set_dark_mode(dark: bool):
-    # Mutates _COLORS in place (see its own module-level comment on why
-    # in-place, not reassignment) - every `_COLORS["key"]` lookup
-    # elsewhere in this file reads fresh at call/paint time, so this
-    # alone is what a toggle needs to change. Callers are still
-    # responsible for reapplying anything that only reads _COLORS once
-    # at construction time rather than on every paint - see
-    # MainWindow._on_theme_toggled()'s own comment for the full list (the
-    # global stylesheet/palette, already-populated tree item brushes,
-    # and the add-row overlay).
-    global _dark_mode
-    _dark_mode = dark
-    _COLORS.clear()
-    _COLORS.update(_DARK_COLORS if dark else _LIGHT_COLORS)
-
-
-def _theme_pref_dir():
-    # Same %APPDATA%\NASsie / ~/.config/nassie convention tour.py's own
-    # _first_run_marker_path() uses - kept as a small self-contained copy
-    # here rather than importing that module's private helpers, matching
-    # how anim_debug.py/tty_debug.py each keep their own independent copy
-    # of this same directory-resolution logic rather than sharing one.
-    # Unlike tour.py's version, this deliberately skips the SUDO_USER
-    # real-home resolution: postinst's first-run wizard launch (the one
-    # real case that runs as root) only ever reaches gui_qt.py via
-    # --gui-qt or the TUI's "Launch Desktop UI", neither of which is
-    # postinst's own auto-launched flow (that's the plain curses TUI) -
-    # so root actually owning ~root/.config/nassie/theme_pref in the one
-    # case this ever runs elevated is the correct behavior, not a bug to
-    # route around.
-    if platform.system() == "Windows" and os.environ.get("APPDATA"):
-        return os.path.join(os.environ["APPDATA"], "NASsie")
-    return os.path.join(os.path.expanduser("~"), ".config", "nassie")
-
-
-def _theme_pref_path():
-    return os.path.join(_theme_pref_dir(), "theme_pref")
-
-
-def load_theme_preference() -> bool:
-    """True for dark, False for light (the default, and whatever a
-    missing/unreadable/corrupt file falls back to). Called from run()
-    before the QApplication/MainWindow exist at all - an unhandled
-    exception here fails the whole launch, not just the theme choice, so
-    this must degrade to the light default rather than propagate.
-    UnicodeDecodeError (a ValueError, not an OSError) is the real one to
-    catch alongside it: a torn write from two NASsie processes racing on
-    save_theme_preference() (the TUI's "Launch Desktop UI" and a
-    directly-launched --gui-qt, say) can leave invalid-UTF-8 bytes in
-    the file, which plain OSError doesn't cover."""
-    try:
-        with open(_theme_pref_path()) as f:
-            return f.read().strip() == "dark"
-    except (OSError, UnicodeDecodeError):
-        return False
-
-
-def save_theme_preference(dark: bool):
-    # Best-effort - a failed save just means the next launch defaults
-    # back to light rather than a broken app.
-    path = _theme_pref_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            f.write("dark" if dark else "light")
-    except OSError:
-        pass
-
-
-class _ThemeToggle(QWidget):
-    """A sliding light/dark switch - the migration plan's own explicit
-    Phase 5 ask ("toggle-switch custom widget"), since Qt ships no stock
-    widget for this shape. QPropertyAnimation drives the thumb's slide,
-    the same compositor-backed mechanism _animate_panel() already uses
-    for the Log/Users glide - the actual reason this whole rewrite
-    exists (see the migration plan's Phase 0 note) - rather than a
-    QCheckBox with a custom style, which has no thumb position of its
-    own to animate at all.
-    """
-
-    toggled = Signal(bool)
-
-    _WIDTH = 44
-    _HEIGHT = 24
-    _MARGIN = 3
-
-    def __init__(self, checked: bool = False, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(self._WIDTH, self._HEIGHT)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Dark mode")
-        self._checked = checked
-        self._thumb_x = self._thumb_target(checked)
-        self._anim = QPropertyAnimation(self, b"thumb_x")
-        self._anim.setDuration(150)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-
-    def _thumb_target(self, checked: bool) -> float:
-        thumb_d = self._HEIGHT - 2 * self._MARGIN
-        return float(self._WIDTH - self._MARGIN - thumb_d) if checked else float(self._MARGIN)
-
-    def isChecked(self) -> bool:
-        return self._checked
-
-    def setChecked(self, checked: bool, animate: bool = True):
-        if checked == self._checked:
-            return
-        self._checked = checked
-        target = self._thumb_target(checked)
-        if animate:
-            self._anim.stop()
-            self._anim.setStartValue(self._thumb_x)
-            self._anim.setEndValue(target)
-            self._anim.start()
-        else:
-            self.thumb_x = target
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.setChecked(not self._checked)
-            self.toggled.emit(self._checked)
-        super().mousePressEvent(event)
-
-    def _get_thumb_x(self):
-        return self._thumb_x
-
-    def _set_thumb_x(self, value):
-        self._thumb_x = value
-        self.update()
-
-    # A Qt property (not a plain attribute) - QPropertyAnimation only
-    # knows how to animate these, by name (the b"thumb_x" passed to its
-    # constructor above), calling this setter once per frame itself.
-    thumb_x = Property(float, _get_thumb_x, _set_thumb_x)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setPen(Qt.PenStyle.NoPen)
-        track = QColor(_COLORS["accent"] if self._checked else _COLORS["border"])
-        painter.setBrush(track)
-        painter.drawRoundedRect(0, 0, self._WIDTH, self._HEIGHT, self._HEIGHT / 2, self._HEIGHT / 2)
-        thumb_d = self._HEIGHT - 2 * self._MARGIN
-        painter.setBrush(QColor(_COLORS["selfg"]))
-        painter.drawEllipse(QRectF(self._thumb_x, self._MARGIN, thumb_d, thumb_d))
-        painter.end()
-
-
 def _round_window_corners(window: QWidget):
     # Confirmed in the migration plan: not Tk-specific, operates on a raw
     # HWND. Ports by swapping just the HWND-resolution helper to
@@ -1160,6 +972,26 @@ class _Worker(QThread):
         except Exception as e:
             buffer.write(f"\nUnexpected error: {e}\n")
         self.done.emit(result, buffer.getvalue())
+
+
+def _fetch_failed(result, log_output) -> bool:
+    """True when a _Worker's (result, log_output) pair means its target
+    function raised, not that it legitimately returned something empty/
+    falsy - run() above only ever leaves `result` at its None default
+    and writes "Unexpected error: " into the log on an actual exception,
+    which a list/dict-returning wizard call (list_users(), list_shares(),
+    _fetch_all(), ...) should never do on its own successful empty case
+    (those return [] or {}, not None).
+
+    Exists because several callbacks below used to conflate the two:
+    treating a failed list_users()/list_shares() fetch as if it had
+    legitimately come back empty, then reporting an unrelated, wrong
+    business-logic message ("everyone already has access", "doesn't
+    have access to any share yet", ...) instead of the fetch actually
+    having failed - or, worse, just silently doing nothing at all
+    (_apply_all() on a failed refresh_all(), previously). Callers use
+    this to tell the two apart and show an honest error instead."""
+    return result is None and "Unexpected error:" in log_output
 
 
 # ---------------------------------------------------------------------------
@@ -1497,7 +1329,14 @@ class CreateShareDialog(QDialog):
     def _on_create_finished(self, created, log_output):
         self.create_btn.setEnabled(True)
         self._on_done(self.wizard.share_name if created else None, log_output)
-        self.accept()
+        if created:
+            self.accept()
+        # On failure, stays open instead of closing out from under the
+        # error message box _on_done() just showed - closing unconditio-
+        # nally here meant retrying after a fixable problem (a bad path,
+        # a transient permission issue) meant re-typing the share name,
+        # path, and every user from scratch instead of just fixing the
+        # one thing that failed and clicking Create again.
 
 
 # ---------------------------------------------------------------------------
@@ -1581,6 +1420,15 @@ class UserManagementPanel(QWidget):
         worker.start()
 
     def _apply_users(self, users, log_output):
+        if _fetch_failed(users, log_output):
+            # Previously rendered as a silent, indistinguishable-from-
+            # genuinely-empty user list (users or [] swallowed the
+            # None) - showing nobody has any account at all reads as a
+            # far more alarming, and wrong, state than "the fetch just
+            # failed, try reopening the panel."
+            self.main_window.log_panel.append(log_output)
+            self.main_window._toast("Could not load the user list - see the log.")
+            return
         self.tree.clear()
         self._add_user_row = _make_add_row()
         self.tree.addTopLevelItem(self._add_user_row)
@@ -1618,11 +1466,21 @@ class UserManagementPanel(QWidget):
         # overwriting a real person's login password. Matches gui.py's
         # _create_new_user(), which validates against the same full list.
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log: self._show_new_user_dialog(users))
+        worker.done.connect(lambda users, log: self._show_new_user_dialog(users, log))
         self.main_window._keep_alive(worker)
         worker.start()
 
-    def _show_new_user_dialog(self, users):
+    def _show_new_user_dialog(self, users, log_output=""):
+        if _fetch_failed(users, log_output):
+            # This list IS the uniqueness check the comment above
+            # explains at length - silently proceeding with an empty
+            # `existing` set on a failed fetch would let a name collide
+            # with an unlisted real account straight through, the exact
+            # thing that check exists to prevent. Refuse instead of
+            # guessing.
+            self.main_window.log_panel.append(log_output)
+            QMessageBox.critical(self, "New User", f"Could not check existing accounts - try again.\n\n{log_output.strip()}")
+            return
         existing = {u.get("username") for u in users or []}
         dialog = AddUserDialog(self, existing, show_access_level=False)
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result_data:
@@ -1651,11 +1509,20 @@ class UserManagementPanel(QWidget):
         # username.
         username = items[0].text(0).split(" (")[0]
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, u=username: self._confirm_delete_user(u, users))
+        worker.done.connect(lambda users, log, u=username: self._confirm_delete_user(u, users, log))
         self.main_window._keep_alive(worker)
         worker.start()
 
-    def _confirm_delete_user(self, username, users):
+    def _confirm_delete_user(self, username, users, log_output=""):
+        if _fetch_failed(users, log_output):
+            # Distinct from "not managed by NASsie" just below - an
+            # earlier version of this treated a failed list_users() the
+            # same as a real answer of "not NASsie's account", telling
+            # the user something false and unrelated to what actually
+            # went wrong.
+            self.main_window.log_panel.append(log_output)
+            QMessageBox.critical(self, "Delete User", f"Could not check '{username}''s status.\n\n{log_output.strip()}")
+            return
         user = next((u for u in users or [] if u.get("username") == username), None)
         if not (user and user.get("managed", False)):
             # Never delete an account NASsie didn't create - matches
@@ -1692,11 +1559,18 @@ class UserManagementPanel(QWidget):
             return
         username = items[0].text(0).split(" (")[0]
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, u=username: self._change_password_flow(u, users))
+        worker.done.connect(lambda users, log, u=username: self._change_password_flow(u, users, log))
         self.main_window._keep_alive(worker)
         worker.start()
 
-    def _change_password_flow(self, username, users):
+    def _change_password_flow(self, username, users, log_output=""):
+        if _fetch_failed(users, log_output):
+            # Distinct from "has no share access yet" just below - a
+            # failed list_users() used to be reported as if it were
+            # that legitimate, unrelated state.
+            self.main_window.log_panel.append(log_output)
+            QMessageBox.critical(self, "Change Password", f"Could not check '{username}''s current shares.\n\n{log_output.strip()}")
+            return
         user = next((u for u in users or [] if u.get("username") == username), None)
         shares = (user or {}).get("shares", [])
         if not shares:
@@ -1902,11 +1776,6 @@ class MainWindow(QMainWindow):
         header.setFixedHeight(56)
         layout = QHBoxLayout(header)
         layout.setContentsMargins(0, 0, 0, 0)
-
-        self.theme_toggle = _ThemeToggle(checked=_dark_mode)
-        self.theme_toggle.toggled.connect(self._on_theme_toggled)
-        layout.addWidget(self.theme_toggle)
-        layout.addSpacing(10)
 
         self.log_btn = self._toolbar_toggle_button("icon_log", "View Log", "log")
         layout.addWidget(self.log_btn)
@@ -2173,63 +2042,6 @@ class MainWindow(QMainWindow):
         self._tour = GuiTourQt(self)
         self._tour.start(resume_index=resume_index)
 
-    def _on_theme_toggled(self, dark: bool):
-        # _set_dark_mode() mutates _COLORS in place, which covers every
-        # `_COLORS["key"]` lookup that reads it fresh at paint/call time
-        # (see that function's own comment) - but the global stylesheet/
-        # palette and every already-populated tree item's own brush (set
-        # once, per item, back when the tree was last built - see
-        # _populate_shares()'s own item.setBackground() calls) only ever
-        # got their color at THAT moment, not on every repaint, so both
-        # need an explicit refresh here. Re-tints existing items in place
-        # via the sorters' own apply() (which calls _restripe_tree() on
-        # whatever's already in the tree) rather than refresh_all() - the
-        # first version of this called that, which re-fetches shares/
-        # groups/users from the OS on every toggle purely to repaint
-        # colors, a real (if usually small) delay for data that didn't
-        # change. self._add_share_row can still be None here if a toggle
-        # somehow lands before the very first refresh_all() (kicked off
-        # at the end of __init__) has completed its async populate -
-        # nothing to re-tint yet in that case, so this is a no-op rather
-        # than reaching into a None item.
-        _set_dark_mode(dark)
-        app = QApplication.instance()
-        _apply_base_palette(app)
-        app.setStyleSheet(_build_stylesheet())
-        save_theme_preference(dark)
-
-        if self._add_share_row is not None:
-            if self._add_share_row_overlay is not None:
-                self._add_share_row_overlay.deleteLater()
-            self._add_share_row_overlay = _attach_add_row_icon(
-                self.shares_tree, self._add_share_row, self._on_new_share
-            )
-            self._shares_sorter.apply()
-        self.shares_tree.viewport().update()
-
-        # The Users panel's own pinned "+" row has an identical overlay
-        # (UserManagementPanel._add_user_row_overlay, built the same way
-        # via _attach_add_row_icon()) with its OWN idle/hover/pressed
-        # colors captured once at construction - missed in an earlier
-        # version of this method, which only re-tinted the panel's tree
-        # rows via _sorter.apply() and left that overlay showing the old
-        # theme's colors as a mismatched square until the panel was next
-        # closed and reopened (refresh() rebuilds it fresh). Same
-        # None-guard reasoning as the shares row above - the panel may
-        # never have been opened yet, in which case there's nothing to
-        # recreate.
-        if self._panel_state["users"]:
-            if self.user_mgmt_panel._add_user_row is not None:
-                if self.user_mgmt_panel._add_user_row_overlay is not None:
-                    self.user_mgmt_panel._add_user_row_overlay.deleteLater()
-                self.user_mgmt_panel._add_user_row_overlay = _attach_add_row_icon(
-                    self.user_mgmt_panel.tree,
-                    self.user_mgmt_panel._add_user_row,
-                    self.user_mgmt_panel._on_new_user,
-                )
-            self.user_mgmt_panel._sorter.apply()
-            self.user_mgmt_panel.tree.viewport().update()
-
     # -- data refresh ---------------------------------------------------
 
     def refresh_all(self):
@@ -2246,6 +2058,18 @@ class MainWindow(QMainWindow):
 
     def _apply_all(self, data, log_output):
         if not data:
+            # refresh_all() runs after every single mutation (create/
+            # delete share, grant/revoke/change access, ...), so a
+            # silent return here - the original behavior - meant a
+            # failed post-mutation refresh gave zero indication anything
+            # was wrong: the tree just quietly stayed stale, with no way
+            # to tell "my last action didn't work" from "the refresh
+            # after it didn't." _fetch_failed() distinguishes that from
+            # a genuinely empty result (there IS no other way _fetch_all
+            # returns falsy - it always builds a dict).
+            if _fetch_failed(data, log_output):
+                self.log_panel.append(log_output)
+                self._toast("Could not refresh the shares list - see the log.")
             return
         self._populate_shares(data["shares"])
         if self._panel_state["users"]:
@@ -2448,11 +2272,19 @@ class MainWindow(QMainWindow):
         if not share:
             return
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, s=share: self._show_grant_new_user_dialog(s, users))
+        worker.done.connect(lambda users, log, s=share: self._show_grant_new_user_dialog(s, users, log))
         self._keep_alive(worker)
         worker.start()
 
-    def _show_grant_new_user_dialog(self, share, users):
+    def _show_grant_new_user_dialog(self, share, users, log_output=""):
+        if _fetch_failed(users, log_output):
+            # Same reasoning as _show_new_user_dialog() - this list IS
+            # the uniqueness check the comment below explains; silently
+            # proceeding on a failed fetch defeats it rather than just
+            # failing to show it.
+            self.log_panel.append(log_output)
+            QMessageBox.critical(self, "New User", f"Could not check existing accounts - try again.\n\n{log_output.strip()}")
+            return
         # Real existing-username set, not empty - matches gui.py's
         # _new_user_for_selected_share(): without this, AddUserDialog's
         # own uniqueness check can't catch a typed name that collides
@@ -2485,7 +2317,7 @@ class MainWindow(QMainWindow):
         if not share:
             return
         worker = _Worker(self._fetch_attach_candidates, share)
-        worker.done.connect(lambda result, log, s=share: self._enter_attach_mode(s, result))
+        worker.done.connect(lambda result, log, s=share: self._enter_attach_mode(s, result, log))
         self._keep_alive(worker)
         worker.start()
 
@@ -2495,7 +2327,15 @@ class MainWindow(QMainWindow):
         already = {u["username"] for u in (share_data or {}).get("users", [])}
         return [u for u in self.wizard.list_users() if u["username"] not in already]
 
-    def _enter_attach_mode(self, share, candidates):
+    def _enter_attach_mode(self, share, candidates, log_output=""):
+        if _fetch_failed(candidates, log_output):
+            # Distinct from the "every candidate already has access"
+            # case just below - conflating the two (an earlier version
+            # of this did, via a bare `if not candidates:`) told the
+            # user the wrong thing outright on a genuine fetch failure.
+            self.log_panel.append(log_output)
+            QMessageBox.critical(self, "Attach User", f"Could not check who's available to attach.\n\n{log_output.strip()}")
+            return
         if not candidates:
             QMessageBox.information(self, "Attach User", "Every existing user already has access to this share.")
             return
@@ -2679,7 +2519,6 @@ def run():
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     app = QApplication(sys.argv)
     app.setFont(QFont(_DEFAULT_FONT_FAMILY, _DEFAULT_FONT_SIZE))
-    _set_dark_mode(load_theme_preference())
     _apply_base_palette(app)
     app.setStyleSheet(_build_stylesheet())
     win = MainWindow()
