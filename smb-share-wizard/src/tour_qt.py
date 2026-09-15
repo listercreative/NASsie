@@ -1,10 +1,10 @@
 """Guided first-run tour - PySide6 port of tour.py's GuiTour.
 
-The step-machine design (event-driven advancement, resumable-via-disk
+The step-machine design (event-driven advancement, restart-on-resume
 state) is UI-framework-agnostic and ports conceptually intact - see the
 migration plan's own note. The persistence functions (tour_state(),
-mark_tour_started(), mark_tour_completed(), tour_progress_index(), and
-their own helpers) have zero tkinter dependency at all and are reused
+mark_tour_started(), mark_tour_completed(), and their own helpers) have
+zero tkinter dependency at all and are reused
 from tour_state.py rather than duplicated here - only the visual pieces
 (highlight box, callout bubble, confirmation dialog) and the step
 machine itself needed a real port. Originally these lived directly in
@@ -43,9 +43,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialogButtonBox, QMessageBox, QApplication,
 )
 
-from tour_state import (
-    tour_state, mark_tour_started, mark_tour_completed, tour_progress_index,
-)
+from tour_state import mark_tour_started, mark_tour_completed
 
 _HIGHLIGHT_COLOR = "#0e92ab"
 _CALLOUT_BG = "#eaf6f8"
@@ -93,11 +91,23 @@ class _TreeRegion:
             # from a previous process) - fall back to the tree's own
             # full bounds rather than a degenerate empty rect.
             return self.tree.viewport().rect()
-        x0 = min(r.left() for r in rects)
         y0 = min(r.top() for r in rects)
-        x1 = max(r.right() for r in rects)
         y1 = max(r.bottom() for r in rects)
-        return QRect(x0, y0, x1 - x0, y1 - y0)
+        # visualItemRect()'s own WIDTH is bounded to column 0's span
+        # only - it excludes the branch/expand-arrow indent Qt reserves
+        # for every top-level row whenever ANY item in the tree has
+        # children, same caveat _AddRowOverlay.reposition() already
+        # documents and corrects for on its own "+" row. Forcing the
+        # full viewport width here for the same reason is what actually
+        # gets this highlight box tracing the row's TRUE bounds -
+        # matching Tk's own tree.bbox(item) (no column argument = every
+        # visible column combined, not just column 0), the same
+        # semantics this whole class's docstring already claims.
+        # Confirmed live (driving the app directly and reading its real
+        # widget geometry, not just eyeballing a screenshot): without
+        # this, the "New User" step's highlight box sat ~20px right of
+        # the add-row's own actual painted/clickable area.
+        return QRect(0, y0, self.tree.viewport().width(), y1 - y0)
 
     def global_rect(self):
         r = self._local_rect()
@@ -340,6 +350,122 @@ class _ContainerTracker(QObject):
         QTimer.singleShot(0, _run)
 
 
+_BLOCKED_MOUSE_EVENTS = (
+    QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick, QEvent.Type.MouseButtonRelease,
+)
+
+
+class _TourInputGuard(QObject):
+    """Installed application-wide (QApplication.instance().installEventFilter)
+    for the life of the tour - reported live: with nothing stopping it,
+    a user mid-tour could click straight past whatever the current step
+    actually asked for (open/close the Log or Users panel, select a
+    different share, ...), leaving the tour's own highlight/callout
+    pointing at a step whose premise (e.g. "the Users panel is now
+    open") the user had just quietly undone.
+
+    Only engages while gui.py's own modality can't already be trusted
+    to do this job instead: a step whose container is a DIALOG (Share
+    Name, Username/Password, ...) is already fully protected by that
+    QDialog's own .exec() call blocking the main window outright, so
+    this only has real work to do while the CURRENT step's container is
+    the MainWindow itself - see GuiTourQt._current_container. Also
+    stays inactive on the finish screen (_wait_event is None there):
+    that's a congratulations message, not a step waiting on a specific
+    action, so there's nothing to protect it from.
+
+    A global position check against the current target's rect, not a
+    widget-identity check - the actual clickable widget for a step
+    varies (the pinned add-row is its own _AddRowOverlay QLabel, an
+    existing tree row's click is handled by the tree's viewport, a
+    toolbar step is the button itself), but every one of them already
+    has to produce a rect for the highlight box to trace - reusing that
+    rect here means one check covers all of them instead of a widget-
+    identity special case per step shape.
+    """
+
+    def __init__(self, tour: "GuiTourQt"):
+        super().__init__(tour.gui)
+        self._tour = tour
+
+    def eventFilter(self, obj, event):
+        if event.type() not in _BLOCKED_MOUSE_EVENTS:
+            return False
+        tour = self._tour
+        if tour._callout is None or tour._wait_event is None:
+            return False
+        try:
+            widget_fn = tour.steps[tour.index][1]
+            widget = widget_fn() if widget_fn is not None else None
+            # Two cases restrict input, everything else leaves it alone:
+            # the MainWindow itself (its own toolbar/trees are otherwise
+            # wide open - see the class docstring), or a _PointAtOnly
+            # step specifically, REGARDLESS of container - that wrapper
+            # means "only this one control matters right now" (the
+            # "Cancel" demo mid-AddUserDialog, the attach dropdown's own
+            # entry, the QR prompt's Cancel), not "the whole dialog is
+            # fair game" the way _HighlightWholeDialog's own steps (Share
+            # Name, Folder, Username/Password) actually want - those
+            # still need Next/Create/OK and every field left clickable,
+            # so they're deliberately NOT covered by this second case.
+            # Reported live: without it, a "press Cancel" step's OK
+            # button and text fields stayed fully live right next to the
+            # one highlighted control that was supposed to be the only
+            # thing that worked.
+            point_at_only = isinstance(widget, _PointAtOnly)
+            if tour._current_container is not tour.gui and not point_at_only:
+                return False
+            # Only ever filter clicks landing inside the CURRENT step's
+            # own container window - reported live (for the gui.gui
+            # case): the "Skip Tour" confirmation the callout's own
+            # button opens (_confirm_and_stop()'s QMessageBox.question())
+            # is a SEPARATE top-level window, and neither its rect nor
+            # the callout's own was ever in the target-rect allowlist
+            # below - Yes/No became unclickable the moment this guard was
+            # active, trapping the user in the confirmation itself. The
+            # callout (its own Tool-window) is caught by the same check
+            # for the identical reason - as is the analogous "Close
+            # Tour?" confirmation a _PointAtOnly dialog step's own
+            # OK/Cancel buttons might otherwise trigger. Every OTHER
+            # window this app can put up mid-step (a native folder
+            # picker, ...) is already a REAL modal .exec() and fully
+            # protected by Qt's own modality regardless - obj.window()
+            # being something other than this step's own container is
+            # reason enough on its own to leave an event alone, no rect
+            # math needed.
+            if not hasattr(obj, "window") or obj.window() is not tour._current_container:
+                return False
+            if self._event_is_allowed(widget, event):
+                return False
+        except RuntimeError:
+            # Whatever this step was pointing at no longer resolves
+            # (same "already deleted" class of race _show_step()'s own
+            # _step_resolves() guards against) - fail OPEN rather than
+            # trap the user behind a guard with nothing left to click.
+            return False
+        return True
+
+    def _event_is_allowed(self, widget, event):
+        pos = event.globalPosition().toPoint()
+        if widget is None:
+            # A step with no widget_fn (the two delete/detach
+            # confirmation steps) only ever runs with a DIALOG
+            # container - reaching here with nothing to protect means
+            # there's nothing TO restrict to, not that everything should
+            # be blocked.
+            return True
+        if isinstance(widget, _TreeRegion):
+            if widget.global_rect().contains(pos):
+                return True
+            tree = widget.tree
+            for bar in (tree.verticalScrollBar(), tree.horizontalScrollBar()):
+                if bar is not None and bar.isVisible() and QRect(bar.mapToGlobal(QPoint(0, 0)), bar.size()).contains(pos):
+                    return True
+            return False
+        target = widget.widget if isinstance(widget, (_PointAtOnly, _HighlightWholeDialog)) else widget
+        return target is not None and _global_rect_of(target).contains(pos)
+
+
 class GuiTourQt:
     """PySide6 port of tour.py's GuiTour - see that class's own
     docstring for the overall design (event-driven advancement, follows
@@ -359,6 +485,13 @@ class GuiTourQt:
         self._tracker = None
         self._reposition = None
         self._active_window = None
+        self._current_container = None
+        # Lives for as long as this tour does (app-level, never
+        # uninstalled) - see _TourInputGuard's own docstring for why it
+        # only actually intercepts anything while a step is genuinely
+        # showing over the main window.
+        self._input_guard = _TourInputGuard(self)
+        QApplication.instance().installEventFilter(self._input_guard)
 
     def _newest_share_region(self):
         tree = self.gui.shares_tree
@@ -482,7 +615,7 @@ class GuiTourQt:
              "user_detach_dialog_cancelled"),
         ]
 
-    def _step_resolves(self, index, check_widget=False):
+    def _step_resolves(self, index):
         try:
             container = self.steps[index][0]()
         except (RuntimeError, AttributeError):
@@ -496,34 +629,20 @@ class GuiTourQt:
             container.isVisible()
         except RuntimeError:
             return False
-        if not check_widget:
-            return True
-        widget_fn = self.steps[index][1]
-        if widget_fn is not None:
-            try:
-                widget = widget_fn()
-                if widget is not None:
-                    target = widget.widget if isinstance(widget, (_PointAtOnly, _HighlightWholeDialog)) else widget
-                    if target is not None:
-                        _global_rect_of(target)
-            except (RuntimeError, AttributeError, IndexError):
-                return False
         return True
 
-    def _resolve_resume_index(self, index):
-        index = max(0, min(index, len(self.steps) - 1))
-        while index > 0 and not self._step_resolves(index, check_widget=True):
-            index -= 1
-        return index
-
-    def start(self, resume_index=0):
-        self.index = self._resolve_resume_index(resume_index)
-        mark_tour_started(self.index)
+    def start(self):
+        # Always step 0 - see mark_tour_started()'s own docstring for
+        # why a resumed run restarts from the top instead of trying to
+        # pick back up at an arbitrary step number, which assumes the
+        # rest of the app's actual state (which shares/users exist,
+        # which panels are open) still matches what that step expects.
+        self.index = 0
+        mark_tour_started()
         self._show_step()
 
     def _show_step(self):
         self._teardown_current()
-        mark_tour_started(self.index)
         container_fn, widget_fn, title, text, wait_event = self.steps[self.index]
         if callable(text):
             text = text()
@@ -531,6 +650,7 @@ class GuiTourQt:
         if container is None or not self._step_resolves(self.index):
             self.stop(completed=False)
             return
+        self._current_container = container
         container.raise_()
         container.activateWindow()
         try:
@@ -559,6 +679,20 @@ class GuiTourQt:
             return
         self._wait_event = wait_event
         self._track_container(container, widget)
+        # Matches refresh_position()'s own reasoning (see its docstring):
+        # geometry read immediately after a container/tree just changed
+        # size can already lag one Qt-internal layout tick behind - a
+        # QTreeWidget Stretch column recomputing its own width, in
+        # particular, confirmed live to leave a freshly-shown step's
+        # highlight box a full row off from its actual target (the
+        # Users panel's own pinned add-row, right after the panel-open
+        # glide). refresh_position() already re-applies this same
+        # follow-up correction, but only for the panel-glide path
+        # specifically (MainWindow._animate_panel()'s own on_finished())
+        # - applying it here too covers every OTHER way a step gets
+        # shown (tour start, an already-open dialog's own step change,
+        # ...) that never goes through refresh_position() at all.
+        QTimer.singleShot(50, self._reposition)
 
     def _track_container(self, container, widget):
         point_at_only = isinstance(widget, _PointAtOnly)
@@ -696,3 +830,4 @@ class GuiTourQt:
             except RuntimeError:
                 pass
             self._callout = None
+        self._current_container = None

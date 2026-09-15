@@ -25,7 +25,7 @@ import subprocess
 import sys
 sys.path.insert(0, '/usr/lib/nassie')
 from core import SMBWizard
-from tour import _first_run_marker_path
+from tour_state import _first_run_marker_path
 
 w = SMBWizard()
 

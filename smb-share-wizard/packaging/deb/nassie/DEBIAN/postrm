@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+# dpkg only ever removes files/directories IT tracks, and refuses to
+# rmdir a non-empty one - anything left behind that it doesn't know
+# about (Python's own __pycache__, written the moment anything actually
+# imports these modules, never a package-listed file) survives every
+# single uninstall untouched, silently accumulating across reinstalls
+# too (a stale tour.cpython-*.pyc for a module the current source
+# doesn't even have anymore - tour.py, removed in the Tk-to-Qt
+# migration - was still sitting in there). Runs on BOTH remove and
+# purge, and unconditionally (no NASSIE_REINSTALLING check like
+# prerm's own interactive cleanup) - this is just the app's own
+# compiled-cache leftovers, not user data, so there's nothing to guard
+# against re-running on install.sh's reinstall cycle either.
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    rm -rf /usr/lib/nassie
+fi
+
+exit 0

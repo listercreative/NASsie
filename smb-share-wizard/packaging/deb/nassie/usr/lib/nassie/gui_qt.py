@@ -35,6 +35,7 @@ import io
 import os
 import platform
 import sys
+import time
 
 from PySide6.QtCore import (
     Qt, QSize, QRect, QPropertyAnimation, QEasingCurve, QThread, Signal, QTimer, QObject, QEvent,
@@ -52,8 +53,11 @@ from PySide6.QtWidgets import (
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from core import SMBWizard, QR_PASSWORD_RESET_NOTE, pick_directory_native, SHARE_NAME_MAX_LEN, SHARE_NAME_RE
-from tour_state import tour_state, mark_tour_completed, tour_progress_index
+from core import (
+    SMBWizard, QR_PASSWORD_RESET_NOTE, pick_directory_native, SHARE_NAME_MAX_LEN, SHARE_NAME_RE,
+    USERNAME_MAX_LEN, USERNAME_RE, PASSWORD_MAX_LEN, PASSWORD_RE,
+)
+from tour_state import tour_state, mark_tour_completed, _real_home
 from tour_qt import GuiTourQt
 # _XRectangle/install_scoped_x_error_handler: pure ctypes/X11 plumbing,
 # reused as-is by _round_linux_bottom() below rather than redefined, see
@@ -98,7 +102,10 @@ _COLORS = {
     # teal accent - light.tcl's own comment explains why: a teal
     # selection read as indistinguishable from the add-row/stripe tint,
     # which is already that same accent color elsewhere in the app.
-    "tree_selbg": "#72af52",
+    # Desaturated from the logo's own #72af52 (same hue/lightness, ~35%
+    # less saturated) - a full-selected ROW of that raw logo green read
+    # as too vivid/neon next to everything else's much quieter palette.
+    "tree_selbg": "#779f62",
     "tree_selfg": "#ffffff",
     # gui.py's own _ADD_ROW_BG/_STRIPE_BG constants (the pinned "+" row's
     # tint, and the alternating-row stripe) - not part of the ttk theme
@@ -199,6 +206,10 @@ def _build_stylesheet() -> str:
             border-radius: 3px;
             padding: 3px;
         }}
+        QLineEdit:read-only {{
+            background: {c['stripe_bg']};
+            color: {c['disfg']};
+        }}
         QLabel {{ color: {c['fg']}; }}
         QMenu {{ background: {c['surface']}; color: {c['fg']}; border: 1px solid {c['border']}; }}
         QMenu::item:selected {{ background: {c['selbg']}; color: {c['selfg']}; }}
@@ -298,12 +309,53 @@ class _AddRowOverlay(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._paint(self._idle_bg)
+        # Populated by _attach_add_row_icon() with the header/scrollbar
+        # signal connections made below - see detach()'s own docstring
+        # for why this overlay has to track and drop these itself
+        # rather than trusting deleteLater() to handle it.
+        self._connections = []
+
+    def detach(self):
+        """Disconnect every signal this overlay was wired to by
+        _attach_add_row_icon(), so it stops reacting the moment it's
+        replaced - MUST be called (by _populate_shares()/
+        UserManagementPanel.refresh()) before deleteLater()ing this
+        overlay, not after.
+
+        deleteLater() alone isn't enough: PySide only auto-disconnects
+        a signal when the CONNECTED QOBJECT itself is destroyed, and
+        the receiver of tree.header().sectionResized here is a plain
+        lambda, not this overlay directly - the lambda merely captures
+        `overlay` in its closure, which Qt's auto-disconnect machinery
+        doesn't see. Without an explicit detach(), every past overlay's
+        connection to the tree's header/scrollbars stays live forever,
+        so each refresh leaks one more stale connection into a
+        (now-or-eventually) deleted overlay - confirmed live: with N
+        refreshes behind it, a single column resize fired N dead
+        reposition() calls, and depending on exactly how far
+        deleteLater() had already progressed for each, that surfaced as
+        either this OWN object already gone (self.hide() itself raising
+        RuntimeError) or just its _item already gone (the tree.clear()
+        case reposition() still separately guards against below).
+        """
+        for connection in self._connections:
+            QObject.disconnect(connection)
+        self._connections.clear()
 
     def _paint(self, color):
         self.setStyleSheet(f"background-color: {color};")
 
     def reposition(self):
-        rect = self._tree.visualItemRect(self._item)
+        try:
+            rect = self._tree.visualItemRect(self._item)
+        except RuntimeError:
+            # Narrower than detach() above: covers only the brief
+            # window, within a single populate, where clear() has
+            # already destroyed this overlay's OWN (still-current, not
+            # yet replaced) _item, but the fresh replacement item/
+            # overlay haven't been created yet.
+            self.hide()
+            return
         if rect.isEmpty():
             self.hide()
             return
@@ -349,10 +401,16 @@ def _attach_add_row_icon(tree: "QTreeWidget", item: "QTreeWidgetItem", on_click)
     # _AddRowFeedback.reposition() to <Configure>/<MouseWheel> (scrolling
     # or resizing a row without repositioning this leaves it floating
     # over the WRONG row, or off past the tree's edge entirely).
-    tree.header().sectionResized.connect(lambda *a: overlay.reposition())
-    tree.verticalScrollBar().valueChanged.connect(lambda *a: overlay.reposition())
+    overlay._connections.append(
+        tree.header().sectionResized.connect(lambda *a: overlay.reposition())
+    )
+    overlay._connections.append(
+        tree.verticalScrollBar().valueChanged.connect(lambda *a: overlay.reposition())
+    )
     if tree.horizontalScrollBar() is not None:
-        tree.horizontalScrollBar().valueChanged.connect(lambda *a: overlay.reposition())
+        overlay._connections.append(
+            tree.horizontalScrollBar().valueChanged.connect(lambda *a: overlay.reposition())
+        )
     # Deferred - right after insertion the view hasn't necessarily
     # finished laying out yet (same reasoning as gui.py's own
     # after_idle() deferral there), so an immediate reposition() call
@@ -412,6 +470,17 @@ def _row_action_button(icon_name: str, tooltip: str, handler) -> "QToolButton":
     btn = QToolButton()
     btn.setIcon(_icon(icon_name))
     btn.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
+    # Explicit size, not left to the style's own natural sizeHint (which
+    # measured 29x29 for this same 24px icon size - only ~2.5px of
+    # margin per side) - matches _toolbar_toggle_button's identical
+    # defensive sizing for the SAME icon size. Reported live: the
+    # "Attach User" chain icon specifically read as clipped/cramped
+    # within its own button - a chain link's two rings extend closer to
+    # the glyph's own bounding box edges than e.g. a plain "+" does, so
+    # the already-thin auto margin left it looking cut off. Confirmed by
+    # rendering the button in isolation both ways - visibly more
+    # breathing room at this size.
+    btn.setFixedSize(_TOGGLE_BUTTON_SIZE, _TOGGLE_BUTTON_SIZE)
     btn.setToolTip(tooltip)
     btn.clicked.connect(handler)
     return btn
@@ -454,6 +523,20 @@ class _RowActionBar(QWidget):
         while self._layout.count():
             child = self._layout.takeAt(0)
             if child.widget():
+                # hide() first, not just deleteLater() - takeAt() only
+                # unparents the widget from THIS layout's own position
+                # management, it doesn't hide it, and deleteLater() is
+                # deferred to the next event-loop pass rather than
+                # taking effect immediately. Without this, a button from
+                # the PREVIOUS bar contents (e.g. the plain New User/
+                # Attach User/Delete Share set, right as entering attach
+                # mode swaps in the combo+Cancel) stayed visually on
+                # screen at its last position - not layout-managed
+                # anymore, but still painted - overlapping whatever the
+                # rebuilt bar draws in that same screen area until GC
+                # actually caught up. Reported live as a stray icon
+                # bleeding in behind the chain/Attach User button.
+                child.widget().hide()
                 child.widget().deleteLater()
 
     def update_bar(self):
@@ -1109,10 +1192,30 @@ class AddUserDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.username_entry = QLineEdit()
+        # Blocks disallowed characters at the keystroke, not just on
+        # submit - matches CreateShareDialog.name_entry's identical
+        # validate="key"-style guard (same source of truth,
+        # check_username()/USERNAME_RE, as the check in _on_ok() below).
+        self.username_entry.setMaxLength(USERNAME_MAX_LEN)
+        self.username_entry.setValidator(
+            QRegularExpressionValidator(QRegularExpression(USERNAME_RE.pattern), self.username_entry)
+        )
         self.password_entry = QLineEdit()
         self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        # Same keystroke-level guard as username_entry above, but a
+        # BLOCKLIST (PASSWORD_RE's own comment explains why) - typing one
+        # of the handful of blocked characters is simply a no-op here
+        # rather than surfacing as a submit-time error.
+        self.password_entry.setMaxLength(PASSWORD_MAX_LEN)
+        self.password_entry.setValidator(
+            QRegularExpressionValidator(QRegularExpression(PASSWORD_RE.pattern), self.password_entry)
+        )
         self.confirm_entry = QLineEdit()
         self.confirm_entry.setEchoMode(QLineEdit.EchoMode.Password)
+        self.confirm_entry.setMaxLength(PASSWORD_MAX_LEN)
+        self.confirm_entry.setValidator(
+            QRegularExpressionValidator(QRegularExpression(PASSWORD_RE.pattern), self.confirm_entry)
+        )
         form.addRow("Username:", self.username_entry)
         form.addRow("Password:", self.password_entry)
         form.addRow("Confirm:", self.confirm_entry)
@@ -1127,7 +1230,13 @@ class AddUserDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._on_ok)
-        buttons.rejected.connect(self._on_cancel)
+        # Straight to self.reject (not a separate _on_cancel) - the
+        # window's own native close button and Escape ALSO call
+        # QDialog's reject() directly, bypassing anything wired only to
+        # this button box's own rejected signal. Overriding reject()
+        # itself below is what actually makes every path converge on
+        # the same tour guard - see that method's own comment.
+        buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
 
@@ -1143,16 +1252,26 @@ class AddUserDialog(QDialog):
         if not event.spontaneous():
             QTimer.singleShot(0, lambda: self.main_window._notify_tour("user_dialog_opened", window=self))
 
-    def _on_cancel(self):
+    def reject(self):
         # See MainWindow._tour_blocks_closing()'s docstring - lets the
-        # dedicated "Cancel" step's own Cancel click through as normal,
-        # blocks it everywhere else in the tour (e.g. midway through
-        # "Username and Password") so it can't strand the tour pointed
-        # at a field on a dialog that no longer exists.
+        # dedicated "Cancel" step's own Cancel click through as normal.
+        # Overriding this method itself (not just the Cancel button's
+        # own click) is what actually covers the window's native close
+        # button and Escape too - both call QDialog.reject() directly by
+        # default, which used to skip this guard (and the tour
+        # notification below) entirely: reported live, closing this
+        # dialog via its own [x] left the tour's callout/highlight stuck
+        # on a destroyed dialog with no way to progress. Everywhere else
+        # in the tour (e.g. midway through "Username and Password"),
+        # _tour_confirm_close() asks first rather than just silently
+        # refusing to close - see its own docstring.
         if self.main_window._tour_blocks_closing(self, "user_dialog_cancelled"):
+            if not self.main_window._tour_confirm_close(self):
+                return
+            super().reject()
             return
         self.main_window._notify_tour("user_dialog_cancelled", window=self)
-        self.reject()
+        super().reject()
 
     def _on_ok(self):
         username = self.username_entry.text().strip()
@@ -1162,11 +1281,32 @@ class AddUserDialog(QDialog):
         if not ok:
             self.error_label.setText(message)
             return
-        if username in self._existing:
-            self.error_label.setText(f"'{username}' already exists.")
+        # Case-insensitive - an exact match was already the one real
+        # check here, but "bob" against an existing "Bob" fell straight
+        # through it: two textually-distinct usernames that Samba/Linux
+        # account lookups don't actually treat as different (POSIX
+        # usernames are conventionally lowercase-only in the first
+        # place), so create_user() would silently reuse/reset the
+        # EXISTING account instead of the new one this dialog looked
+        # like it just made - same underlying class of bug as
+        # check_share_name()'s own case-insensitive collision guard, see
+        # its comment for the full story.
+        existing_by_lower = {e.lower(): e for e in self._existing}
+        collision = existing_by_lower.get(username.lower())
+        if collision is not None:
+            if collision == username:
+                self.error_label.setText(f"'{username}' already exists.")
+            else:
+                self.error_label.setText(
+                    f"'{collision}' already exists - names differing only by capitalization aren't allowed."
+                )
             return
         if not password:
             self.error_label.setText("Password can't be empty.")
+            return
+        pw_ok, pw_message = SMBWizard.check_password(password)
+        if not pw_ok:
+            self.error_label.setText(pw_message)
             return
         if password != confirm:
             self.error_label.setText("Passwords don't match.")
@@ -1230,6 +1370,24 @@ class CreateShareDialog(QDialog):
         path_layout.addWidget(QLabel("Folder to share:"))
         path_row = QHBoxLayout()
         self.path_entry = QLineEdit()
+        # Read-only, not just validated - set programmatically (the
+        # default from _go_to_path_page(), or a real picked folder from
+        # _browse()) and never by direct keystrokes at all, since every
+        # manual-entry gap this field kept surfacing (a relative path, a
+        # path pointing at an existing file, ...) had the same root
+        # cause: it accepted arbitrary typed text where every other path
+        # into this field (the default, Browse) can only ever produce
+        # something already known-good. Still focusable/selectable
+        # (read-only, not disabled) so the value can be seen and copied,
+        # just not typed into - Qt blocks keyboard edits on a read-only
+        # QLineEdit on its own, no extra keyPressEvent handling needed.
+        self.path_entry.setReadOnly(True)
+        # The I-beam text cursor otherwise still shows on hover over a
+        # read-only field (Qt doesn't change it automatically just
+        # because typing is blocked), which reads as "you can click in
+        # here and type" right up until someone tries. A plain arrow
+        # matches what Browse's own button already signals correctly.
+        self.path_entry.setCursor(Qt.CursorShape.ArrowCursor)
         path_row.addWidget(self.path_entry)
         browse_btn = QPushButton("Browse...")
         browse_btn.clicked.connect(self._browse)
@@ -1253,6 +1411,30 @@ class CreateShareDialog(QDialog):
         # Deferred - see AddUserDialog.showEvent()'s identical reasoning.
         if not event.spontaneous():
             QTimer.singleShot(0, lambda: self.main_window._notify_tour("share_dialog_opened", window=self))
+
+    def reject(self):
+        # This dialog has no Cancel button at all, so without overriding
+        # reject() itself, the window's own native close button (and
+        # Escape) went straight to QDialog's default reject() - closing
+        # the dialog immediately with no tour notification whatsoever,
+        # any time it happened (both tour steps this dialog hosts wait
+        # on real progress, "share_name_confirmed"/"share_created", not
+        # on any kind of cancel) - reported live: closing it via the
+        # window's own [x] left the tour's callout/highlight stuck
+        # pointing at fields on a dialog that no longer existed, with no
+        # way to advance OR skip (Skip Tour is the callout's OWN button,
+        # a separate widget the callout stays open and clickable
+        # throughout - just nothing was progressing the actual step).
+        # There's no cancel-and-continue path designed for this dialog
+        # at all - own_close_event=None can never equal a real
+        # wait_event string, so _tour_blocks_closing() says yes for as
+        # long as the tour is pointed at this dialog, no matter which
+        # step. _tour_confirm_close() asks rather than just silently
+        # refusing - see its own docstring.
+        if self.main_window._tour_blocks_closing(self, None):
+            if not self.main_window._tour_confirm_close(self):
+                return
+        super().reject()
 
     def _go_to_path_page(self):
         name = self.name_entry.text().strip()
@@ -1436,6 +1618,7 @@ class UserManagementPanel(QWidget):
         # shares tree's identical call in _populate_shares() for why.
         self._add_user_row.setFirstColumnSpanned(True)
         if self._add_user_row_overlay is not None:
+            self._add_user_row_overlay.detach()
             self._add_user_row_overlay.deleteLater()
         self._add_user_row_overlay = _attach_add_row_icon(self.tree, self._add_user_row, self._on_new_user)
         for u in users or []:
@@ -1605,6 +1788,10 @@ class UserManagementPanel(QWidget):
         if pw_dialog.exec() != QDialog.DialogCode.Accepted or not pw_dialog.result_value:
             return
         password = pw_dialog.result_value
+        pw_ok, pw_message = SMBWizard.check_password(password)
+        if not pw_ok:
+            QMessageBox.critical(self, "New password", pw_message)
+            return
         worker = _Worker(self._do_change_password, share_name, username, password)
         worker.done.connect(
             lambda result, log, s=share_name, u=username, p=password: self._on_password_changed(s, u, p, result, log)
@@ -1817,6 +2004,18 @@ class MainWindow(QMainWindow):
         self.shares_tree = _SharesTree()
         self.shares_tree.setItemDelegate(_RowHoverDelegate(self.shares_tree))
         self.shares_tree.setHeaderLabels(["Share Name", "Path"])
+        # Qt's own default initial width for column 0 (100px) is just
+        # barely wider than "Share Name" itself - fine with no sort
+        # indicator shown, but the moment this column is actually
+        # sorted (adding the indicator arrow next to the text), there's
+        # nowhere left for it to go on the same line and Qt wraps the
+        # section onto a second line instead ("Share Name" / "▲"
+        # stacked) - reported live. Widened past text+arrow+padding's
+        # real combined need (measured ~111px) with real margin to
+        # spare, rather than something that would start wrapping again
+        # the moment a translation or a future font change makes the
+        # label a few pixels wider.
+        self.shares_tree.setColumnWidth(0, 130)
         # "Path" (the last column) fills any remaining width instead of
         # leaving it unclaimed by any column - matches gui.py's own
         # shares_list.column("path", stretch=True). Still scrolls
@@ -1984,6 +2183,26 @@ class MainWindow(QMainWindow):
 
     # -- guided tour (see tour_qt.py) --------------------------------------
 
+    def closeEvent(self, event):
+        # Closing the app entirely necessarily ends any tour in progress
+        # too - same "are you sure, this also closes the tour"
+        # confirmation a tour-tracked dialog's own reject() shows (see
+        # _tour_confirm_close()'s docstring), reused here rather than a
+        # parallel one-off implementation since "ask, then end the tour
+        # on Yes" is identical either way. Reported live: the window's
+        # own [x] closed the whole app immediately with no warning at
+        # all while a step was still showing - unlike a dialog's own
+        # close (guarded by _tour_blocks_closing() first), there's no
+        # per-step exception to check here, since no tour step ever
+        # expects the WHOLE APP closing as its own legitimate next
+        # action the way AddUserDialog's dedicated Cancel step does -
+        # ask any time a step is actually showing at all.
+        tour = self._tour
+        if tour is not None and tour._callout is not None and not self._tour_confirm_close(self):
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def _notify_tour(self, event, window=None):
         # Matches gui.py's own GUIWizard._notify_tour(): the active tour
         # (if any) advances itself on real actions happening rather than
@@ -2016,6 +2235,42 @@ class MainWindow(QMainWindow):
             and tour._wait_event != own_close_event
         )
 
+    def _tour_confirm_close(self, dialog):
+        # Called from a tour-tracked dialog's own reject() exactly when
+        # _tour_blocks_closing() says yes - i.e. the tour still wants
+        # something else from this dialog, but the user is trying to
+        # leave anyway (Escape, the window's own [x], or Cancel on a
+        # step with no dedicated cancel path). Silently eating that
+        # click (an earlier version of this) reads as the dialog being
+        # broken, not deliberately guarded - asking instead, the same
+        # way the callout's own "Skip Tour" button already does, is
+        # what actually communicates "there's a reason this didn't just
+        # close." No leaves the dialog and the tour exactly where they
+        # were.
+        #
+        # Yes lets the close proceed but marks the tour INTERRUPTED, not
+        # completed - reported live: closing the app mid-tour (even
+        # after confirming here) isn't the same thing as deliberately
+        # clicking "Skip Tour" on the callout - one is "I need to close
+        # this right now," the other is "I don't want this tour" - and
+        # only the second should mean "never offer it again." Marking
+        # this one completed too meant closing the window silently
+        # turned into the same outcome as skipping outright, with no way
+        # to tell the two apart on the next launch - completed=False
+        # here leaves the "started" marker GuiTourQt.start() already
+        # wrote in place (mark_tour_started()), which is exactly what
+        # makes the NEXT launch's tour_state() correctly read
+        # "interrupted" and offer to restart (see _offer_tour_resume() -
+        # a full restart from step one now, not an attempt to resume
+        # mid-step).
+        if QMessageBox.question(
+            dialog, "Close Tour?",
+            "Are you sure you want to close? This will also close the tour.",
+        ) != QMessageBox.StandardButton.Yes:
+            return False
+        self._tour.stop(completed=False)
+        return True
+
     def _tour_flash_name_error(self, message):
         if self._tour is not None:
             self._tour.show_name_error(message)
@@ -2028,19 +2283,27 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(400, self._offer_tour_resume)
 
     def _offer_tour_resume(self):
+        # Restarts from step one on "Yes", not an attempt to pick back
+        # up at whatever step an earlier run reached - see
+        # tour_state.mark_tour_started()'s own docstring for why: a bare
+        # step number can't guarantee the rest of the app's actual state
+        # (which shares/users already exist, which panels are open)
+        # still matches what that step expects, so a "resume" that
+        # skipped ahead risked landing on a step whose own narrative no
+        # longer made sense against what's really on screen.
         if QMessageBox.question(
-            self, "Resume Tour",
-            "It looks like the guided tour didn't finish last time.\n\nContinue where you left off?",
+            self, "Restart Tour",
+            "It looks like the guided tour didn't finish last time.\n\nStart it again from the beginning?",
         ) == QMessageBox.StandardButton.Yes:
-            self._start_tour(resume_index=tour_progress_index())
+            self._start_tour()
         else:
             mark_tour_completed()
 
-    def _start_tour(self, resume_index=0):
+    def _start_tour(self):
         # Rebuilt each time rather than cached - matches gui.py's own
         # _start_tour() (see its own comment for why).
         self._tour = GuiTourQt(self)
-        self._tour.start(resume_index=resume_index)
+        self._tour.start()
 
     # -- data refresh ---------------------------------------------------
 
@@ -2086,6 +2349,34 @@ class MainWindow(QMainWindow):
             self._maybe_start_tour()
 
     def _populate_shares(self, shares):
+        # Remember whatever was actually selected before rebuilding, so
+        # it can be restored by NAME once the rebuild is done - clear()
+        # below destroys every QTreeWidgetItem outright, so nothing
+        # survives to reselect by identity. Two cases, not one: a
+        # selected SHARE stays "the thing you're working on" through
+        # whatever action on it just triggered this refresh (e.g.
+        # attaching a user to it, which adds a CHILD row you were never
+        # actually on) - but a selected USER row is itself the thing an
+        # action was just taken on (permission toggle, QR code, ...) and
+        # has to stay selected on THAT SAME USER, not get bumped back up
+        # to its parent share. An earlier version of this always climbed
+        # to the parent share regardless - reported live: toggling
+        # read-only on a selected user kicked selection back up to the
+        # share instead of staying put. Matched by the user's raw
+        # USERNAME, not its full row label - the label itself gains/
+        # loses the very " (read-only)" suffix a permission toggle just
+        # changed, so comparing full old-vs-new label text would never
+        # match again the moment that's what actually changed.
+        selected_share_name = None
+        selected_username = None
+        current = self.shares_tree.currentItem()
+        if current is not None:
+            if current.parent() is None:
+                if current is not self._add_share_row:
+                    selected_share_name = current.text(0)
+            else:
+                selected_share_name = current.parent().text(0)
+                selected_username = current.text(0).removesuffix(" (read-only)")
         self.shares_tree.clear()
         self._add_share_row = _make_add_row()
         self.shares_tree.addTopLevelItem(self._add_share_row)
@@ -2096,17 +2387,24 @@ class MainWindow(QMainWindow):
         # column 0.
         self._add_share_row.setFirstColumnSpanned(True)
         if self._add_share_row_overlay is not None:
+            self._add_share_row_overlay.detach()
             self._add_share_row_overlay.deleteLater()
         self._add_share_row_overlay = _attach_add_row_icon(self.shares_tree, self._add_share_row, self._on_new_share)
+        new_selection = None
         for share in shares or []:
             name = share.get("name", "?")
             path = share.get("path") or "Unknown"
             share_item = QTreeWidgetItem(self.shares_tree, [name, path])
+            if name == selected_share_name and selected_username is None:
+                new_selection = share_item
             for u in share.get("users", []):
-                label = u.get("username", "?")
+                username = u.get("username", "?")
+                label = username
                 if u.get("read_only"):
                     label += " (read-only)"
                 user_item = QTreeWidgetItem(share_item, [label, ""])
+                if name == selected_share_name and username == selected_username:
+                    new_selection = user_item
                 # Matches the pinned add-rows' own identical use of this
                 # (see _populate_shares()'s add-row setup just above) -
                 # a user row has nothing meaningful for the "Path"
@@ -2122,6 +2420,11 @@ class MainWindow(QMainWindow):
                 user_item.setFirstColumnSpanned(True)
         self.shares_tree.expandAll()
         self._shares_sorter.apply()
+        # After apply() (which can reorder top-level items via take/
+        # reinsert, not destroy/recreate them - the item reference
+        # itself stays valid either way).
+        if new_selection is not None:
+            self.shares_tree.setCurrentItem(new_selection)
 
     def _selected_share_and_user(self):
         items = self.shares_tree.selectedItems()
@@ -2146,7 +2449,26 @@ class MainWindow(QMainWindow):
         # event right now.
         share, _ = self._selected_share_and_user()
         if share:
-            self._notify_tour("share_selected")
+            # Deferred - this method is connected to shares_tree's own
+            # itemSelectionChanged BEFORE self._share_action_bar even
+            # exists (that connects ITS OWN update_bar() to the same
+            # signal later, when _RowActionBar() is constructed), and
+            # Qt runs slots in connection order - notifying the tour
+            # synchronously here used to advance it to the very next
+            # step ("New User", pointing at _row_action_button(0))
+            # BEFORE update_bar() had rebuilt the row action bar's own
+            # buttons for this newly-selected row at all. That step's
+            # target resolved to None (the bar's layout was still
+            # empty/stale) and so never got a highlight box - reported
+            # live: the callout showed with no highlight at all, right
+            # up until the (separately, correctly rendered moments
+            # later by that same later slot) action bar's buttons
+            # appeared with nothing ever pointing at them. update_bar()
+            # itself is synchronous and already part of THIS SAME
+            # itemSelectionChanged emission - letting this event-loop
+            # tick finish first is enough for it to have already run by
+            # the time this actually fires.
+            QTimer.singleShot(0, lambda: self._notify_tour("share_selected"))
 
     def _on_shares_item_clicked(self, item, column):
         if item is self._add_share_row:
@@ -2192,6 +2514,17 @@ class MainWindow(QMainWindow):
             combo.addItem(label)
             label_to_user[label] = u
         combo.setCurrentIndex(-1)
+        # The dropdown POPUP otherwise inherits the combo's own narrow
+        # width (constrained by the row action bar's compact toolbar-
+        # height layout), eliding a longer "username (existing account)"
+        # label into an unreadable mid-string "exi...account" - reported
+        # live. Widening just the popup's view (not the combo itself,
+        # which should stay compact sitting in the row) to fit the
+        # longest actual label fixes this without touching the combo's
+        # own on-row width at all.
+        fm = combo.fontMetrics()
+        longest = max((fm.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())), default=0)
+        combo.view().setMinimumWidth(longest + 40)
 
         def on_activated(index):
             user = label_to_user.get(combo.itemText(index))
@@ -2380,6 +2713,10 @@ class MainWindow(QMainWindow):
             if pw_dialog.exec() != QDialog.DialogCode.Accepted or not pw_dialog.result_value:
                 return
             password = pw_dialog.result_value
+            pw_ok, pw_message = SMBWizard.check_password(password)
+            if not pw_ok:
+                QMessageBox.critical(self, "Password", pw_message)
+                return
 
         if not user.get("managed", False):
             if QMessageBox.question(
@@ -2503,7 +2840,59 @@ class MainWindow(QMainWindow):
         QrCodeDialog(self, share, user, payload).exec()
 
 
+_crash_log_file = None  # Kept alive for the whole process - see
+                        # _install_crash_handler()'s own comment on why
+                        # this can't just be a local variable.
+
+
+def _install_crash_handler():
+    # A SIGSEGV (seen live: PySide6's compiled bindings segfaulting on
+    # this system's Python 3.14 - describe_gui_qt_failure()'s own
+    # comment in core.py has the history) kills the process with NO
+    # Python-visible exception at all - nothing an `except Exception`
+    # handler, or even sys.excepthook, could ever catch, since the
+    # interpreter itself dies mid-instruction. faulthandler installs a
+    # low-level OS signal handler for exactly this class of fatal signal
+    # (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL) that dumps every thread's
+    # Python frame stack at the MOMENT of the crash before the process
+    # actually goes down - the one piece of diagnostic info a bare "it
+    # crashed" report can never carry on its own, and the only lead this
+    # class of crash leaves behind at all if it turns out to be a real,
+    # reproducible bug rather than the already-documented environment
+    # instability.
+    #
+    # Written to a FILE, not stderr - same reasoning as tty_debug.py's
+    # own file-based logging: this process's stderr is being consumed by
+    # the TUI parent that launched it (see launch_gui_qt()), not
+    # something left on a terminal a tester could scroll back to after
+    # the fact. _real_home() (not a bare expanduser("~")) so this lands
+    # in the real invoking user's own ~/.config/nassie even when this
+    # process ends up running as root - tty_debug.py's OWN identically-
+    # named problem, still unfixed there (see its own _log_dir()).
+    #
+    # The open file object has to stay referenced for the rest of the
+    # process's life (module-level _crash_log_file, not a local) -
+    # faulthandler.enable(file=...) does NOT keep its own strong
+    # reference, so a local variable going out of scope here would let
+    # Python's own GC close the file well before any real crash much
+    # later in the session ever had a chance to use it.
+    global _crash_log_file
+    import faulthandler
+    try:
+        path = os.path.join(_real_home(), ".config", "nassie", "crash.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _crash_log_file = open(path, "a", encoding="utf-8", buffering=1)
+        _crash_log_file.write(
+            f"\n=== NASsie crash handler installed - {time.strftime('%Y-%m-%d %H:%M:%S')} - "
+            f"Python {platform.python_version()} ===\n"
+        )
+        faulthandler.enable(file=_crash_log_file, all_threads=True)
+    except OSError:
+        pass
+
+
 def run():
+    _install_crash_handler()
     if platform.system() == "Linux":
         # Must happen before QApplication exists - Qt picks its platform
         # plugin at construction time. Routes through XWayland even on a
