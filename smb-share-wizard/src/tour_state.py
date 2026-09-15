@@ -79,48 +79,44 @@ def tour_state():
     return "completed" if content == "completed" else "interrupted"
 
 
-def mark_tour_started(index=0):
-    # index - the current step (see GuiTour.index) - rides along in the
-    # same "started" marker as "started:<index>", rather than a separate
-    # file, so there's only ever one source of truth for "is a tour in
-    # flight, and if so where". Read back by tour_progress_index() on the
-    # next launch (see GUIWizard._offer_tour_resume()) to pick the
-    # walkthrough back up close to where it left off instead of forcing a
-    # full restart from step one.
-    _write_tour_state(f"started:{index}")
+def mark_tour_started():
+    # No step index recorded (an earlier version tracked one, as
+    # "started:<index>", to resume near where an interrupted run left
+    # off) - resuming at an arbitrary step turned out to assume the rest
+    # of the app's actual state (which shares/users already exist, which
+    # panels are open) matches what that step expects, which a bare step
+    # NUMBER can't guarantee and _step_resolves() can only partially
+    # catch (a widget existing isn't the same as the walkthrough's own
+    # narrative still making sense). Restarting from the top is what
+    # GUIWizard._offer_tour_resume() actually does now - simpler, and
+    # never stale relative to whatever's really on screen.
+    _write_tour_state("started")
 
 
 def mark_tour_completed():
     _write_tour_state("completed")
 
 
-def tour_progress_index():
-    # The furthest step index a previous, interrupted run reached (see
-    # mark_tour_started()'s own comment) - 0 if there's no marker, it's
-    # already "completed", or it predates this field ever existing (a
-    # bare "started" with no ":<index>", from an older NASsie version -
-    # falls back to a plain restart from step one, same as before this
-    # existed, rather than erroring on it).
-    path = _first_run_marker_path()
-    try:
-        with open(path) as f:
-            content = f.read().strip()
-    except OSError:
-        return 0
-    if not content.startswith("started:"):
-        return 0
-    try:
-        return max(0, int(content.split(":", 1)[1]))
-    except ValueError:
-        return 0
-
-
 def _write_tour_state(state):
+    # Atomic write (temp file + os.replace(), not a direct open("w")) -
+    # this specifically matters here because "interrupted" (the one
+    # state this function's other callers care about distinguishing)
+    # means the app was force-closed or crashed mid-tour, i.e. exactly
+    # the scenario where an in-place write could itself get killed
+    # partway through. A torn write leaving behind partial content still
+    # just reads as "interrupted" either way (tour_state() only ever
+    # checks for the literal "completed" string) rather than corrupting
+    # anything meaningful, but os.replace() (atomic on both POSIX and
+    # Windows - the destination always ends up as either the old content
+    # or the complete new content, never a partial write) costs nothing
+    # to use regardless.
     path = _first_run_marker_path()
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    with open(path, "w") as f:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
         f.write(state)
+    os.replace(tmp_path, path)
     _chown_to_real_user(directory, path)
 
 

@@ -30,7 +30,7 @@ cp "$SRC"/icons/*.png "$PKGLIB/icons/"
 find "$PKG" -type d -exec chmod 755 {} \;
 chmod 644 "$PKGLIB"/*.py "$PKGLIB/nassie_icon.png"
 find "$PKGLIB/icons" -type f -exec chmod 644 {} \;
-chmod 755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/usr/bin/nassie"
+chmod 755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/DEBIAN/postrm" "$PKG/usr/bin/nassie"
 chmod 644 "$PKG/DEBIAN/control" \
           "$PKG/usr/share/applications/nassie.desktop" \
           "$PKG/usr/share/doc/nassie/copyright" \

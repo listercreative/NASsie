@@ -151,9 +151,27 @@ SHARE_NAME_RE = re.compile(r'^[A-Za-z0-9 _-]+$')
 
 # Usernames are also written unescaped into smb.conf's "valid users"/"read
 # list" lines (space-joined), so the same reasoning applies; this also keeps
-# names within the traditional POSIX/Windows SAM username length.
+# names within the traditional POSIX/Windows SAM username length. "-" was
+# dropped from the allowed set (share names/paths still allow it) - a
+# leading "-" is exactly what a shell/CLI parses as an OPTION FLAG rather
+# than a positional argument, and this value reaches real command-line
+# tools directly (useradd on Linux, New-LocalUser's -Name on Windows) -
+# underscore is the one separator character actually needed here.
 USERNAME_MAX_LEN = 20
-USERNAME_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+USERNAME_RE = re.compile(r'^[A-Za-z0-9_]+$')
+
+# Passwords are never written unescaped into smb.conf or interpolated into
+# a shell/PowerShell command string (they travel via stdin on Linux -
+# _configure_linux_user's own smbpasswd call - and an environment variable
+# on Windows - _configure_windows_user's own $env:NASSIE_TEMP_PW - neither
+# of which cares what characters are in it), so this is narrower than the
+# username/share-name/path patterns above: a blocklist of characters with
+# no legitimate use in a password but real potential for confusion
+# (readable as a path separator or a comparison operator when this value
+# gets displayed/logged/re-typed) rather than a tight allowlist that would
+# otherwise needlessly weaken what's allowed in a credential.
+PASSWORD_MAX_LEN = 128
+PASSWORD_RE = re.compile(r'^[^\x00-\x1f<>/\\|]+$')
 
 # The path is also written unescaped as smb.conf's "path = ..." line. Real
 # filesystem paths need ":", "/", "\\", and spaces, so this can't be as tight
@@ -861,6 +879,24 @@ class SMBWizard:
                 f"Refusing to use '{check_path}' as a share path: it resolves to "
                 f"'{resolved}', a home or system directory. Choose (or create) a subfolder instead."
             )
+        # Browse (QFileDialog/pick_directory_native) can only ever return
+        # an existing DIRECTORY - it has no way to hand back a path to a
+        # regular file, a device node, a broken symlink, or anything else
+        # that isn't one. Only manual typing can name something that
+        # exists but isn't a directory, and nothing caught that until now
+        # - it passed every check above and then hit run_linux()/
+        # run_windows()'s own os.makedirs(path, exist_ok=True) partway
+        # through actually creating the share (after installing Samba,
+        # for a fresh install), which raises FileExistsError for an
+        # existing non-directory (exist_ok only suppresses that for an
+        # existing directory) - a late, confusing failure instead of
+        # this dialog just saying what's actually wrong before anything
+        # has been touched. A path that doesn't exist at all is still
+        # fine and intentional - see run_linux()'s own os.makedirs() -
+        # this only rejects a path that exists AND is the wrong kind of
+        # thing.
+        if os.path.exists(resolved) and not os.path.isdir(resolved):
+            return False, f"'{check_path}' already exists and isn't a folder - choose a different path."
         return True, None
 
     def check_share_name(self, name=None):
@@ -870,7 +906,32 @@ class SMBWizard:
         # /etc/samba/smb.conf - an unrestricted name can inject arbitrary
         # config directives.
         check_name = self.share_name if name is None else name
-        return _validate_against(check_name, SHARE_NAME_MAX_LEN, SHARE_NAME_RE, "Share name")
+        ok, message = _validate_against(check_name, SHARE_NAME_MAX_LEN, SHARE_NAME_RE, "Share name")
+        if not ok:
+            return ok, message
+        # Case-insensitive collision check - SHARE_NAME_RE itself allows
+        # mixed case, so nothing else stops someone from creating "test"
+        # and "Test" as two textually-distinct names, but Windows share
+        # names are conventionally case-insensitive (Windows itself
+        # refuses to create two differing only by case), and this app's
+        # OWN Linux machinery already collapses them onto the same
+        # underlying resource regardless: _share_group_name() lowercases
+        # before deriving the group name, and _rewrite_valid_users()/
+        # _rewrite_read_list()/_delete_share_linux() all match the
+        # target "[section]" case-insensitively - confirmed live, a user
+        # added to "test" ended up written into "Test"'s own valid-users
+        # line instead, because whichever share happened to appear first
+        # in smb.conf won every later case-insensitive section lookup
+        # for the OTHER name too. Rejecting the collision here, the one
+        # shared validation entry point every share-name-typing UI
+        # already calls, is what actually prevents creating the second,
+        # silently-conflicting share in the first place, rather than
+        # trying to patch every downstream case-sensitivity assumption
+        # individually.
+        existing_names = {s["name"].lower() for s in self.list_shares()}
+        if check_name.lower() in existing_names:
+            return False, f"A share named '{check_name}' (or differing only by capitalization) already exists."
+        return True, None
 
     @staticmethod
     def check_username(username):
@@ -879,6 +940,19 @@ class SMBWizard:
         # "valid users"/"read list" lines. Static (doesn't touch instance
         # state) so UI layers can validate a username without a wizard.
         return _validate_against(username, USERNAME_MAX_LEN, USERNAME_RE, "Username")
+
+    @staticmethod
+    def check_password(password):
+        # Returns (ok, message). See PASSWORD_RE's own comment for why
+        # this is a blocklist, not the tighter allowlist check_username/
+        # check_share_name use. Only for a NEWLY SET password (account
+        # creation, a share attach, an explicit password change) - never
+        # applied to a password being VERIFIED against one that might
+        # already exist from before this restriction did (the QR code
+        # flow's own re-entry prompt, say), which would wrongly refuse a
+        # correct, already-real password on the sole basis that this
+        # check didn't exist when it was originally set.
+        return _validate_against(password, PASSWORD_MAX_LEN, PASSWORD_RE, "Password")
 
     def dispatch_execution(self):
         ok, message = self.check_share_path()
@@ -2695,14 +2769,21 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         with open(smb_conf, 'r') as f:
             lines = f.readlines()
 
-        target = f"[{name}]".lower()
+        # Exact match, not case-folded - check_share_name() now refuses
+        # to create a share that collides case-insensitively with an
+        # existing one, but this still matters for a share that
+        # predates that guard (or was hand-edited into smb.conf): a
+        # case-insensitive match here found whichever of "test"/"Test"
+        # happened to appear FIRST in the file and stopped there,
+        # regardless of which one was actually requested by exact name.
+        target = f"[{name}]"
         out = []
         skipping = False
         removed = False
         for raw_line in lines:
             stripped = raw_line.strip()
             if stripped.startswith('[') and stripped.endswith(']'):
-                skipping = stripped.lower() == target
+                skipping = stripped == target
                 if skipping:
                     removed = True
                     continue
@@ -2732,14 +2813,19 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         with open(smb_conf, 'r') as f:
             lines = f.readlines()
 
-        target = f"[{share_name}]".lower()
+        # Exact match, not case-folded - see _delete_share_linux()'s
+        # identical comment. Confirmed live: adding a user to "test"
+        # ended up writing into "Test"'s own valid-users line instead,
+        # because a case-insensitive match here found "Test" first (it
+        # happened to appear earlier in the file) and stopped there.
+        target = f"[{share_name}]"
         out = []
         in_target = False
         updated = False
         for raw_line in lines:
             stripped = raw_line.strip()
             if stripped.startswith('[') and stripped.endswith(']'):
-                in_target = stripped.lower() == target
+                in_target = stripped == target
                 out.append(raw_line)
                 continue
             if in_target and not updated:
@@ -2792,7 +2878,9 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         with open(smb_conf, 'r') as f:
             lines = f.readlines()
 
-        target = f"[{share_name}]".lower()
+        # Exact match, not case-folded - see _delete_share_linux()'s
+        # identical comment.
+        target = f"[{share_name}]"
         out = []
         in_target = False
         found_line = False
@@ -2800,7 +2888,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         for raw_line in lines:
             stripped = raw_line.strip()
             if stripped.startswith('[') and stripped.endswith(']'):
-                in_target = stripped.lower() == target
+                in_target = stripped == target
                 out.append(raw_line)
                 if in_target:
                     header_index = len(out) - 1
