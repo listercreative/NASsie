@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
     QLabel, QToolButton, QPushButton, QFrame, QTreeWidget, QTreeWidgetItem,
     QLineEdit, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
     QPlainTextEdit, QFileDialog, QStackedWidget, QSizePolicy,
-    QStyledItemDelegate, QStyleOptionViewItem, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle, QProgressBar,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1481,6 +1481,7 @@ class CreateShareDialog(QDialog):
         self.wizard.share_path = path
         self.wizard.users = []
         self.create_btn.setEnabled(False)
+        self.main_window._busy_start()
 
         def apply():
             if self.wizard.has_admin_privileges():
@@ -1510,6 +1511,7 @@ class CreateShareDialog(QDialog):
 
     def _on_create_finished(self, created, log_output):
         self.create_btn.setEnabled(True)
+        self.main_window._busy_stop()
         self._on_done(self.wizard.share_name if created else None, log_output)
         if created:
             self.accept()
@@ -1672,9 +1674,11 @@ class UserManagementPanel(QWidget):
         worker = _Worker(self.wizard.add_user, data["username"], data["password"])
         worker.done.connect(lambda result, log: self._on_created(data["username"], result, log))
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _on_created(self, username, created, log_output):
+        self.main_window._busy_stop()
         if log_output.strip():
             self.main_window.log_panel.append(log_output)
         if created:
@@ -1725,9 +1729,11 @@ class UserManagementPanel(QWidget):
         worker = _Worker(self.wizard.remove_user, username)
         worker.done.connect(lambda result, log, u=username: self._on_deleted(u, result, log))
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _on_deleted(self, username, deleted, log_output):
+        self.main_window._busy_stop()
         if log_output.strip():
             self.main_window.log_panel.append(log_output)
         if deleted:
@@ -1797,6 +1803,7 @@ class UserManagementPanel(QWidget):
             lambda result, log, s=share_name, u=username, p=password: self._on_password_changed(s, u, p, result, log)
         )
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _do_change_password(self, share_name, username, password):
@@ -1810,6 +1817,7 @@ class UserManagementPanel(QWidget):
         return self.wizard.grant_share_access(share_name, username, password, read_only)
 
     def _on_password_changed(self, share, username, password, changed, log_output):
+        self.main_window._busy_stop()
         if log_output.strip():
             self.main_window.log_panel.append(log_output)
         if changed:
@@ -1966,6 +1974,27 @@ class MainWindow(QMainWindow):
 
         self.log_btn = self._toolbar_toggle_button("icon_log", "View Log", "log")
         layout.addWidget(self.log_btn)
+
+        # Indeterminate busy spinner - shown only while at least one
+        # privileged/mutating background action (create/delete share,
+        # add/delete user, grant/revoke/change access, change password)
+        # is running, via _busy_start()/_busy_stop()'s refcount. Restores
+        # gui.py's own header "_busy_bar" (a ttk.Progressbar), dropped
+        # during the Qt migration - its absence left long-running actions
+        # (especially a Windows UAC elevation prompt taking a while to
+        # appear) with zero visual feedback, indistinguishable from the
+        # app having frozen. Not wrapped around plain list_users()/
+        # list_shares() fetches, matching gui.py's original scope - those
+        # are fast reads, not the slow, elevation-prone calls this exists
+        # to cover.
+        self._busy_bar = QProgressBar()
+        self._busy_bar.setRange(0, 0)
+        self._busy_bar.setFixedWidth(100)
+        self._busy_bar.setFixedHeight(14)
+        self._busy_bar.setTextVisible(False)
+        self._busy_bar.hide()
+        self._busy_count = 0
+        layout.addWidget(self._busy_bar)
 
         layout.addStretch(1)
         if os.path.exists(icon_path):
@@ -2173,6 +2202,16 @@ class MainWindow(QMainWindow):
     def _keep_alive(self, worker: _Worker):
         self._workers.append(worker)
         worker.finished.connect(lambda: self._workers.remove(worker) if worker in self._workers else None)
+
+    def _busy_start(self):
+        self._busy_count += 1
+        if self._busy_count == 1:
+            self._busy_bar.show()
+
+    def _busy_stop(self):
+        self._busy_count = max(0, self._busy_count - 1)
+        if self._busy_count == 0:
+            self._busy_bar.hide()
 
     def _toast(self, message):
         # Phase 2 stand-in for gui.py's own transient _Toast widget -
@@ -2589,9 +2628,11 @@ class MainWindow(QMainWindow):
         worker = _Worker(self.wizard.remove_share, share, False)
         worker.done.connect(lambda result, log: self._on_share_deleted(share, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _on_share_deleted(self, share, removed, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if removed:
@@ -2633,9 +2674,11 @@ class MainWindow(QMainWindow):
         )
         worker.done.connect(lambda result, log: self._on_access_granted(share, data["username"], result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _on_access_granted(self, share, username, added, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if added:
@@ -2736,6 +2779,7 @@ class MainWindow(QMainWindow):
         worker = _Worker(self.wizard.grant_share_access, share, username, password, False)
         worker.done.connect(lambda result, log: self._on_access_granted(share, username, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _existing_account_grant_message(self, username):
@@ -2778,9 +2822,11 @@ class MainWindow(QMainWindow):
         worker = _Worker(self.wizard.revoke_share_access, share, user)
         worker.done.connect(lambda result, log: self._on_access_revoked(share, user, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _on_access_revoked(self, share, user, revoked, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if revoked:
@@ -2800,9 +2846,11 @@ class MainWindow(QMainWindow):
         worker = _Worker(self.wizard.change_share_access, share, user, not currently_read_only)
         worker.done.connect(lambda result, log: self._on_access_changed(share, user, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _on_access_changed(self, share, user, changed, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if changed:
