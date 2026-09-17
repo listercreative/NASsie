@@ -251,12 +251,12 @@ class SMBWizard:
         # delete_folder opts into also deleting it, captured before the
         # share definition (and its recorded path) is gone.
         share_path = None
-        if delete_folder:
+        if delete_folder or self.system == "Linux":
             share = next((s for s in self.list_shares() if s["name"] == name), None)
             share_path = share.get("path") if share else None
 
         if self.system == "Linux":
-            ok = self._delete_share_linux(name)
+            ok = self._delete_share_linux(name, share_path)
         elif self.system == "Darwin":
             ok = self._delete_share_macos(name)
         elif self.system == "Windows":
@@ -2627,6 +2627,28 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
                 break
             current = parent
 
+    def _revoke_traversal_acl(self, share_path, group_name):
+        # Counterpart to _grant_traversal_acl(): undoes exactly the
+        # per-ancestor traversal grant that creating this share added, so
+        # deleting it doesn't leave a stale group - or, once the group
+        # itself is later deleted (groupdel doesn't touch filesystem ACLs
+        # at all), an unresolvable bare gid - sitting in an ancestor's ACL
+        # (e.g. $HOME) forever. Walks every ancestor rather than just the
+        # ones the grant actually touched - removing an entry that was
+        # never there is a harmless no-op, and cheaper than also tracking
+        # which ancestors got a real grant.
+        if self.system != "Linux":
+            return
+        if not shutil.which("setfacl"):
+            return
+        current = os.path.dirname(os.path.abspath(share_path))
+        while True:
+            _run(["setfacl", "-x", f"g:{group_name}", current], capture_output=True, text=True)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
     def _expose_share_directory(self, share_path, group_name, path_existed_before):
         # smb.conf's "read only = no" only governs the SMB protocol layer;
         # smbd still enforces real Unix permissions when it impersonates the
@@ -2762,7 +2784,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             )
         return shares
 
-    def _delete_share_linux(self, name):
+    def _delete_share_linux(self, name, share_path=None):
         smb_conf = "/etc/samba/smb.conf"
         if not os.path.exists(smb_conf):
             return False
@@ -2796,6 +2818,9 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
 
         with open(smb_conf, 'w') as f:
             f.writelines(out)
+
+        if share_path:
+            self._revoke_traversal_acl(share_path, self._share_group_name(name))
 
         try:
             self._restart_samba_service()
