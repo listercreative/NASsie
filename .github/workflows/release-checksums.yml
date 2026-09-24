@@ -45,6 +45,30 @@ jobs:
         working-directory: smb-share-wizard/packaging/windows
         run: .\build.ps1
 
+      # build.ps1 leaves the PyInstaller NASsie.exe next to the MSI it just
+      # packed it into. Sign that exe, then rebuild the MSI so it embeds the
+      # signed copy, then sign the MSI wrapper itself.
+      - name: Sign NASsie.exe with Artifact Signing
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: NASsie
+          certificate-profile-name: NASsie-Public-Trust
+          files-folder: ${{ github.workspace }}\smb-share-wizard\packaging\windows
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Rebuild NASsie.msi around the signed exe
+        working-directory: smb-share-wizard/packaging/windows
+        run: |
+          wix build nassie.wxs -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -out NASsie.msi
+          if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+
       - name: Sign NASsie.msi with Artifact Signing
         uses: azure/artifact-signing-action@v2
         with:
@@ -63,9 +87,11 @@ jobs:
       - name: Verify MSI signature
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature smb-share-wizard/packaging/windows/NASsie.msi
-          $sig | Format-List Status, StatusMessage, SignerCertificate
-          if ($sig.Status -ne 'Valid') { throw "NASsie.msi signature is $($sig.Status)" }
+          foreach ($f in 'NASsie.exe', 'NASsie.msi') {
+            $sig = Get-AuthenticodeSignature "smb-share-wizard/packaging/windows/$f"
+            $sig | Format-List Status, StatusMessage, SignerCertificate
+            if ($sig.Status -ne 'Valid') { throw "$f signature is $($sig.Status)" }
+          }
 
       - name: Upload MSI + checksum to release
         shell: bash
