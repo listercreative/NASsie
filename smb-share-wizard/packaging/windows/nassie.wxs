@@ -2,7 +2,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
   <Package Name="NASsie"
-           Manufacturer="Lister Creative Enterprise LLC"
+           Manufacturer="Lister Creative Enterprises LLC"
            Version="0.1.36.0"
            UpgradeCode="4c2e7f0a-9b1d-4e3a-8c6f-2a1b5d7e9f30"
            Compressed="yes">
