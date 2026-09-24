@@ -32,6 +32,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import io
+import math
 import os
 import platform
 import sys
@@ -42,14 +43,14 @@ from PySide6.QtCore import (
     QRegularExpression, QModelIndex, QPoint,
 )
 from PySide6.QtGui import (
-    QIcon, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator, QPainter, QPolygon,
+    QIcon, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator, QPainter, QPainterPath, QPolygon,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QToolButton, QPushButton, QFrame, QTreeWidget, QTreeWidgetItem,
     QLineEdit, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
     QPlainTextEdit, QFileDialog, QStackedWidget, QSizePolicy,
-    QStyledItemDelegate, QStyleOptionViewItem, QStyle, QProgressBar,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1852,6 +1853,85 @@ class LogPanel(QWidget):
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
+_BUSY_SHOW_DELAY_MS = 250
+
+
+class _BusyOverlay(QWidget):
+    """Dimmed scrim over the whole window with the NASsie logo floating on
+    animated waves - shown while background work runs. Covers its parent
+    (so clicks can't land on the UI underneath mid-action) and only ticks
+    its animation timer while visible."""
+
+    _LOGO = 96
+    _WAVE_W = 180
+    _WAVE_H = 34
+
+    def __init__(self, parent: QWidget, icon_path: str):
+        super().__init__(parent)
+        self._pixmap = None
+        if os.path.exists(icon_path):
+            self._pixmap = QPixmap(icon_path).scaled(
+                self._LOGO, self._LOGO,
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
+            )
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._tick)
+        parent.installEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, obj, event):
+        if obj is self.parentWidget() and event.type() == QEvent.Type.Resize:
+            self.setGeometry(self.parentWidget().rect())
+        return False
+
+    def start(self):
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.12) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(255, 255, 255, 170))
+
+        cx, cy = self.width() / 2, self.height() / 2
+        # Logo bobs gently with the waves.
+        bob = math.sin(self._phase) * 3
+        if self._pixmap is not None:
+            p.drawPixmap(int(cx - self._LOGO / 2), int(cy - self._LOGO - 4 + bob), self._pixmap)
+
+        left, top = cx - self._WAVE_W / 2, cy + 4
+        clip = QPainterPath()
+        clip.addRoundedRect(left, top, self._WAVE_W, self._WAVE_H, 8, 8)
+        p.setClipPath(clip)
+        accent = QColor(_COLORS["accent"])
+        for i, (alpha, speed, amp) in enumerate(((110, 1.0, 5), (200, -1.6, 4))):
+            wave = QPainterPath()
+            wave.moveTo(left, top + self._WAVE_H)
+            x = 0.0
+            while x <= self._WAVE_W:
+                y = top + 12 + i * 6 + math.sin(x / 18 + self._phase * speed) * amp
+                wave.lineTo(left + x, y)
+                x += 3
+            wave.lineTo(left + self._WAVE_W, top + self._WAVE_H)
+            wave.closeSubpath()
+            c = QColor(accent)
+            c.setAlpha(alpha)
+            p.fillPath(wave, c)
+        p.end()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1908,6 +1988,17 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
+        # Busy overlay (see _BusyOverlay) - shown by _busy_start()/
+        # _busy_stop()'s refcount while any privileged/mutating background
+        # action (create/delete share, add/delete user, grant/revoke/change
+        # access, change password) is running. Not wrapped around plain
+        # list_users()/list_shares() fetches - those are fast reads.
+        self._busy_count = 0
+        self._busy_overlay = _BusyOverlay(central, icon_path)
+        self._busy_delay = QTimer(self)
+        self._busy_delay.setSingleShot(True)
+        self._busy_delay.setInterval(_BUSY_SHOW_DELAY_MS)
+        self._busy_delay.timeout.connect(self._busy_overlay.start)
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(0)
@@ -1974,27 +2065,6 @@ class MainWindow(QMainWindow):
 
         self.log_btn = self._toolbar_toggle_button("icon_log", "View Log", "log")
         layout.addWidget(self.log_btn)
-
-        # Indeterminate busy spinner - shown only while at least one
-        # privileged/mutating background action (create/delete share,
-        # add/delete user, grant/revoke/change access, change password)
-        # is running, via _busy_start()/_busy_stop()'s refcount. Restores
-        # gui.py's own header "_busy_bar" (a ttk.Progressbar), dropped
-        # during the Qt migration - its absence left long-running actions
-        # (especially a Windows UAC elevation prompt taking a while to
-        # appear) with zero visual feedback, indistinguishable from the
-        # app having frozen. Not wrapped around plain list_users()/
-        # list_shares() fetches, matching gui.py's original scope - those
-        # are fast reads, not the slow, elevation-prone calls this exists
-        # to cover.
-        self._busy_bar = QProgressBar()
-        self._busy_bar.setRange(0, 0)
-        self._busy_bar.setFixedWidth(100)
-        self._busy_bar.setFixedHeight(14)
-        self._busy_bar.setTextVisible(False)
-        self._busy_bar.hide()
-        self._busy_count = 0
-        layout.addWidget(self._busy_bar)
 
         layout.addStretch(1)
         if os.path.exists(icon_path):
@@ -2206,12 +2276,14 @@ class MainWindow(QMainWindow):
     def _busy_start(self):
         self._busy_count += 1
         if self._busy_count == 1:
-            self._busy_bar.show()
+            # Brief delay so near-instant actions don't flash the overlay.
+            self._busy_delay.start()
 
     def _busy_stop(self):
         self._busy_count = max(0, self._busy_count - 1)
         if self._busy_count == 0:
-            self._busy_bar.hide()
+            self._busy_delay.stop()
+            self._busy_overlay.stop()
 
     def _toast(self, message):
         # Phase 2 stand-in for gui.py's own transient _Toast widget -
@@ -2955,6 +3027,13 @@ def run():
         # native Wayland path on purpose) isn't silently overridden.
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     app = QApplication(sys.argv)
+    # Without these, the window manager only sees the interpreter's own
+    # name (python3 / gui_qt.py) as the app identity, so the dock/taskbar
+    # can't match this window to nassie.desktop (StartupWMClass=NASsie)
+    # and shows the wrong name and icon.
+    app.setApplicationName("NASsie")
+    app.setDesktopFileName("nassie")
+    app.setWindowIcon(QIcon(os.path.join(_asset_base_dir(), "nassie_icon.png")))
     app.setFont(QFont(_DEFAULT_FONT_FAMILY, _DEFAULT_FONT_SIZE))
     _apply_base_palette(app)
     app.setStyleSheet(_build_stylesheet())

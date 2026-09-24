@@ -45,6 +45,28 @@ jobs:
         working-directory: smb-share-wizard/packaging/windows
         run: .\build.ps1
 
+      - name: Sign NASsie.msi with Artifact Signing
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: NASsie
+          certificate-profile-name: NASsie-Public-Trust
+          files-folder: ${{ github.workspace }}\smb-share-wizard\packaging\windows
+          files-folder-filter: msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify MSI signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature smb-share-wizard/packaging/windows/NASsie.msi
+          $sig | Format-List Status, StatusMessage, SignerCertificate
+          if ($sig.Status -ne 'Valid') { throw "NASsie.msi signature is $($sig.Status)" }
+
       - name: Upload MSI + checksum to release
         shell: bash
         env:
