@@ -579,12 +579,12 @@ class GuiTourQt:
              "including ones not made by NASsie (indicated by \"existing account\"). Select "
              "the user that you just created.",
              "user_attached"),
-            (lambda: gui, lambda: self._row_action_button(2),
+            (lambda: gui, lambda: self._row_action_button(gui._share_action_bar._layout.count() - 1),
              "Delete Share",
              "Press the Delete share button.",
              "share_delete_dialog_opened"),
             (lambda: gui, None,
-             "Delete Share", "Press No to return to the main window. Your share will NOT be deleted.",
+             "Delete Share", "Press Cancel to return to the main window. Your share will NOT be deleted.",
              "share_delete_dialog_cancelled"),
 
             (lambda: gui, lambda: self._newest_user_row(),
