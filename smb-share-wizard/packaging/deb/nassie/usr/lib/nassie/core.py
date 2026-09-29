@@ -191,6 +191,31 @@ def _validate_against(value, max_len, pattern, label):
     return True, None
 
 
+def _managed_share_only(func):
+    """Refuse to act on a share NASsie didn't create. Wraps every method
+    that changes an existing share (or its users/groups), so the rule
+    holds no matter which UI - or elevated relaunch - calls it."""
+    import functools
+    import inspect
+    signature = inspect.signature(func)
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if getattr(self, "_allow_unmanaged_changes", False):
+            # Set only by the uninstall path, which must be able to remove
+            # what earlier NASsie builds created (they lack the marker).
+            return func(self, *args, **kwargs)
+        bound = signature.bind(self, *args, **kwargs)
+        name = bound.arguments.get("share_name", bound.arguments.get("name"))
+        shares = self.list_shares(include_unmanaged=True)
+        share = next((s for s in shares if s["name"] == name), None)
+        if share is not None and not self.is_managed_share(share):
+            print(f"Refusing to change '{name}': it wasn't set up by NASsie.")
+            return False
+        return func(self, *args, **kwargs)
+    return wrapper
+
+
 class SMBWizard:
     """Platform detection, persistence, privilege elevation, and the actual
     per-OS commands that create/apply an SMB share. No UI code lives here —
@@ -230,20 +255,30 @@ class SMBWizard:
             return sudo_user
         return None
 
-    def list_shares(self):
+    def list_shares(self, include_unmanaged=False):
         # NASsie is just a helper for Samba/NTFS sharing - it doesn't keep
         # its own record of what shares exist, because that copy can drift
         # from reality (a share that failed to apply would still show up as
         # "created"; a share removed some other way would linger forever).
         # This always reads the live configuration instead.
+        #
+        # Shares NASsie didn't create are never returned (and every
+        # mutating method below refuses them) unless a caller explicitly
+        # asks for include_unmanaged=True - only name-collision checks do,
+        # since a hidden share still owns its name.
         if self.system == "Linux":
-            return self._list_shares_linux()
+            shares = self._list_shares_linux()
         elif self.system == "Darwin":
-            return self._list_shares_macos()
+            shares = self._list_shares_macos()
         elif self.system == "Windows":
-            return self._list_shares_windows()
-        return []
+            shares = self._list_shares_windows()
+        else:
+            return []
+        if include_unmanaged:
+            return shares
+        return [s for s in shares if self.is_managed_share(s)]
 
+    @_managed_share_only
     def delete_share(self, name, delete_folder=False):
         # Requires root. Callers not already elevated should go through
         # remove_share() instead, which handles that. Removing the share
@@ -251,12 +286,16 @@ class SMBWizard:
         # delete_folder opts into also deleting it, captured before the
         # share definition (and its recorded path) is gone.
         share_path = None
-        if delete_folder:
-            share = next((s for s in self.list_shares() if s["name"] == name), None)
+        if delete_folder or self.system == "Linux":
+            share = next(
+                (s for s in self.list_shares(include_unmanaged=getattr(self, "_allow_unmanaged_changes", False))
+                 if s["name"] == name),
+                None,
+            )
             share_path = share.get("path") if share else None
 
         if self.system == "Linux":
-            ok = self._delete_share_linux(name)
+            ok = self._delete_share_linux(name, share_path)
         elif self.system == "Darwin":
             ok = self._delete_share_macos(name)
         elif self.system == "Windows":
@@ -294,6 +333,303 @@ class SMBWizard:
             return self.delete_share(name, delete_folder)
         return self.elevate_and_delete(name, delete_folder)
 
+    # -- editing an existing share (rename and/or change folder) -----------
+
+    def is_managed_share(self, share):
+        """True only for shares NASsie itself created (they carry its
+        explicit marker - see below). Anything else is never shown or
+        edited."""
+        if self.system == "Darwin":
+            return True  # macOS isn't shipped; behaviour left unchanged
+        # Strictly the explicit marker NASsie stamps on a share when it
+        # creates it - Windows: the share's Description; Linux: a comment
+        # line in its smb.conf block. Anything without it, INCLUDING
+        # shares made by earlier NASsie builds, is treated as a prior
+        # existing share: hidden from the user and never modified.
+        return bool(share.get("nassie_managed"))
+
+    # -- adopting shares from earlier NASsie versions -----------------------
+
+    def find_unadopted_shares(self):
+        """Shares an earlier NASsie build created (they have NASsie's own
+        ownership group) but that lack today's explicit marker, so they're
+        currently hidden. Nothing else qualifies: a hand-made share has no
+        NASsie ownership group. NASsie's accounts need no such step -
+        they're recognised by their own marker (nologin shell / Windows
+        account description) that every build has always set."""
+        found = []
+        for share in self.list_shares(include_unmanaged=True):
+            if self.is_managed_share(share):
+                continue
+            if self.system == "Linux":
+                group = self._share_group_name(share["name"])
+                owned = _run(["getent", "group", group], capture_output=True, text=True).returncode == 0
+            elif self.system == "Windows":
+                owned = (share.get("group") or "").startswith("NASsie_")
+            else:
+                owned = False
+            if owned:
+                found.append(share)
+        return found
+
+    def adopt_existing_shares(self):
+        # Requires root/admin; callers not already elevated use
+        # adopt_existing(). Only stamps the marker - nothing else about
+        # the shares, their users or their permissions changes.
+        candidates = self.find_unadopted_shares()
+        if not candidates:
+            return True
+        names = {s["name"] for s in candidates}
+        if self.system == "Linux":
+            smb_conf = "/etc/samba/smb.conf"
+            with open(smb_conf, "r") as f:
+                lines = f.readlines()
+            out = []
+            for raw in lines:
+                out.append(raw)
+                stripped = raw.strip()
+                if stripped.startswith("[") and stripped.endswith("]") and stripped[1:-1] in names:
+                    out.append("    # NASsie-managed\n")
+            with open(smb_conf, "w") as f:
+                f.writelines(out)
+            try:
+                self._restart_samba_service()
+            except Exception as e:
+                print(f"[Linux] Adopted shares but failed to restart Samba: {e}")
+        elif self.system == "Windows":
+            for name in sorted(names):
+                proc = _run(
+                    ["powershell", "-Command",
+                     f"Set-SmbShare -Name '{self._ps_quote(name)}' -Description '{self._WINDOWS_SHARE_MARKER}' -Force"],
+                    capture_output=True, text=True,
+                )
+                if proc.returncode != 0:
+                    print(f"[Windows] Could not adopt '{name}': {(proc.stderr or '').strip()}")
+                    return False
+        else:
+            return False
+        print(f"Adopted {len(names)} existing NASsie share(s): {', '.join(sorted(names))}.")
+        return True
+
+    def adopt_existing(self):
+        if self.has_admin_privileges():
+            return self.adopt_existing_shares()
+        return self._elevated_relaunch("--adopt-shares", {})
+
+    @staticmethod
+    def adopt_shares_from_file(path):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        wizard = SMBWizard()
+        wizard._invoking_user_override = data.get('_invoking_user')
+        return wizard.adopt_existing_shares()
+
+    def check_share_edit(self, old_name, new_name, new_path):
+        """(ok, message) for editing `old_name` into `new_name`/`new_path`.
+        Same validators as creation, except a share's own current name
+        doesn't count as a collision with itself (a capitalization-only
+        rename is allowed)."""
+        ok, message = _validate_against(new_name, SHARE_NAME_MAX_LEN, SHARE_NAME_RE, "Share name")
+        if not ok:
+            return False, message
+        shares = self.list_shares(include_unmanaged=True)
+        current = next((s for s in shares if s["name"] == old_name), None)
+        if current is None:
+            return False, f"Share '{old_name}' no longer exists."
+        if not self.is_managed_share(current):
+            return False, f"'{old_name}' wasn't set up by NASsie, so it can't be edited here."
+        others = {s["name"].lower() for s in shares if s["name"] != old_name}
+        if new_name.lower() in others:
+            return False, f"A share named '{new_name}' (or differing only by capitalization) already exists."
+        ok, message = self.check_share_path(new_path)
+        if not ok:
+            return False, message
+        old_abs = os.path.normcase(os.path.abspath(os.path.expanduser(current.get("path") or "")))
+        new_abs = os.path.normcase(os.path.abspath(os.path.expanduser(new_path)))
+        if new_name == old_name and old_abs == new_abs:
+            return False, "Nothing to change."
+        return True, None
+
+    def edit_share(self, old_name, new_name, new_path):
+        # Requires root/admin - callers not already elevated go through
+        # update_share(). Only the share definition and its permissions
+        # move; the files themselves are never copied, moved or deleted.
+        ok, message = self.check_share_edit(old_name, new_name, new_path)
+        if not ok:
+            print(f"Cannot edit share: {message}")
+            return False
+        if self.system == "Linux":
+            return self._edit_share_linux(old_name, new_name, new_path)
+        if self.system == "Windows":
+            return self._edit_share_windows(old_name, new_name, new_path)
+        print(f"Editing shares isn't supported on {self.system}.")
+        return False
+
+    def update_share(self, old_name, new_name, new_path):
+        if self.has_admin_privileges():
+            return self.edit_share(old_name, new_name, new_path)
+        return self.elevate_and_edit_share(old_name, new_name, new_path)
+
+    def _edit_share_linux(self, old_name, new_name, new_path):
+        smb_conf = "/etc/samba/smb.conf"
+        share = next((s for s in self._list_shares_linux() if s["name"] == old_name), None)
+        if share is None or not os.path.exists(smb_conf):
+            print(f"[Linux] No such share: '{old_name}'")
+            return False
+        old_path = share.get("path") or ""
+        old_group = share.get("group")
+        new_path = os.path.abspath(os.path.expanduser(new_path))
+        path_changed = os.path.abspath(old_path) != new_path if old_path else True
+
+        # Rename the ownership group too, but only if it's the one NASsie
+        # itself named after the old share - never a group it doesn't own.
+        group = old_group
+        rename_group = (
+            old_group is not None
+            and old_group == self._share_group_name(old_name)
+            and self._share_group_name(new_name) != old_group
+        )
+        new_group = self._share_group_name(new_name)
+        if rename_group and _run(["getent", "group", new_group], capture_output=True, text=True).returncode == 0:
+            print(f"[Linux] Group '{new_group}' already exists - keeping '{old_group}' as this share's group.")
+            rename_group = False
+
+        with open(smb_conf, "r") as f:
+            original_conf = f.read()
+
+        # Rewrite just this share's block: its header and its path line.
+        out, in_target, found = [], False, False
+        for raw in original_conf.splitlines(keepends=True):
+            stripped = raw.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_target = stripped == f"[{old_name}]"
+                if in_target:
+                    found = True
+                    out.append(f"[{new_name}]\n")
+                    continue
+            elif in_target:
+                bare = stripped.split("#", 1)[0].split(";", 1)[0].strip()
+                if "=" in bare and bare.split("=", 1)[0].strip().lower() == "path":
+                    out.append(f"    path = {new_path}\n")
+                    continue
+            out.append(raw)
+        if not found:
+            print(f"[Linux] Could not find [{old_name}] in {smb_conf}.")
+            return False
+
+        renamed = False
+        try:
+            if rename_group:
+                print(f"[Linux] Renaming group '{old_group}' to '{new_group}'...")
+                _run(["groupmod", "-n", new_group, old_group], check=True, capture_output=True, text=True)
+                renamed = True
+                group = new_group
+
+            if path_changed:
+                existed = os.path.isdir(new_path)
+                os.makedirs(new_path, exist_ok=True)
+                if group:
+                    self._expose_share_directory(new_path, group, existed)
+
+            with open(smb_conf, "w") as f:
+                f.write("".join(out))
+
+            if group:
+                if path_changed and old_path:
+                    # ACL entries are keyed by gid, so the old path's
+                    # traversal grant is still revocable by the new name.
+                    self._revoke_traversal_acl(old_path, group)
+                self._grant_traversal_acl(new_path, group)
+
+            self._restart_samba_service()
+        except Exception as e:
+            print(f"[Linux] Edit failed, rolling back: {e}")
+            try:
+                with open(smb_conf, "w") as f:
+                    f.write(original_conf)
+                if renamed:
+                    _run(["groupmod", "-n", old_group, new_group], capture_output=True, text=True)
+                self._restart_samba_service()
+            except Exception as rollback_error:
+                print(f"[Linux] Rollback also failed: {rollback_error}")
+            return False
+        print(f"[Linux] Share '{old_name}' is now '{new_name}' at '{new_path}'.")
+        return True
+
+    def _edit_share_windows(self, old_name, new_name, new_path):
+        share = next((s for s in self._list_shares_windows() if s["name"] == old_name), None)
+        if share is None:
+            print(f"[Windows] No such share: '{old_name}'")
+            return False
+        old_path = share.get("path") or ""
+        old_group = self._windows_group_name(old_name)
+        new_group = self._windows_group_name(new_name)
+        path_changed = os.path.normcase(os.path.abspath(old_path)) != os.path.normcase(os.path.abspath(new_path))
+        has_group = bool(share.get("group"))
+        group = old_group
+        renamed = False
+        try:
+            if path_changed:
+                _run(["powershell", "-Command", f"New-Item -Path '{self._ps_quote(new_path)}' -ItemType Directory -Force"],
+                     check=True, capture_output=True, text=True)
+                if has_group:
+                    self._grant_windows_ntfs_permissions(new_path, old_group)
+            if has_group and old_group != new_group:
+                exists = _run(
+                    ["powershell", "-Command", f"if (Get-LocalGroup -Name '{self._ps_quote(new_group)}' -ErrorAction SilentlyContinue) {{ exit 3 }}"],
+                    capture_output=True, text=True,
+                ).returncode == 3
+                if not exists:
+                    _run(["powershell", "-Command",
+                          f"Rename-LocalGroup -Name '{self._ps_quote(old_group)}' -NewName '{self._ps_quote(new_group)}'"],
+                         check=True, capture_output=True, text=True)
+                    renamed = True
+                    group = new_group
+
+            # SMB shares can't be renamed or re-pointed in place: capture
+            # every ACE, recreate the share, re-apply them - and put the
+            # original back if any step fails.
+            script = (
+                f"$old = '{self._ps_quote(old_name)}'; $new = '{self._ps_quote(new_name)}'; "
+                f"$oldPath = '{self._ps_quote(old_path)}'; $newPath = '{self._ps_quote(new_path)}'\n"
+                "$ace = @(Get-SmbShareAccess -Name $old | ForEach-Object { "
+                "[PSCustomObject]@{ Account = $_.AccountName; Right = $_.AccessRight.ToString() } })\n"
+                "function Restore($name, $path) {\n"
+                f"  New-SmbShare -Name $name -Path $path -FullAccess 'Administrators' -Description '{self._WINDOWS_SHARE_MARKER}' | Out-Null\n"
+                "  foreach ($a in $ace) { if ($a.Account -notmatch 'Administrators$') {\n"
+                "    Grant-SmbShareAccess -Name $name -AccountName $a.Account -AccessRight $a.Right -Force | Out-Null } }\n"
+                "}\n"
+                "Remove-SmbShare -Name $old -Force -ErrorAction Stop\n"
+                "try { Restore $new $newPath } catch {\n"
+                "  Remove-SmbShare -Name $new -Force -ErrorAction SilentlyContinue\n"
+                "  Restore $old $oldPath\n"
+                "  Write-Error $_; exit 1\n"
+                "}\n"
+            )
+            proc = self._run_ps_script(script, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError((proc.stderr or proc.stdout or "share swap failed").strip())
+
+            if path_changed and old_path and has_group:
+                # Drop the group's NTFS grant on the folder it no longer serves.
+                _run(["icacls", old_path, "/remove", group], capture_output=True, text=True)
+        except Exception as e:
+            print(f"[Windows] Edit failed: {e}")
+            if renamed:
+                _run(["powershell", "-Command",
+                      f"Rename-LocalGroup -Name '{self._ps_quote(new_group)}' -NewName '{self._ps_quote(old_group)}'"],
+                     capture_output=True, text=True)
+            return False
+        print(f"[Windows] Share '{old_name}' is now '{new_name}' at '{new_path}'.")
+        return True
+
     def create_user(self, username, password):
         # Requires root/admin. Creates (or resets the password of) a
         # standalone account not attached to any share or group - lets a
@@ -316,6 +652,7 @@ class SMBWizard:
             return self.create_user(username, password)
         return self.elevate_and_create_user(username, password)
 
+    @_managed_share_only
     def add_user_to_share(self, share_name, username, password, read_only=False):
         # Requires root. Callers not already elevated should go through
         # grant_share_access() instead, which handles that.
@@ -355,6 +692,7 @@ class SMBWizard:
             return self._verify_password_windows(username, password)
         return False
 
+    @_managed_share_only
     def set_share_user_access(self, share_name, username, read_only):
         # Changes an existing share user's read-only status without
         # touching their password or group membership - the "change access
@@ -446,6 +784,7 @@ class SMBWizard:
             return self._windows_access_group_name(name)
         return self._posix_access_group_name(name)
 
+    @_managed_share_only
     def assign_group_to_share(self, group_name, share_name, read_only):
         # Requires root/admin. Grants group_name real, persistent SMB-level
         # access to share_name (Full or Read) - unlike set_group_access_level
@@ -470,6 +809,7 @@ class SMBWizard:
             return self.assign_group_to_share(group_name, share_name, read_only)
         return self.elevate_and_assign_group_to_share(group_name, share_name, read_only)
 
+    @_managed_share_only
     def unassign_group_from_share(self, group_name, share_name):
         # Requires root/admin. The inverse of assign_group_to_share() -
         # revokes the group's own grant on this one share; members keep
@@ -520,6 +860,7 @@ class SMBWizard:
                     overrides[(share["name"], username)] = (access_group, group_read_only)
         return overrides
 
+    @_managed_share_only
     def remove_user_from_share(self, share_name, username):
         # Requires root. Revokes access to one share only (valid-users entry
         # + group membership) - the account itself, and its access to any
@@ -928,7 +1269,7 @@ class SMBWizard:
         # silently-conflicting share in the first place, rather than
         # trying to patch every downstream case-sensitivity assumption
         # individually.
-        existing_names = {s["name"].lower() for s in self.list_shares()}
+        existing_names = {s["name"].lower() for s in self.list_shares(include_unmanaged=True)}
         if check_name.lower() in existing_names:
             return False, f"A share named '{check_name}' (or differing only by capitalization) already exists."
         return True, None
@@ -1198,6 +1539,11 @@ class SMBWizard:
     def elevate_and_delete(self, name, delete_folder=False):
         return self._elevated_relaunch("--delete-share", {"name": name, "delete_folder": delete_folder})
 
+    def elevate_and_edit_share(self, old_name, new_name, new_path):
+        return self._elevated_relaunch(
+            "--edit-share", {"old_name": old_name, "new_name": new_name, "new_path": new_path}
+        )
+
     def elevate_and_grant_access(self, share_name, username, password, read_only=False):
         return self._elevated_relaunch(
             "--add-user", {"share": share_name, "username": username, "password": password, "read_only": read_only}
@@ -1273,7 +1619,22 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.delete_share(data['name'], data.get('delete_folder', False))
+        return wizard.delete_share(data['name'], data.get('delete_folder', False))
+
+    @staticmethod
+    def edit_share_from_file(path):
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        wizard = SMBWizard()
+        wizard._invoking_user_override = data.get('_invoking_user')
+        return wizard.edit_share(data['old_name'], data['new_name'], data['new_path'])
 
     @staticmethod
     def create_user_from_file(path):
@@ -1288,7 +1649,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.create_user(data['username'], data['password'])
+        return wizard.create_user(data['username'], data['password'])
 
     @staticmethod
     def add_user_to_share_from_file(path):
@@ -1303,7 +1664,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.add_user_to_share(data['share'], data['username'], data['password'], data.get('read_only', False))
+        return wizard.add_user_to_share(data['share'], data['username'], data['password'], data.get('read_only', False))
 
     @staticmethod
     def change_access_from_file(path):
@@ -1318,7 +1679,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.set_share_user_access(data['share'], data['username'], data['read_only'])
+        return wizard.set_share_user_access(data['share'], data['username'], data['read_only'])
 
     @staticmethod
     def change_group_access_from_file(path):
@@ -1333,7 +1694,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.set_group_access_level(data['group'], data['share'], data['read_only'])
+        return wizard.set_group_access_level(data['group'], data['share'], data['read_only'])
 
     @staticmethod
     def revoke_share_access_from_file(path):
@@ -1348,7 +1709,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.remove_user_from_share(data['share'], data['username'])
+        return wizard.remove_user_from_share(data['share'], data['username'])
 
     @staticmethod
     def delete_user_from_file(path):
@@ -1363,7 +1724,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.delete_user(data['username'])
+        return wizard.delete_user(data['username'])
 
     @staticmethod
     def delete_group_from_file(path):
@@ -1378,7 +1739,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.delete_group(data['name'])
+        return wizard.delete_group(data['name'])
 
     @staticmethod
     def assign_user_to_group_from_file(path):
@@ -1393,7 +1754,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.add_user_to_group(data['username'], data['group'])
+        return wizard.add_user_to_group(data['username'], data['group'])
 
     @staticmethod
     def revoke_group_membership_from_file(path):
@@ -1408,7 +1769,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.remove_user_from_group(data['username'], data['group'])
+        return wizard.remove_user_from_group(data['username'], data['group'])
 
     @staticmethod
     def create_group_from_file(path):
@@ -1423,7 +1784,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.create_group(data['name'])
+        return wizard.create_group(data['name'])
 
     @staticmethod
     def assign_group_to_share_from_file(path):
@@ -1438,7 +1799,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.assign_group_to_share(data['group'], data['share'], data['read_only'])
+        return wizard.assign_group_to_share(data['group'], data['share'], data['read_only'])
 
     @staticmethod
     def unassign_group_from_share_from_file(path):
@@ -1453,7 +1814,7 @@ class SMBWizard:
 
         wizard = SMBWizard()
         wizard._invoking_user_override = data.get('_invoking_user')
-        wizard.unassign_group_from_share(data['group'], data['share'])
+        return wizard.unassign_group_from_share(data['group'], data['share'])
 
     @staticmethod
     def create_desktop_shortcut_windows():
@@ -1589,7 +1950,7 @@ class SMBWizard:
 
         try:
             wizard = SMBWizard()
-            shares = [s for s in wizard.list_shares() if s.get("group") and s.get("path")]
+            shares = [s for s in wizard.list_shares(include_unmanaged=True) if (s.get("group") or s.get("nassie_managed")) and s.get("path")]
             if not shares:
                 return
 
@@ -1665,7 +2026,7 @@ class SMBWizard:
         # ordinary share, only for one with an admin-assigned access-control
         # group. Determined here in Python (reusing the already-correct
         # list_shares() logic) rather than re-derived inside the PS script.
-        nassie_share_names = [s["name"] for s in wizard.list_shares() if s.get("group")]
+        nassie_share_names = [s["name"] for s in wizard.list_shares(include_unmanaged=True) if s.get("group") or s.get("nassie_managed")]
         share_list_ps = "@(" + ",".join(f"'{wizard._ps_quote(n)}'" for n in nassie_share_names) + ")"
 
         script = f"""
@@ -1829,6 +2190,8 @@ Get-LocalUser | Where-Object {{ $_.Description -eq '{marker}' }} | ForEach-Objec
     # live account IS the source of truth, this marker lives on it, and
     # can never drift out of sync the way a side file could).
     _WINDOWS_ACCOUNT_MARKER = "Created by NASsie"
+    # Same idea for shares: written to New-SmbShare's -Description.
+    _WINDOWS_SHARE_MARKER = "Created by NASsie"
 
     def _windows_user_exists(self, username):
         escaped = self._ps_quote(username)
@@ -2008,6 +2371,7 @@ Remove-Item $cfgPath,$dbPath -ErrorAction SilentlyContinue
             cmd = (
                 f"if (-not (Get-SmbShare -Name '{escaped_share}' -ErrorAction SilentlyContinue)) {{ "
                 f"New-SmbShare -Name '{escaped_share}' -Path '{escaped_path}' -FullAccess 'Administrators' "
+                f"-Description '{self._WINDOWS_SHARE_MARKER}' "
                 f"}}"
             )
             _run(["powershell", "-Command", cmd], check=True, capture_output=True, text=True)
@@ -2070,7 +2434,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             "| ForEach-Object { "
             "$access = Get-SmbShareAccess -Name $_.Name | Select-Object AccountName,"
             "@{Name='AccessRight';Expression={$_.AccessRight.ToString()}}; "
-            "[PSCustomObject]@{ Name = $_.Name; Path = $_.Path; Access = $access } "
+            "[PSCustomObject]@{ Name = $_.Name; Path = $_.Path; Description = $_.Description; Access = $access } "
             "} | ConvertTo-Json -Compress -Depth 4"
         )
         proc = _run(["powershell", "-Command", cmd], capture_output=True, text=True)
@@ -2126,6 +2490,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             share = {
                 "name": share_name,
                 "path": s.get("Path", ""),
+                "nassie_managed": (s.get("Description") or "") == self._WINDOWS_SHARE_MARKER,
                 "users": [],
                 "group": ownership_group if ownership_group in existing_groups else None,
                 "access_group": None,
@@ -2470,6 +2835,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         valid_users = usernames if usernames else [self._NO_USERS_PLACEHOLDER]
         block = (
             f"\n[{share_name}]\n"
+            f"    # NASsie-managed\n"
             f"    path = {share_path}\n"
             f"    browsable = yes\n"
             f"    read only = no\n"
@@ -2627,6 +2993,28 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
                 break
             current = parent
 
+    def _revoke_traversal_acl(self, share_path, group_name):
+        # Counterpart to _grant_traversal_acl(): undoes exactly the
+        # per-ancestor traversal grant that creating this share added, so
+        # deleting it doesn't leave a stale group - or, once the group
+        # itself is later deleted (groupdel doesn't touch filesystem ACLs
+        # at all), an unresolvable bare gid - sitting in an ancestor's ACL
+        # (e.g. $HOME) forever. Walks every ancestor rather than just the
+        # ones the grant actually touched - removing an entry that was
+        # never there is a harmless no-op, and cheaper than also tracking
+        # which ancestors got a real grant.
+        if self.system != "Linux":
+            return
+        if not shutil.which("setfacl"):
+            return
+        current = os.path.dirname(os.path.abspath(share_path))
+        while True:
+            _run(["setfacl", "-x", f"g:{group_name}", current], capture_output=True, text=True)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
     def _expose_share_directory(self, share_path, group_name, path_existed_before):
         # smb.conf's "read only = no" only governs the SMB protocol layer;
         # smbd still enforces real Unix permissions when it impersonates the
@@ -2724,6 +3112,8 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
 
         with open(smb_conf, 'r') as f:
             for raw_line in f:
+                if current is not None and "NASsie-managed" in raw_line and raw_line.lstrip().startswith("#"):
+                    current["nassie_managed"] = True
                 line = raw_line.split('#', 1)[0].split(';', 1)[0].strip()
                 if not line:
                     continue
@@ -2762,7 +3152,7 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
             )
         return shares
 
-    def _delete_share_linux(self, name):
+    def _delete_share_linux(self, name, share_path=None):
         smb_conf = "/etc/samba/smb.conf"
         if not os.path.exists(smb_conf):
             return False
@@ -2796,6 +3186,9 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
 
         with open(smb_conf, 'w') as f:
             f.writelines(out)
+
+        if share_path:
+            self._revoke_traversal_acl(share_path, self._share_group_name(name))
 
         try:
             self._restart_samba_service()
@@ -3027,7 +3420,8 @@ Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like '*Tailscale*' 
         # just the one they were most recently added to, so deleting the
         # account doesn't leave dangling references to a user that no longer
         # exists.
-        for share in self._list_shares_linux():
+        # Managed shares only: a share NASsie didn't create is never modified.
+        for share in self.list_shares():
             if any(u["username"] == username for u in share.get("users", [])):
                 self._remove_valid_user_from_smb_conf(share["name"], username)
 

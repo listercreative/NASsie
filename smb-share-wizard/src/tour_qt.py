@@ -41,6 +41,7 @@ from PySide6.QtCore import Qt, QRect, QPoint, QEvent, QObject, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QDialogButtonBox, QMessageBox, QApplication,
+    QScrollBar,
 )
 
 from tour_state import mark_tour_started, mark_tour_completed
@@ -353,6 +354,14 @@ class _ContainerTracker(QObject):
 _BLOCKED_MOUSE_EVENTS = (
     QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonDblClick, QEvent.Type.MouseButtonRelease,
 )
+_KEY_EVENTS = (QEvent.Type.KeyPress, QEvent.Type.KeyRelease)
+# Keys that can't activate anything: plain focus movement and bare
+# modifiers. Escape is added for dialog steps (it means "Cancel", which
+# the dialog's own reject() already routes through the tour).
+_HARMLESS_KEYS = {
+    Qt.Key.Key_Tab, Qt.Key.Key_Backtab, Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt,
+    Qt.Key.Key_Meta, Qt.Key.Key_AltGr, Qt.Key.Key_CapsLock,
+}
 
 
 class _TourInputGuard(QObject):
@@ -389,7 +398,9 @@ class _TourInputGuard(QObject):
         self._tour = tour
 
     def eventFilter(self, obj, event):
-        if event.type() not in _BLOCKED_MOUSE_EVENTS:
+        etype = event.type()
+        is_key = etype in _KEY_EVENTS
+        if etype not in _BLOCKED_MOUSE_EVENTS and not is_key and etype != QEvent.Type.ContextMenu:
             return False
         tour = self._tour
         if tour._callout is None or tour._wait_event is None:
@@ -435,6 +446,19 @@ class _TourInputGuard(QObject):
             # math needed.
             if not hasattr(obj, "window") or obj.window() is not tour._current_container:
                 return False
+            if is_key:
+                # Keyboard can activate any focused button/row (Space,
+                # Enter, arrows, Delete, ...) without a click ever
+                # touching the target - only focus movement (and Escape
+                # in a dialog step) is left alone.
+                key = event.key()
+                return not (key in _HARMLESS_KEYS or (key == Qt.Key.Key_Escape and tour._current_container is not tour.gui))
+            if etype == QEvent.Type.ContextMenu:
+                return True
+            if etype == QEvent.Type.MouseButtonDblClick:
+                # A double-click can activate/expand/collapse a row even
+                # when its first click was on the allowed target.
+                return True
             if self._event_is_allowed(widget, event):
                 return False
         except RuntimeError:
@@ -455,11 +479,16 @@ class _TourInputGuard(QObject):
             # be blocked.
             return True
         if isinstance(widget, _TreeRegion):
-            if widget.global_rect().contains(pos):
+            # An empty region (its row doesn't exist yet) falls back to the
+            # whole tree for DRAWING - it must never mean "everything is
+            # clickable".
+            if widget.items and widget.global_rect().contains(pos):
                 return True
             tree = widget.tree
-            for bar in (tree.verticalScrollBar(), tree.horizontalScrollBar()):
-                if bar is not None and bar.isVisible() and QRect(bar.mapToGlobal(QPoint(0, 0)), bar.size()).contains(pos):
+            # Includes the overlay scrollbar (a child of the tree, see
+            # gui_qt._AutoHideScrollBars), not just the native bars.
+            for bar in tree.findChildren(QScrollBar):
+                if bar.isVisible() and QRect(bar.mapToGlobal(QPoint(0, 0)), bar.size()).contains(pos):
                     return True
             return False
         target = widget.widget if isinstance(widget, (_PointAtOnly, _HighlightWholeDialog)) else widget
@@ -493,23 +522,31 @@ class GuiTourQt:
         self._input_guard = _TourInputGuard(self)
         QApplication.instance().installEventFilter(self._input_guard)
 
+    def _created_share_item(self):
+        """The share the tour itself created, never just "the last row"
+        (which could be a share that already existed)."""
+        gui = self.gui
+        tree = gui.shares_tree
+        name = gui._tour_created_share
+        for i in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(i)
+            if item is not gui._add_share_row and name is not None and item.text(0) == name:
+                return item
+        return None
+
     def _newest_share_region(self):
         tree = self.gui.shares_tree
-        count = tree.topLevelItemCount()
-        for i in range(count - 1, -1, -1):
-            item = tree.topLevelItem(i)
-            if item is not self.gui._add_share_row:
-                children = [item.child(j) for j in range(item.childCount())]
-                return _TreeRegion(tree, [item] + children)
-        return _TreeRegion(tree, [])
+        item = self._created_share_item()
+        if item is None:
+            return _TreeRegion(tree, [])
+        children = [item.child(j) for j in range(item.childCount())]
+        return _TreeRegion(tree, [item] + children)
 
     def _newest_user_row(self):
         tree = self.gui.shares_tree
-        count = tree.topLevelItemCount()
-        for i in range(count - 1, -1, -1):
-            item = tree.topLevelItem(i)
-            if item is not self.gui._add_share_row and item.childCount() > 0:
-                return _TreeRegion(tree, [item.child(item.childCount() - 1)])
+        item = self._created_share_item()
+        if item is not None and item.childCount() > 0:
+            return _TreeRegion(tree, [item.child(item.childCount() - 1)])
         return _TreeRegion(tree, [])
 
     def _row_action_button(self, index):

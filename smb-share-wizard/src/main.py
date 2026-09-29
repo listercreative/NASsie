@@ -95,6 +95,7 @@ Usage:
         "--apply": "apply_from_file",
         "--delete-share": "delete_share_from_file",
         "--edit-share": "edit_share_from_file",
+        "--adopt-shares": "adopt_shares_from_file",
         "--create-user": "create_user_from_file",
         "--add-user": "add_user_to_share_from_file",
         "--change-access": "change_access_from_file",
@@ -153,7 +154,13 @@ Usage:
             run()
         elif len(sys.argv) >= 3 and sys.argv[1] in RELAUNCH_HANDLERS:
             from core import SMBWizard
-            getattr(SMBWizard, RELAUNCH_HANDLERS[sys.argv[1]])(sys.argv[2])
+            result = getattr(SMBWizard, RELAUNCH_HANDLERS[sys.argv[1]])(sys.argv[2])
+            # The parent process only sees this exit code (see
+            # SMBWizard._elevated_relaunch): an action that refused or
+            # failed must exit non-zero, or the UI reports success for
+            # something that never happened.
+            if result is False:
+                sys.exit(1)
         else:
             args = sys.argv[1:]
             recognized = {"--gui-qt", "--cli", "--help", "-h"}

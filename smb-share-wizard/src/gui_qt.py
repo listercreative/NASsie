@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
     QLabel, QToolButton, QPushButton, QFrame, QTreeWidget, QTreeWidgetItem,
     QLineEdit, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
     QPlainTextEdit, QFileDialog, QStackedWidget, QSizePolicy,
-    QStyledItemDelegate, QStyleOptionViewItem, QStyle, QAbstractScrollArea,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle, QAbstractScrollArea, QScrollBar,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -713,7 +713,8 @@ class _RowActionBar(QWidget):
         QApplication.processEvents()
         bar_w = self.sizeHint().width()
         viewport_w = self.tree.viewport().width()
-        x = max(0, viewport_w - bar_w)
+        # Leave room for the overlay scrollbar along the right edge.
+        x = max(0, viewport_w - bar_w - _AutoHideScrollBars._WIDTH)
         self.setGeometry(x, rect.top(), bar_w, rect.height())
         self.show()
         self.raise_()
@@ -904,22 +905,45 @@ def _asset_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-_DEBOUNCE_MS = 700
+class _ActionGate:
+    """One shared gate for every click that starts an action (row
+    buttons, add-rows, panel toggles), instead of a timer per button:
+    - a click is dropped if ANY action was accepted within the cooldown
+      (so two different buttons can't be fired back to back either);
+    - dropped while an action is still running - its handler (including
+      any nested dialog.exec()) hasn't returned, or a background job is
+      in flight (busy_fn) - however long that takes;
+    - dropped while any modal dialog is up."""
 
+    COOLDOWN_MS = 600
 
-def _debounced(handler, ms: int = _DEBOUNCE_MS):
-    """Leading-edge debounce: the first call runs, repeats within `ms`
-    are dropped. Stops rapid re-clicks from stacking dialogs or
-    duplicate background jobs."""
-    last = [0.0]
+    def __init__(self):
+        self._last = 0.0
+        self._active = False
+        self.busy_fn = None
 
-    def wrapper(*args, **kwargs):
-        now = time.monotonic()
-        if now - last[0] < ms / 1000.0:
+    def run(self, handler):
+        if self._active or time.monotonic() - self._last < self.COOLDOWN_MS / 1000.0:
             return None
-        last[0] = now
-        return handler(*args, **kwargs)
-    return wrapper
+        if self.busy_fn is not None and self.busy_fn():
+            return None
+        if QApplication.activeModalWidget() is not None:
+            return None
+        self._active = True
+        try:
+            return handler()
+        finally:
+            self._active = False
+            self._last = time.monotonic()
+
+
+_GATE = _ActionGate()
+
+
+def _debounced(handler):
+    """Route a click handler through the shared _GATE. Signal arguments
+    (clicked's `checked`) are deliberately ignored."""
+    return lambda *_args: _GATE.run(handler)
 
 
 def _icon(name: str) -> QIcon:
@@ -953,13 +977,32 @@ def _toggle_icon(name: str) -> QIcon:
 
 
 class _AutoHideScrollBars(QObject):
-    """Scrollbars stay invisible (transparent handle, see the
-    QScrollBar[active] QSS rule) until scrolled/hovered, then fade out
-    again shortly after activity stops."""
+    """Scrollbars stay invisible until scrolled/hovered, then fade out
+    again shortly after activity stops.
+
+    The vertical bar is an OVERLAY drawn on top of the viewport's right
+    edge (the native one is switched off), so it takes no layout space:
+    a native bar, even with a transparent handle, still reserved a blank
+    10px gutter that cut short the column header beside it. The overlay
+    mirrors the native bar's range/value, so wheel/keyboard scrolling
+    still drives the real one."""
+
+    _WIDTH = 10
 
     def __init__(self, view: "QAbstractScrollArea", hide_ms: int = 900):
         super().__init__(view)
-        self._bars = [b for b in (view.verticalScrollBar(), view.horizontalScrollBar()) if b is not None]
+        self._view = view
+        self._native = view.verticalScrollBar()
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._overlay = QScrollBar(Qt.Orientation.Vertical, view)
+        self._overlay.setFixedWidth(self._WIDTH)
+        self._sync_range()
+        self._native.rangeChanged.connect(lambda *a: self._sync_range())
+        self._native.valueChanged.connect(self._overlay.setValue)
+        self._overlay.valueChanged.connect(self._native.setValue)
+        self._bars = [self._overlay]
+        if view.horizontalScrollBar() is not None:
+            self._bars.append(view.horizontalScrollBar())
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(hide_ms)
@@ -970,6 +1013,22 @@ class _AutoHideScrollBars(QObject):
             bar.valueChanged.connect(lambda *a: self._show())
             bar.installEventFilter(self)
         view.viewport().installEventFilter(self)
+        view.installEventFilter(self)
+        self._place()
+
+    def _sync_range(self):
+        n = self._native
+        self._overlay.setRange(n.minimum(), n.maximum())
+        self._overlay.setPageStep(n.pageStep())
+        self._overlay.setSingleStep(n.singleStep())
+        self._overlay.setValue(n.value())
+        self._overlay.setVisible(n.maximum() > n.minimum())
+        self._place()
+
+    def _place(self):
+        vp = self._view.viewport().geometry()
+        self._overlay.setGeometry(vp.right() + 1 - self._WIDTH, vp.top(), self._WIDTH, vp.height())
+        self._overlay.raise_()
 
     def _set(self, active: bool):
         for bar in self._bars:
@@ -995,6 +1054,8 @@ class _AutoHideScrollBars(QObject):
             self._show()
         elif t == QEvent.Type.Wheel:
             self._show()
+        elif t == QEvent.Type.Resize and obj in (self._view, self._view.viewport()):
+            QTimer.singleShot(0, self._sync_range)
         return False
 
 
@@ -1543,6 +1604,8 @@ class AddUserDialog(QDialog):
         self.result_data = {
             "username": username, "password": password, "read_only": self.readonly_check.isChecked(),
         }
+        if self.main_window._tour_active():
+            self.main_window._tour_created_user = username
         self.main_window._notify_tour("user_created", window=self)
         self.accept()
 
@@ -1896,7 +1959,10 @@ class UserManagementPanel(QWidget):
         # static row - see _RowActionBar's own docstring. No separate
         # Change Password/Delete buttons live anywhere else now.
         self._action_bar = _RowActionBar(self.tree, self._build_row_actions)
-        self._hover_bar = _RowActionBar(self.tree, self._build_row_actions, hover_only=True)
+        self._hover_bar = _RowActionBar(
+            self.tree, self._build_row_actions, hover_only=True,
+            hover_ok_fn=lambda: not self.main_window._tour_active(),
+        )
 
     def _build_row_actions(self, container: QHBoxLayout, item) -> bool:
         if item is self._add_user_row:
@@ -1908,7 +1974,7 @@ class UserManagementPanel(QWidget):
     def _on_item_clicked(self, item, column):
         if item is self._add_user_row:
             self.tree.clearSelection()
-            self._on_new_user()
+            _GATE.run(self._on_new_user)
 
     def refresh(self):
         def fetch():
@@ -1961,6 +2027,8 @@ class UserManagementPanel(QWidget):
         self._sorter.apply()
 
     def _on_new_user(self):
+        if not self.main_window._tour_gate("user_dialog_opened"):
+            return
         if getattr(self, "_new_user_pending", False):
             return
         self._new_user_pending = True
@@ -2021,6 +2089,8 @@ class UserManagementPanel(QWidget):
         self.main_window.refresh_all()
 
     def _on_delete_user(self):
+        if not self.main_window._tour_gate():
+            return
         items = self.tree.selectedItems()
         if not items or items[0] is self._add_user_row:
             return
@@ -2029,8 +2099,11 @@ class UserManagementPanel(QWidget):
         # username.
         username = items[0].text(0).split(" (")[0]
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, u=username: self._confirm_delete_user(u, users, log))
+        worker.done.connect(
+            lambda users, log, u=username: (self.main_window._busy_stop(), self._confirm_delete_user(u, users, log))
+        )
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _confirm_delete_user(self, username, users, log_output=""):
@@ -2077,13 +2150,18 @@ class UserManagementPanel(QWidget):
         self.main_window.refresh_all()
 
     def _on_change_password(self):
+        if not self.main_window._tour_gate():
+            return
         items = self.tree.selectedItems()
         if not items or items[0] is self._add_user_row:
             return
         username = items[0].text(0).split(" (")[0]
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, u=username: self._change_password_flow(u, users, log))
+        worker.done.connect(
+            lambda users, log, u=username: (self.main_window._busy_stop(), self._change_password_flow(u, users, log))
+        )
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _change_password_flow(self, username, users, log_output=""):
@@ -2304,6 +2382,12 @@ class MainWindow(QMainWindow):
         self._attaching_share = None
         self._attaching_candidates = []
         self._attaching_labels = {}
+        self._tour_created_user = None
+        # The share the tour itself just had you create - every later
+        # step (select, add user, attach, delete demo, ...) is confined
+        # to it, so a share that already existed can never be touched.
+        self._tour_created_share = None
+        self._pending_tour_event = None
 
         # See _start_tour()/_maybe_start_tour() below - GuiTourQt, or
         # None whenever no tour is currently running.
@@ -2337,6 +2421,7 @@ class MainWindow(QMainWindow):
         # access, change password) is running. Not wrapped around plain
         # list_users()/list_shares() fetches - those are fast reads.
         self._busy_count = 0
+        _GATE.busy_fn = lambda: self._busy_count > 0
         self._busy_overlay = _BusyOverlay(central, icon_path)
         self._busy_delay = QTimer(self)
         self._busy_delay.setSingleShot(True)
@@ -2431,7 +2516,7 @@ class MainWindow(QMainWindow):
         btn.setFixedSize(_TOGGLE_BUTTON_SIZE, _TOGGLE_BUTTON_SIZE)
         btn.setCheckable(True)
         btn.setToolTip(tooltip)
-        btn.clicked.connect(_debounced(lambda: self._toggle_panel(kind), 350))
+        btn.clicked.connect(_debounced(lambda: self._toggle_panel(kind)))
         return btn
 
     def _build_shares_page(self) -> QWidget:
@@ -2492,6 +2577,11 @@ class MainWindow(QMainWindow):
         # parent share was collapsed and clicked open again. Re-asserts
         # it on every expand rather than trying to chase why Qt drops it.
         self.shares_tree.itemExpanded.connect(self._on_share_item_expanded)
+        # Mid-tour, a collapsed share would pull its user rows out from
+        # under the step's highlight - keep them open.
+        self.shares_tree.itemCollapsed.connect(
+            lambda item: item.setExpanded(True) if self._tour_active() else None
+        )
         # See _SHARES_TOUR_FREE_PICK_EVENTS's own comment for why those
         # two wait_events stay unlocked while every other active tour
         # step locks selection to whatever row is already selected.
@@ -2525,7 +2615,7 @@ class MainWindow(QMainWindow):
         self._share_action_bar = _RowActionBar(self.shares_tree, self._build_share_row_actions)
         self._share_hover_bar = _RowActionBar(
             self.shares_tree, self._build_share_row_actions,
-            hover_ok_fn=lambda: self._attaching_item is None, hover_only=True,
+            hover_ok_fn=lambda: self._attaching_item is None and not self._tour_active(), hover_only=True,
         )
 
         return page
@@ -2544,6 +2634,14 @@ class MainWindow(QMainWindow):
         return self.user_mgmt_panel, self.users_btn, self.side_panel_host, False
 
     def _toggle_panel(self, kind):
+        # Mid-tour, only the step that asks for it may open/close the
+        # Users panel - and the Log panel is never part of the tour.
+        opening_now = not self._panel_state[kind]
+        allowed = () if kind == "log" else (("user_mgmt_opened",) if opening_now else ("user_mgmt_closed",))
+        if not self._tour_gate(*allowed):
+            # The (checkable) button already flipped itself on click.
+            self._panel_info(kind)[1].setChecked(self._panel_state[kind])
+            return
         if self._animation is not None:
             # A glide is already in flight (either side) - queue this
             # request instead of starting a second QPropertyAnimation
@@ -2670,6 +2768,29 @@ class MainWindow(QMainWindow):
         if self._tour is not None:
             self._tour.on_event(event, window=window)
 
+    def _tour_active(self):
+        tour = self._tour
+        return bool(tour and tour._callout is not None and tour._wait_event is not None)
+
+    def _tour_gate(self, *allowed_events):
+        """False (and a hint) if a tour step is showing that doesn't ask
+        for one of `allowed_events`. The tour's mouse/keyboard guard
+        already stops most stray input; this is the second line of
+        defence inside each action, so nothing can run out of step no
+        matter how it was triggered. Always passes when no tour runs."""
+        if not self._tour_active():
+            return True
+        if self._tour._wait_event in allowed_events:
+            # Even the allowed action must be aimed at the tour's own
+            # share, never one that already existed.
+            selected, _ = self._selected_share_and_user()
+            if selected and self._tour_created_share not in (None, selected):
+                self._toast("The tour only works with the share it created.")
+                return False
+            return True
+        self._toast("Follow the tour step first - or use Skip Tour.")
+        return False
+
     def _tour_waiting_on(self, event):
         # True only while the tour is actually showing a step whose
         # wait_event is this one - used to guard Delete Share/Detach so
@@ -2734,6 +2855,46 @@ class MainWindow(QMainWindow):
         if self._tour is not None:
             self._tour.show_name_error(message)
 
+    def _maybe_offer_adoption(self, then):
+        """One-time, on launch: shares (and, through them, users) made by
+        an earlier NASsie version keep working after an update. Their
+        accounts are already recognised; the shares just need today's
+        marker, which takes admin rights once."""
+        worker = _Worker(self.wizard.find_unadopted_shares)
+        worker.done.connect(lambda found, log: self._offer_adoption(found, then))
+        self._keep_alive(worker)
+        worker.start()
+
+    def _offer_adoption(self, found, then):
+        if not found:
+            then()
+            return
+        names = "\n".join(f"  \u2022 {s['name']}" for s in found)
+        if QMessageBox.question(
+            self, "Keep your existing shares?",
+            f"NASsie found {len(found)} share(s) created by an earlier version:\n\n{names}\n\n"
+            "Keep managing them here? Nothing about them changes - they just stay in NASsie "
+            "after this update. This needs administrator permission once.",
+        ) != QMessageBox.StandardButton.Yes:
+            then()
+            return
+        worker = _Worker(self.wizard.adopt_existing)
+        worker.done.connect(lambda ok, log: self._on_adopted(ok, log, then))
+        self._keep_alive(worker)
+        self._busy_start()
+        worker.start()
+
+    def _on_adopted(self, ok, log_output, then):
+        self._busy_stop()
+        if log_output.strip():
+            self.log_panel.append(log_output)
+        if ok:
+            self._toast("Existing shares are now managed by NASsie.")
+        else:
+            QMessageBox.warning(self, "Existing shares", f"Could not adopt the existing shares.\n\n{log_output.strip()}")
+        self.refresh_all()
+        then()
+
     def _maybe_start_tour(self):
         state = tour_state()
         if state == "new":
@@ -2761,6 +2922,16 @@ class MainWindow(QMainWindow):
     def _start_tour(self):
         # Rebuilt each time rather than cached - matches gui.py's own
         # _start_tour() (see its own comment for why).
+        open_kinds = [k for k, v in self._panel_state.items() if v]
+        if open_kinds or self._animation is not None:
+            # Every step assumes both panels start closed - close them
+            # (the queue keeps the latest request) and try again.
+            for kind in open_kinds:
+                self._toggle_panel(kind)
+            QTimer.singleShot(_GLIDE_MS * 2 + 150, self._start_tour)
+            return
+        self._tour_created_user = None
+        self._tour_created_share = None
         self._tour = GuiTourQt(self)
         self._tour.start()
 
@@ -2768,10 +2939,18 @@ class MainWindow(QMainWindow):
 
     def refresh_all(self):
         worker = _Worker(self._fetch_all)
-        worker.done.connect(lambda data, log: (self._busy_stop(), self._apply_all(data, log)))
+        worker.done.connect(
+            lambda data, log: (self._busy_stop(), self._apply_all(data, log), self._flush_pending_tour_event())
+        )
         self._keep_alive(worker)
         self._busy_start()
         worker.start()
+
+    def _flush_pending_tour_event(self):
+        event = self._pending_tour_event
+        self._pending_tour_event = None
+        if event:
+            QTimer.singleShot(0, lambda: self._notify_tour(event))
 
     def _fetch_all(self):
         shares = self.wizard.list_shares()
@@ -2806,7 +2985,7 @@ class MainWindow(QMainWindow):
             # the tour's first highlight box tracing the whole tree
             # instead of just the add-row.
             self._did_first_refresh = True
-            self._maybe_start_tour()
+            self._maybe_offer_adoption(then=self._maybe_start_tour)
 
     def _populate_shares(self, shares):
         # Remember whatever was actually selected before rebuilding, so
@@ -2910,6 +3089,10 @@ class MainWindow(QMainWindow):
         # a no-op unless the tour is actually waiting on this exact
         # event right now.
         share, _ = self._selected_share_and_user()
+        if share and self._tour_active() and self._tour_created_share not in (None, share):
+            # Mid-tour, selecting some OTHER (pre-existing) share doesn't
+            # count as the step's "select your share".
+            return
         if share:
             # Deferred - this method is connected to shares_tree's own
             # itemSelectionChanged BEFORE self._share_action_bar even
@@ -2935,7 +3118,7 @@ class MainWindow(QMainWindow):
     def _on_shares_item_clicked(self, item, column):
         if item is self._add_share_row:
             self.shares_tree.clearSelection()
-            self._on_new_share()
+            _GATE.run(self._on_new_share)
 
     def _build_share_row_actions(self, container: QHBoxLayout, item) -> bool:
         # The add-row is a real Treeview row too, so _RowActionBar's own
@@ -2973,7 +3156,13 @@ class MainWindow(QMainWindow):
         # _build_inline_attach()/_commit_inline_attach().
         combo = QComboBox()
         label_to_user = {}
-        for u in self._attaching_candidates:
+        candidates = self._attaching_candidates
+        if self._tour_waiting_on("user_attached") and self._tour_created_user:
+            # The tour asks for the user it just had you create - offer
+            # only that one, not every account on the machine.
+            only = [u for u in candidates if u["username"] == self._tour_created_user]
+            candidates = only or candidates
+        for u in candidates:
             label = self._attaching_labels.get(u["username"], u["username"])
             combo.addItem(label)
             label_to_user[label] = u
@@ -3008,6 +3197,8 @@ class MainWindow(QMainWindow):
         return True
 
     def _cancel_inline_attach(self):
+        if not self._tour_gate():
+            return
         self._attaching_item = None
         self._attaching_share = None
         self._attaching_candidates = []
@@ -3017,12 +3208,21 @@ class MainWindow(QMainWindow):
     # -- share/user actions ----------------------------------------------
 
     def _on_new_share(self):
+        if not self._tour_gate("share_dialog_opened"):
+            return
         dialog = CreateShareDialog(self, self.wizard, self._on_share_created)
         dialog.exec()
 
     def _on_share_created(self, share_name, log_output):
         if share_name:
-            self._notify_tour("share_created")
+            if self._tour_active():
+                self._tour_created_share = share_name
+                # The next step highlights the new share's row, which
+                # doesn't exist in the tree until the refresh below has
+                # landed - so advance the tour only then.
+                self._pending_tour_event = "share_created"
+            else:
+                self._notify_tour("share_created")
         if log_output.strip():
             self.log_panel.append(log_output)
         if share_name:
@@ -3032,6 +3232,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_delete_share(self):
+        if not self._tour_gate("share_delete_dialog_opened"):
+            return
         share, _ = self._selected_share_and_user()
         if not share:
             return
@@ -3059,6 +3261,8 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_edit_share(self):
+        if not self._tour_gate():
+            return
         share_name, user = self._selected_share_and_user()
         if not share_name or user:
             return
@@ -3112,12 +3316,17 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_grant_new_user(self):
+        if not self._tour_gate("user_dialog_opened"):
+            return
         share, _ = self._selected_share_and_user()
         if not share:
             return
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, s=share: self._show_grant_new_user_dialog(s, users, log))
+        worker.done.connect(
+            lambda users, log, s=share: (self._busy_stop(), self._show_grant_new_user_dialog(s, users, log))
+        )
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _show_grant_new_user_dialog(self, share, users, log_output=""):
@@ -3159,6 +3368,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_attach_user(self):
+        if not self._tour_gate("attach_dropdown_opened"):
+            return
         share, _ = self._selected_share_and_user()
         if not share:
             return
@@ -3205,6 +3416,8 @@ class MainWindow(QMainWindow):
         self._notify_tour("attach_dropdown_opened")
 
     def _commit_inline_attach(self, user):
+        if not self._tour_gate("user_attached"):
+            return
         share = self._attaching_share
         username = user["username"]
         self._attaching_item = None
@@ -3273,6 +3486,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_detach_user(self):
+        if not self._tour_gate("user_detach_dialog_opened"):
+            return
         share, user = self._selected_share_and_user()
         if not share or not user:
             return
@@ -3306,6 +3521,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_toggle_access(self):
+        if not self._tour_gate("access_level_changed"):
+            return
         share, user = self._selected_share_and_user()
         if not share or not user:
             return
@@ -3340,6 +3557,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_show_qr(self):
+        if not self._tour_gate("qr_dialog_opened"):
+            return
         share, user = self._selected_share_and_user()
         if not share or not user:
             return

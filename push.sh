@@ -67,6 +67,10 @@ grep -q "^Version: ${VERSION}\$" "$CONTROL" || { echo "Failed to update $CONTROL
 
 echo "Bumped version: $CURRENT_VERSION -> $VERSION"
 
+# Keep the tracked .deb package tree in step with src/ (build.sh does the
+# same before building the .deb itself).
+sh smb-share-wizard/packaging/deb/sync.sh
+
 git add -A
 git commit -m "$MESSAGE"
 git push

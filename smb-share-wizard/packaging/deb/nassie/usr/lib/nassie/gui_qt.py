@@ -32,6 +32,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import io
+import math
 import os
 import platform
 import sys
@@ -42,14 +43,14 @@ from PySide6.QtCore import (
     QRegularExpression, QModelIndex, QPoint,
 )
 from PySide6.QtGui import (
-    QIcon, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator, QPainter, QPolygon,
+    QIcon, QBrush, QCursor, QPalette, QColor, QPixmap, QFont, QRegularExpressionValidator, QPainter, QPainterPath, QPolygon,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QToolButton, QPushButton, QFrame, QTreeWidget, QTreeWidgetItem,
     QLineEdit, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QMessageBox,
     QPlainTextEdit, QFileDialog, QStackedWidget, QSizePolicy,
-    QStyledItemDelegate, QStyleOptionViewItem, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle, QAbstractScrollArea, QScrollBar,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -92,7 +93,9 @@ _GLIDE_MS = 220
 # actually changed - and it wasn't worth chasing further; light-only,
 # same as gui.py's Tk build has always been.
 _COLORS = {
-    "fg": "#1c1c1c",
+    "fg": "#155460",
+    # Text on the light-blue (tinted stripe) rows; "fg" covers white and gray.
+    "fg_on_tint": "#065a6b",
     "bg": "#fafafa",
     "disfg": "#a0a0a0",
     "selfg": "#ffffff",
@@ -105,8 +108,8 @@ _COLORS = {
     # Desaturated from the logo's own #72af52 (same hue/lightness, ~35%
     # less saturated) - a full-selected ROW of that raw logo green read
     # as too vivid/neon next to everything else's much quieter palette.
-    "tree_selbg": "#779f62",
-    "tree_selfg": "#ffffff",
+    "tree_selbg": "#eaf6f8",
+    "tree_selfg": "#3c5a2a",
     # gui.py's own _ADD_ROW_BG/_STRIPE_BG constants (the pinned "+" row's
     # tint, and the alternating-row stripe) - not part of the ttk theme
     # package at all, applied directly via tree.tag_configure().
@@ -116,11 +119,22 @@ _COLORS = {
     # pressed while its panel is open" fill color.
     "toggle_pressed_bg": "#37474f",
     "border": "#d0d0d0",
+    # The logo's own green (icon_add.png's tint) - the "+" add-row glyph.
+    "nassie_green": "#72af52",
+    # The add-row "+" glyph.
+    "add_icon": "#3c5a2a",
+    # Log/Users toolbar toggles: blue icon on white at rest, inverted
+    # (white icon on blue) while their panel is open.
+    "toggle_blue": "#0e92ab",
+    "toggle_blue_hover_bg": "#e3f4f7",
+    "scrollbar_handle": "#b4b4b4",
     # The single hover color the whole shares tree uses - _AddRowOverlay's
     # own idle/hover pairing was confirmed live as the one people are
     # actually happy with, so real row hover (_RowHoverDelegate,
     # _SharesTree.drawBranches()) reuses this exact value instead of a
     # second, similar-but-different one of its own.
+    # Hover feedback for the pinned "+" add-rows only (regular rows no
+    # longer tint on hover - the action buttons show instead).
     "row_hover_bg": "#d7eef2",
     "row_pressed_bg": "#c2e6ec",
     # QLineEdit/QTreeWidget/QHeaderView field backgrounds and the
@@ -161,7 +175,7 @@ def _build_stylesheet() -> str:
             selection-background-color: {c['tree_selbg']};
             selection-color: {c['tree_selfg']};
         }}
-        QTreeWidget::item {{ height: {_TREE_ROW_HEIGHT}px; color: {c['fg']}; outline: none; }}
+        QTreeWidget::item {{ height: {_TREE_ROW_HEIGHT}px; outline: none; }}
         QTreeWidget::item:selected {{ background: {c['tree_selbg']}; color: {c['tree_selfg']}; outline: none; border: none; }}
         QTreeWidget::item:focus {{ outline: none; border: none; }}
         QHeaderView::section {{
@@ -185,6 +199,28 @@ def _build_stylesheet() -> str:
             border-color: {c['btn_pressed_border']};
         }}
         QToolButton:checked {{ background: {c['toggle_pressed_bg']}; border-color: {c['toggle_pressed_bg']}; }}
+        QToolButton#toolbarToggle {{
+            background: #ffffff; border: 1px solid {c['toggle_blue']}; border-radius: 4px;
+        }}
+        QToolButton#toolbarToggle:hover {{ background: {c['toggle_blue_hover_bg']}; }}
+        QToolButton#toolbarToggle:checked {{
+            background: {c['toggle_blue']}; border-color: {c['toggle_blue']};
+        }}
+        QToolButton#toolbarToggle:checked:hover {{ background: #0c7c91; }}
+        QWidget#rowActionBar {{ background: transparent; }}
+        QToolButton#rowAction {{ background: transparent; border: none; border-radius: 4px; }}
+        QToolButton#rowAction:hover {{ background: rgba(6, 90, 107, 28); }}
+        QToolButton#rowAction:pressed {{ background: rgba(6, 90, 107, 60); }}
+        QToolButton#rowAction[onSelected="true"]:hover {{ background: rgba(60, 90, 42, 30); }}
+        QToolButton#rowAction[onSelected="true"]:pressed {{ background: rgba(60, 90, 42, 60); }}
+        QScrollBar {{ background: transparent; border: none; }}
+        QScrollBar:vertical {{ width: 10px; margin: 0; }}
+        QScrollBar:horizontal {{ height: 10px; margin: 0; }}
+        QScrollBar::handle {{ background: {c['scrollbar_handle']}; border-radius: 4px; min-height: 24px; min-width: 24px; }}
+        QScrollBar[autohide="true"]::handle {{ background: transparent; }}
+        QScrollBar[autohide="true"][active="true"]::handle {{ background: {c['scrollbar_handle']}; }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; background: none; border: none; }}
+        QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
         QPushButton {{
             background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {c['btn_top']}, stop:1 {c['btn_bottom']});
             color: {c['fg']};
@@ -238,9 +274,12 @@ def _restripe_tree(tree: "QTreeWidget", pinned_item=None):
         item = tree.topLevelItem(i)
         if item is pinned_item:
             continue
-        bg = top_tint if top_index % 2 == 1 else surface
+        tinted = top_index % 2 == 1
+        bg = top_tint if tinted else surface
+        fg_brush = QBrush(QColor(_COLORS["fg_on_tint"] if tinted else _COLORS["fg"]))
         for col in range(tree.columnCount()):
             item.setBackground(col, bg)
+            item.setForeground(col, fg_brush)
         top_index += 1
         for j in range(item.childCount()):
             child = item.child(j)
@@ -293,7 +332,7 @@ class _AddRowOverlay(QLabel):
         super().__init__(tree.viewport())
         self._tree = tree
         self._item = item
-        self._on_click = on_click
+        self._on_click = _debounced(on_click) if on_click else None
         # Read fresh per instance (not class attributes - a theme toggle
         # recreates this overlay via _populate_shares() rather than
         # mutating an existing one, see that function's own comment on
@@ -303,9 +342,9 @@ class _AddRowOverlay(QLabel):
         self._HOVER_BG = _COLORS["row_hover_bg"]
         self._PRESSED_BG = _COLORS["row_pressed_bg"]
         self._pressed = False
-        icon = _icon("icon_add")
-        if not icon.isNull():
-            self.setPixmap(icon.pixmap(_ICON_SIZE, _ICON_SIZE))
+        tinted = _tinted_pixmap("icon_add", _COLORS["add_icon"])
+        if not tinted.isNull():
+            self.setPixmap(QIcon(tinted).pixmap(_ICON_SIZE, _ICON_SIZE))
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._paint(self._idle_bg)
@@ -468,6 +507,8 @@ class _BlankClickDeselecter(QObject):
 
 def _row_action_button(icon_name: str, tooltip: str, handler) -> "QToolButton":
     btn = QToolButton()
+    btn.setObjectName("rowAction")
+    btn.setProperty("iconName", icon_name)
     btn.setIcon(_icon(icon_name))
     btn.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
     # Explicit size, not left to the style's own natural sizeHint (which
@@ -482,7 +523,7 @@ def _row_action_button(icon_name: str, tooltip: str, handler) -> "QToolButton":
     # breathing room at this size.
     btn.setFixedSize(_TOGGLE_BUTTON_SIZE, _TOGGLE_BUTTON_SIZE)
     btn.setToolTip(tooltip)
-    btn.clicked.connect(handler)
+    btn.clicked.connect(_debounced(handler))
     return btn
 
 
@@ -501,15 +542,32 @@ class _RowActionBar(QWidget):
     this class for the two places it's wired up.
     """
 
-    def __init__(self, tree: "QTreeWidget", build_fn):
+    def __init__(self, tree: "QTreeWidget", build_fn, hover_ok_fn=None, hover_only=False):
         super().__init__(tree.viewport())
+        self.setObjectName("rowActionBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.tree = tree
         self.build_fn = build_fn
+        # Two instances serve each tree: the normal one always shows the
+        # SELECTED row's buttons; a hover_only one shows the mouse-over
+        # row's buttons, but only for a row that ISN'T selected - so
+        # hovering elsewhere never takes the selected row's buttons
+        # away. hover_ok_fn lets a caller suppress hover (e.g. mid
+        # inline-attach).
+        self._hover_only = hover_only
+        self._hover_ok_fn = hover_ok_fn or (lambda: True)
+        self._hover_item = None
+        self._target = None
+        self._pressing = False
+        if hover_only:
+            tree.setMouseTracking(True)
+            tree.viewport().setMouseTracking(True)
+            tree.viewport().installEventFilter(self)
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(1)
         self.hide()
-        tree.itemSelectionChanged.connect(self.update_bar)
+        tree.itemSelectionChanged.connect(self._sync)
         # Reposition only (no rebuild) on scroll/column-resize - matches
         # gui.py's own reasoning: neither changes WHICH row is selected
         # or what build_fn returns for it, only where the already-built
@@ -539,22 +597,101 @@ class _RowActionBar(QWidget):
                 child.widget().hide()
                 child.widget().deleteLater()
 
+    def _current_item(self):
+        if self._hover_only:
+            item = self._hover_item
+            if item is None or not self._hover_ok_fn() or item.isSelected():
+                return None
+            return item
+        items = self.tree.selectedItems()
+        return items[0] if items else None
+
+    def eventFilter(self, obj, event):
+        if obj is self.tree.viewport():
+            t = event.type()
+            if t == QEvent.Type.MouseMove:
+                item = self.tree.itemAt(event.position().toPoint())
+                if item is not self._hover_item:
+                    self._hover_item = item
+                    self._sync()
+            elif t == QEvent.Type.Leave:
+                # Moving onto the bar itself also "leaves" the viewport.
+                pos = self.tree.viewport().mapFromGlobal(QCursor.pos())
+                if not (self.isVisible() and self.geometry().contains(pos)) and self._hover_item is not None:
+                    self._hover_item = None
+                    self._sync()
+        return False
+
+    def _select_target(self):
+        # Buttons' handlers act on the tree's selection, so a click on a
+        # hover-only bar selects that row first.
+        self._pressing = True
+        item = self._target
+        if item is not None and not item.isSelected():
+            self.tree.setCurrentItem(item)
+
+    def _retint(self):
+        """White glyphs read on the green selected row only; on a
+        hover-only (light) row they switch to the dark text color."""
+        selected = self._target is not None and self._target.isSelected()
+        color = _COLORS["tree_selfg"] if selected else _COLORS["fg"]
+        if not selected and self._target is not None:
+            fg = self._target.foreground(0)
+            if fg.style() != Qt.BrushStyle.NoBrush:
+                color = fg.color().name()
+        for i in range(self._layout.count()):
+            w = self._layout.itemAt(i).widget()
+            name = w.property("iconName") if isinstance(w, QToolButton) else None
+            if not name:
+                continue
+            w.setIcon(QIcon(_tinted_pixmap(name, color)))
+            w.setProperty("onSelected", selected)
+            w.style().unpolish(w)
+            w.style().polish(w)
+
+    def _release_press(self):
+        self._pressing = False
+        self._sync()
+
+    def _sync(self):
+        """Rebuild only when the row the bar serves actually changed."""
+        if self._pressing:
+            # A click on a hover-bar button selects its row on press (see
+            # _select_target) - keep the button alive until the click
+            # has actually been delivered.
+            return
+        item = self._current_item()
+        if item is not None and item is self._target and self._layout.count():
+            self._retint()
+            self.reposition()
+            return
+        self.update_bar()
+
     def update_bar(self):
         self._clear()
-        items = self.tree.selectedItems()
-        if not items or not self.build_fn(self._layout, items[0]):
+        item = self._current_item()
+        self._target = item
+        if item is None or not self.build_fn(self._layout, item):
+            self._target = None
             self.hide()
             return
+        for i in range(self._layout.count()):
+            w = self._layout.itemAt(i).widget()
+            if isinstance(w, QToolButton):
+                if self._hover_only:
+                    w.pressed.connect(self._select_target)
+                    w.released.connect(lambda: QTimer.singleShot(0, self._release_press))
+        self._retint()
         self.reposition()
 
     def reposition(self):
         if self._layout.count() == 0:
             return
-        items = self.tree.selectedItems()
-        if not items:
+        item = self._target
+        if item is None:
             self.hide()
             return
-        rect = self.tree.visualItemRect(items[0])
+        rect = self.tree.visualItemRect(item)
         if rect.isEmpty():
             self.hide()
             return
@@ -576,46 +713,22 @@ class _RowActionBar(QWidget):
         QApplication.processEvents()
         bar_w = self.sizeHint().width()
         viewport_w = self.tree.viewport().width()
-        x = max(0, viewport_w - bar_w)
+        # Leave room for the overlay scrollbar along the right edge.
+        x = max(0, viewport_w - bar_w - _AutoHideScrollBars._WIDTH)
         self.setGeometry(x, rect.top(), bar_w, rect.height())
         self.show()
         self.raise_()
 
 
 class _RowHoverDelegate(QStyledItemDelegate):
-    """Paints a hovered, non-selected cell with _COLORS["row_hover_bg"]
-    instead of QTreeWidget's own "::item:hover" stylesheet rule (see
-    _SharesTree.drawBranches()'s own docstring for why a plain QSS rule
-    doesn't reach the branch/indent strip at all). Works by temporarily
-    swapping the item's own background brush for the hover color and
-    letting the normal paint path draw with that (not by hand-drawing
-    text/icons), so every other rendering detail - font, icon, a
-    spanned user row's full-row width, RTL, ... - stays exactly what
-    QStyledItemDelegate already gets right on its own.
-    """
+    """Rows get no hover tint - the hover-only action buttons (see
+    _RowActionBar) are the hover feedback. Strips the native
+    State_MouseOver flag so the style doesn't paint its own hover fill."""
 
     def paint(self, painter, option, index):
-        tree = self.parent()
-        item = tree.itemFromIndex(index) if tree is not None else None
-        if (
-            item is not None
-            and not (option.state & QStyle.StateFlag.State_Selected)
-            and index.siblingAtColumn(0) == tree._hover_index
-        ):
-            col = index.column()
-            original = item.background(col)
-            item.setBackground(col, QColor(_COLORS["row_hover_bg"]))
-            opt = QStyleOptionViewItem(option)
-            # Clearing the native hover flag is load-bearing - left
-            # set, the style's own default paint layers ITS OWN hover
-            # treatment on top, which empirically won over the
-            # background we just set (confirmed live: the flat,
-            # mismatched gray came right back).
-            opt.state &= ~QStyle.StateFlag.State_MouseOver
-            super().paint(painter, opt, index)
-            item.setBackground(col, original)
-            return
-        super().paint(painter, option, index)
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~QStyle.StateFlag.State_MouseOver
+        super().paint(painter, opt, index)
 
 
 class _SharesTree(QTreeWidget):
@@ -698,9 +811,6 @@ class _SharesTree(QTreeWidget):
         if item.isSelected():
             painter.fillRect(rect, QColor(_COLORS["tree_selbg"]))
             fg = QColor(_COLORS["tree_selfg"])
-        elif index == self._hover_index:
-            painter.fillRect(rect, QColor(_COLORS["row_hover_bg"]))
-            fg = QColor(_COLORS["fg"])
         else:
             brush = item.background(0)
             if brush.style() != Qt.BrushStyle.NoBrush:
@@ -795,9 +905,158 @@ def _asset_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+class _ActionGate:
+    """One shared gate for every click that starts an action (row
+    buttons, add-rows, panel toggles), instead of a timer per button:
+    - a click is dropped if ANY action was accepted within the cooldown
+      (so two different buttons can't be fired back to back either);
+    - dropped while an action is still running - its handler (including
+      any nested dialog.exec()) hasn't returned, or a background job is
+      in flight (busy_fn) - however long that takes;
+    - dropped while any modal dialog is up."""
+
+    COOLDOWN_MS = 600
+
+    def __init__(self):
+        self._last = 0.0
+        self._active = False
+        self.busy_fn = None
+
+    def run(self, handler):
+        if self._active or time.monotonic() - self._last < self.COOLDOWN_MS / 1000.0:
+            return None
+        if self.busy_fn is not None and self.busy_fn():
+            return None
+        if QApplication.activeModalWidget() is not None:
+            return None
+        self._active = True
+        try:
+            return handler()
+        finally:
+            self._active = False
+            self._last = time.monotonic()
+
+
+_GATE = _ActionGate()
+
+
+def _debounced(handler):
+    """Route a click handler through the shared _GATE. Signal arguments
+    (clicked's `checked`) are deliberately ignored."""
+    return lambda *_args: _GATE.run(handler)
+
+
 def _icon(name: str) -> QIcon:
+    # Assets ship white on transparent (see icons/render_icons.py);
+    # icon_add is baked NASsie green.
     path = os.path.join(_asset_base_dir(), "icons", f"{name}.png")
     return QIcon(path) if os.path.exists(path) else QIcon()
+
+
+def _tinted_pixmap(name: str, color: str) -> QPixmap:
+    path = os.path.join(_asset_base_dir(), "icons", f"{name}.png")
+    pm = QPixmap(path)
+    if pm.isNull():
+        return pm
+    p = QPainter(pm)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    p.fillRect(pm.rect(), QColor(color))
+    p.end()
+    return pm
+
+
+def _toggle_icon(name: str) -> QIcon:
+    """Blue glyph at rest, white while checked (button background inverts)."""
+    icon = QIcon()
+    blue = _tinted_pixmap(name, _COLORS["toggle_blue"])
+    white = _tinted_pixmap(name, "#ffffff")
+    for mode in (QIcon.Mode.Normal, QIcon.Mode.Active):
+        icon.addPixmap(blue, mode, QIcon.State.Off)
+        icon.addPixmap(white, mode, QIcon.State.On)
+    return icon
+
+
+class _AutoHideScrollBars(QObject):
+    """Scrollbars stay invisible until scrolled/hovered, then fade out
+    again shortly after activity stops.
+
+    The vertical bar is an OVERLAY drawn on top of the viewport's right
+    edge (the native one is switched off), so it takes no layout space:
+    a native bar, even with a transparent handle, still reserved a blank
+    10px gutter that cut short the column header beside it. The overlay
+    mirrors the native bar's range/value, so wheel/keyboard scrolling
+    still drives the real one."""
+
+    _WIDTH = 10
+
+    def __init__(self, view: "QAbstractScrollArea", hide_ms: int = 900):
+        super().__init__(view)
+        self._view = view
+        self._native = view.verticalScrollBar()
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._overlay = QScrollBar(Qt.Orientation.Vertical, view)
+        self._overlay.setFixedWidth(self._WIDTH)
+        self._sync_range()
+        self._native.rangeChanged.connect(lambda *a: self._sync_range())
+        self._native.valueChanged.connect(self._overlay.setValue)
+        self._overlay.valueChanged.connect(self._native.setValue)
+        self._bars = [self._overlay]
+        if view.horizontalScrollBar() is not None:
+            self._bars.append(view.horizontalScrollBar())
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(hide_ms)
+        self._timer.timeout.connect(self._maybe_hide)
+        for bar in self._bars:
+            bar.setProperty("autohide", True)
+            bar.setProperty("active", False)
+            bar.valueChanged.connect(lambda *a: self._show())
+            bar.installEventFilter(self)
+        view.viewport().installEventFilter(self)
+        view.installEventFilter(self)
+        self._place()
+
+    def _sync_range(self):
+        n = self._native
+        self._overlay.setRange(n.minimum(), n.maximum())
+        self._overlay.setPageStep(n.pageStep())
+        self._overlay.setSingleStep(n.singleStep())
+        self._overlay.setValue(n.value())
+        self._overlay.setVisible(n.maximum() > n.minimum())
+        self._place()
+
+    def _place(self):
+        vp = self._view.viewport().geometry()
+        self._overlay.setGeometry(vp.right() + 1 - self._WIDTH, vp.top(), self._WIDTH, vp.height())
+        self._overlay.raise_()
+
+    def _set(self, active: bool):
+        for bar in self._bars:
+            if bar.property("active") != active:
+                bar.setProperty("active", active)
+                bar.style().unpolish(bar)
+                bar.style().polish(bar)
+                bar.update()
+
+    def _show(self):
+        self._set(True)
+        self._timer.start()
+
+    def _maybe_hide(self):
+        if any(b.isSliderDown() or b.underMouse() for b in self._bars):
+            self._timer.start()
+            return
+        self._set(False)
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t in (QEvent.Type.Wheel, QEvent.Type.Enter, QEvent.Type.MouseMove) and obj in self._bars:
+            self._show()
+        elif t == QEvent.Type.Wheel:
+            self._show()
+        elif t == QEvent.Type.Resize and obj in (self._view, self._view.viewport()):
+            QTimer.singleShot(0, self._sync_range)
+        return False
 
 
 def _apply_base_palette(app: QApplication):
@@ -1057,6 +1316,26 @@ class _Worker(QThread):
         self.done.emit(result, buffer.getvalue())
 
 
+def _confirm(parent, title: str, text: str, accept_label: str) -> bool:
+    """Confirmation box with a verb button ("Delete") and Cancel instead
+    of Yes/No."""
+    box = QMessageBox(QMessageBox.Icon.Question, title, text, QMessageBox.StandardButton.NoButton, parent)
+    accept = box.addButton(accept_label, QMessageBox.ButtonRole.AcceptRole)
+    cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(cancel)
+    box.setEscapeButton(cancel)
+    box.exec()
+    return box.clickedButton() is accept
+
+
+def _validate_share_name_format(name: str):
+    if not name:
+        return False, "Share name can't be empty."
+    if len(name) > SHARE_NAME_MAX_LEN or not SHARE_NAME_RE.fullmatch(name):
+        return False, "Share names may only use letters, numbers, spaces, dashes and underscores."
+    return True, None
+
+
 def _fetch_failed(result, log_output) -> bool:
     """True when a _Worker's (result, log_output) pair means its target
     function raised, not that it legitimately returned something empty/
@@ -1239,6 +1518,17 @@ class AddUserDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_button.setText("Create User")
+        # Tab: Username -> Password -> Confirm -> Create User -> Cancel.
+        self.setTabOrder(self.username_entry, self.password_entry)
+        self.setTabOrder(self.password_entry, self.confirm_entry)
+        if show_access_level:
+            self.setTabOrder(self.confirm_entry, self.readonly_check)
+            self.setTabOrder(self.readonly_check, ok_button)
+        else:
+            self.setTabOrder(self.confirm_entry, ok_button)
+        self.setTabOrder(ok_button, self.cancel_button)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1314,6 +1604,8 @@ class AddUserDialog(QDialog):
         self.result_data = {
             "username": username, "password": password, "read_only": self.readonly_check.isChecked(),
         }
+        if self.main_window._tour_active():
+            self.main_window._tour_created_user = username
         self.main_window._notify_tour("user_created", window=self)
         self.accept()
 
@@ -1481,6 +1773,7 @@ class CreateShareDialog(QDialog):
         self.wizard.share_path = path
         self.wizard.users = []
         self.create_btn.setEnabled(False)
+        self.main_window._busy_start()
 
         def apply():
             if self.wizard.has_admin_privileges():
@@ -1510,6 +1803,7 @@ class CreateShareDialog(QDialog):
 
     def _on_create_finished(self, created, log_output):
         self.create_btn.setEnabled(True)
+        self.main_window._busy_stop()
         self._on_done(self.wizard.share_name if created else None, log_output)
         if created:
             self.accept()
@@ -1519,6 +1813,91 @@ class CreateShareDialog(QDialog):
         # a transient permission issue) meant re-typing the share name,
         # path, and every user from scratch instead of just fixing the
         # one thing that failed and clicking Create again.
+
+
+class EditShareDialog(QDialog):
+    """Rename a share and/or point it at a different folder. Only the
+    share definition and its permissions move - files are never copied
+    or deleted."""
+
+    def __init__(self, parent, wizard: SMBWizard, name: str, path: str):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Share")
+        self.wizard = wizard
+        self.old_name = name
+        self.old_path = path
+        self.result_data = None
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name_entry = QLineEdit(name)
+        # Same keystroke-level guard as CreateShareDialog.name_entry:
+        # the name is written unescaped as an smb.conf section header.
+        self.name_entry.setMaxLength(SHARE_NAME_MAX_LEN)
+        self.name_entry.setValidator(
+            QRegularExpressionValidator(QRegularExpression(SHARE_NAME_RE.pattern), self.name_entry)
+        )
+        form.addRow("Share name:", self.name_entry)
+        path_row = QHBoxLayout()
+        self.path_entry = QLineEdit(path)
+        # Read-only for the same reason as CreateShareDialog.path_entry:
+        # only Browse can produce a known-good path.
+        self.path_entry.setReadOnly(True)
+        self.path_entry.setCursor(Qt.CursorShape.ArrowCursor)
+        path_row.addWidget(self.path_entry, 1)
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.clicked.connect(self._browse)
+        path_row.addWidget(self.browse_btn)
+        form.addRow("Folder:", path_row)
+        layout.addLayout(form)
+
+        note = QLabel("Existing files stay where they are - only the share is updated.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.error_label = QLabel()
+        self.error_label.setStyleSheet(f"color: {_COLORS['error_fg']};")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.save_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.save_button.setText("Save")
+        self.cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setTabOrder(self.name_entry, self.browse_btn)
+        self.setTabOrder(self.browse_btn, self.save_button)
+        self.setTabOrder(self.save_button, self.cancel_button)
+
+    def _browse(self):
+        handled, selected = False, None
+        if platform.system() == "Linux":
+            handled, selected = pick_directory_native("Select Folder to Share")
+        if not handled:
+            selected = QFileDialog.getExistingDirectory(self, "Select Folder to Share", self.path_entry.text())
+        if selected:
+            self.path_entry.setText(os.path.normpath(selected))
+
+    def _on_save(self):
+        name = self.name_entry.text().strip()
+        path = self.path_entry.text().strip()
+        # Cheap, local checks only - the collision check needs a live
+        # share list (slow on Windows) and runs in the background job.
+        ok, message = _validate_share_name_format(name)
+        if not ok:
+            self.error_label.setText(message)
+            return
+        ok, message = self.wizard.check_share_path(path)
+        if not ok:
+            self.error_label.setText(message)
+            return
+        same_path = os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(self.old_path))
+        if name == self.old_name and same_path:
+            self.error_label.setText("Nothing to change.")
+            return
+        self.result_data = {"name": name, "path": path}
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -1551,6 +1930,7 @@ class UserManagementPanel(QWidget):
         # which packs a real ttk.Scrollbar unconditionally rather than
         # Qt's default auto-hide-when-not-needed policy.
         self.tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        _AutoHideScrollBars(self.tree)
         self.tree.itemClicked.connect(self._on_item_clicked)
         _BlankClickDeselecter(
             self.tree,
@@ -1579,6 +1959,10 @@ class UserManagementPanel(QWidget):
         # static row - see _RowActionBar's own docstring. No separate
         # Change Password/Delete buttons live anywhere else now.
         self._action_bar = _RowActionBar(self.tree, self._build_row_actions)
+        self._hover_bar = _RowActionBar(
+            self.tree, self._build_row_actions, hover_only=True,
+            hover_ok_fn=lambda: not self.main_window._tour_active(),
+        )
 
     def _build_row_actions(self, container: QHBoxLayout, item) -> bool:
         if item is self._add_user_row:
@@ -1590,15 +1974,16 @@ class UserManagementPanel(QWidget):
     def _on_item_clicked(self, item, column):
         if item is self._add_user_row:
             self.tree.clearSelection()
-            self._on_new_user()
+            _GATE.run(self._on_new_user)
 
     def refresh(self):
         def fetch():
             return self.wizard.list_users()
 
         worker = _Worker(fetch)
-        worker.done.connect(self._apply_users)
+        worker.done.connect(lambda users, log: (self.main_window._busy_stop(), self._apply_users(users, log)))
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _apply_users(self, users, log_output):
@@ -1622,6 +2007,10 @@ class UserManagementPanel(QWidget):
             self._add_user_row_overlay.deleteLater()
         self._add_user_row_overlay = _attach_add_row_icon(self.tree, self._add_user_row, self._on_new_user)
         for u in users or []:
+            # Pre-existing (non-NASsie) accounts stay out of this list
+            # entirely - NASsie can't delete or reset them anyway.
+            if not u.get("managed", False):
+                continue
             username = u.get("username", "?")
             # Labels a pre-existing (non-NASsie) account right in the
             # list itself, not just in the Attach User picker (see
@@ -1638,6 +2027,11 @@ class UserManagementPanel(QWidget):
         self._sorter.apply()
 
     def _on_new_user(self):
+        if not self.main_window._tour_gate("user_dialog_opened"):
+            return
+        if getattr(self, "_new_user_pending", False):
+            return
+        self._new_user_pending = True
         # Full account list from the wizard, not just this tree's own
         # (filtered) displayed rows - refresh()/_apply_users() only
         # shows accounts NASsie manages or that already have share
@@ -1649,9 +2043,18 @@ class UserManagementPanel(QWidget):
         # overwriting a real person's login password. Matches gui.py's
         # _create_new_user(), which validates against the same full list.
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log: self._show_new_user_dialog(users, log))
+        worker.done.connect(
+            lambda users, log: (self.main_window._busy_stop(), self._finish_new_user(users, log))
+        )
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
+
+    def _finish_new_user(self, users, log_output):
+        try:
+            self._show_new_user_dialog(users, log_output)
+        finally:
+            self._new_user_pending = False
 
     def _show_new_user_dialog(self, users, log_output=""):
         if _fetch_failed(users, log_output):
@@ -1672,9 +2075,11 @@ class UserManagementPanel(QWidget):
         worker = _Worker(self.wizard.add_user, data["username"], data["password"])
         worker.done.connect(lambda result, log: self._on_created(data["username"], result, log))
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _on_created(self, username, created, log_output):
+        self.main_window._busy_stop()
         if log_output.strip():
             self.main_window.log_panel.append(log_output)
         if created:
@@ -1684,6 +2089,8 @@ class UserManagementPanel(QWidget):
         self.main_window.refresh_all()
 
     def _on_delete_user(self):
+        if not self.main_window._tour_gate():
+            return
         items = self.tree.selectedItems()
         if not items or items[0] is self._add_user_row:
             return
@@ -1692,8 +2099,11 @@ class UserManagementPanel(QWidget):
         # username.
         username = items[0].text(0).split(" (")[0]
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, u=username: self._confirm_delete_user(u, users, log))
+        worker.done.connect(
+            lambda users, log, u=username: (self.main_window._busy_stop(), self._confirm_delete_user(u, users, log))
+        )
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _confirm_delete_user(self, username, users, log_output=""):
@@ -1717,17 +2127,20 @@ class UserManagementPanel(QWidget):
                 "your computer's own account settings.",
             )
             return
-        if QMessageBox.question(
+        if not _confirm(
             self, "Delete User",
             f"Delete user '{username}' entirely? This removes their account everywhere, not just one share.",
-        ) != QMessageBox.StandardButton.Yes:
+            "Delete",
+        ):
             return
         worker = _Worker(self.wizard.remove_user, username)
         worker.done.connect(lambda result, log, u=username: self._on_deleted(u, result, log))
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _on_deleted(self, username, deleted, log_output):
+        self.main_window._busy_stop()
         if log_output.strip():
             self.main_window.log_panel.append(log_output)
         if deleted:
@@ -1737,13 +2150,18 @@ class UserManagementPanel(QWidget):
         self.main_window.refresh_all()
 
     def _on_change_password(self):
+        if not self.main_window._tour_gate():
+            return
         items = self.tree.selectedItems()
         if not items or items[0] is self._add_user_row:
             return
         username = items[0].text(0).split(" (")[0]
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, u=username: self._change_password_flow(u, users, log))
+        worker.done.connect(
+            lambda users, log, u=username: (self.main_window._busy_stop(), self._change_password_flow(u, users, log))
+        )
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _change_password_flow(self, username, users, log_output=""):
@@ -1797,6 +2215,7 @@ class UserManagementPanel(QWidget):
             lambda result, log, s=share_name, u=username, p=password: self._on_password_changed(s, u, p, result, log)
         )
         self.main_window._keep_alive(worker)
+        self.main_window._busy_start()
         worker.start()
 
     def _do_change_password(self, share_name, username, password):
@@ -1810,6 +2229,7 @@ class UserManagementPanel(QWidget):
         return self.wizard.grant_share_access(share_name, username, password, read_only)
 
     def _on_password_changed(self, share, username, password, changed, log_output):
+        self.main_window._busy_stop()
         if log_output.strip():
             self.main_window.log_panel.append(log_output)
         if changed:
@@ -1835,6 +2255,8 @@ class LogPanel(QWidget):
         layout.setContentsMargins(0, 0, 8, 0)
         self.text = QPlainTextEdit()
         self.text.setReadOnly(True)
+        self.text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        _AutoHideScrollBars(self.text)
         layout.addWidget(self.text, 1)
 
     def append(self, text):
@@ -1844,6 +2266,93 @@ class LogPanel(QWidget):
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
+_BUSY_SHOW_DELAY_MS = 250
+
+
+class _BusyOverlay(QWidget):
+    """Dimmed scrim over the whole window with the NASsie logo floating on
+    animated waves - shown while background work runs. Covers its parent
+    (so clicks can't land on the UI underneath mid-action) and only ticks
+    its animation timer while visible."""
+
+    _LOGO = 96
+    _WAVE_W = 180
+    _WAVE_H = 34
+
+    def __init__(self, parent: QWidget, icon_path: str):
+        super().__init__(parent)
+        self._pixmap = None
+        if os.path.exists(icon_path):
+            self._pixmap = QPixmap(icon_path).scaled(
+                self._LOGO, self._LOGO,
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
+            )
+        self._phase = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._tick)
+        parent.installEventFilter(self)
+        self.hide()
+
+    def eventFilter(self, obj, event):
+        if obj is self.parentWidget() and event.type() == QEvent.Type.Resize:
+            self.setGeometry(self.parentWidget().rect())
+        return False
+
+    def start(self):
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.12) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor(255, 255, 255, 170))
+
+        cx, cy = self.width() / 2, self.height() / 2
+        left, top = cx - self._WAVE_W / 2, cy + 4
+
+        # The logo is drawn FIRST and the waves over it, so its lower
+        # part sits submerged behind the water and it reads as swimming.
+        # It bobs and rocks slightly, in step with the waves.
+        if self._pixmap is not None:
+            bob = math.sin(self._phase) * 4
+            rock = math.sin(self._phase + 0.8) * 3.0
+            p.save()
+            p.translate(cx, top + 6 + bob)
+            p.rotate(rock)
+            p.drawPixmap(int(-self._LOGO / 2), -self._LOGO + 26, self._pixmap)
+            p.restore()
+
+        clip = QPainterPath()
+        clip.addRoundedRect(left, top, self._WAVE_W, self._WAVE_H, 8, 8)
+        p.setClipPath(clip)
+        accent = QColor(_COLORS["accent"])
+        for i, (alpha, speed, amp) in enumerate(((150, 1.0, 5), (225, -1.6, 4))):
+            wave = QPainterPath()
+            wave.moveTo(left, top + self._WAVE_H)
+            x = 0.0
+            while x <= self._WAVE_W:
+                y = top + 6 + i * 6 + math.sin(x / 18 + self._phase * speed) * amp
+                wave.lineTo(left + x, y)
+                x += 3
+            wave.lineTo(left + self._WAVE_W, top + self._WAVE_H)
+            wave.closeSubpath()
+            c = QColor(accent)
+            c.setAlpha(alpha)
+            p.fillPath(wave, c)
+        p.end()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1873,6 +2382,12 @@ class MainWindow(QMainWindow):
         self._attaching_share = None
         self._attaching_candidates = []
         self._attaching_labels = {}
+        self._tour_created_user = None
+        # The share the tour itself just had you create - every later
+        # step (select, add user, attach, delete demo, ...) is confined
+        # to it, so a share that already existed can never be touched.
+        self._tour_created_share = None
+        self._pending_tour_event = None
 
         # See _start_tour()/_maybe_start_tour() below - GuiTourQt, or
         # None whenever no tour is currently running.
@@ -1900,16 +2415,23 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
+        # Busy overlay (see _BusyOverlay) - shown by _busy_start()/
+        # _busy_stop()'s refcount while any privileged/mutating background
+        # action (create/delete share, add/delete user, grant/revoke/change
+        # access, change password) is running. Not wrapped around plain
+        # list_users()/list_shares() fetches - those are fast reads.
+        self._busy_count = 0
+        _GATE.busy_fn = lambda: self._busy_count > 0
+        self._busy_overlay = _BusyOverlay(central, icon_path)
+        self._busy_delay = QTimer(self)
+        self._busy_delay.setSingleShot(True)
+        self._busy_delay.setInterval(_BUSY_SHOW_DELAY_MS)
+        self._busy_delay.timeout.connect(self._busy_overlay.start)
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(0)
 
         root_layout.addWidget(self._build_header(icon_path))
-
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setFrameShadow(QFrame.Shadow.Sunken)
-        root_layout.addWidget(separator)
 
         content_row = QHBoxLayout()
         content_row.setSpacing(0)
@@ -1984,7 +2506,8 @@ class MainWindow(QMainWindow):
 
     def _toolbar_toggle_button(self, icon_name, tooltip, kind) -> QToolButton:
         btn = QToolButton()
-        icon = _icon(icon_name)
+        btn.setObjectName("toolbarToggle")
+        icon = _toggle_icon(icon_name)
         if not icon.isNull():
             btn.setIcon(icon)
             btn.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
@@ -1993,7 +2516,7 @@ class MainWindow(QMainWindow):
         btn.setFixedSize(_TOGGLE_BUTTON_SIZE, _TOGGLE_BUTTON_SIZE)
         btn.setCheckable(True)
         btn.setToolTip(tooltip)
-        btn.clicked.connect(lambda: self._toggle_panel(kind))
+        btn.clicked.connect(_debounced(lambda: self._toggle_panel(kind)))
         return btn
 
     def _build_shares_page(self) -> QWidget:
@@ -2015,7 +2538,11 @@ class MainWindow(QMainWindow):
         # spare, rather than something that would start wrapping again
         # the moment a translation or a future font change makes the
         # label a few pixels wider.
-        self.shares_tree.setColumnWidth(0, 130)
+        # Sized from the header's real (bold) font metrics, not a fixed
+        # guess: text + section padding (6px each side) + sort arrow.
+        header_fm = self.shares_tree.header().fontMetrics()
+        col0_w = max(130, header_fm.horizontalAdvance("Share Name") + 12 + 32)
+        self.shares_tree.setColumnWidth(0, col0_w)
         # "Path" (the last column) fills any remaining width instead of
         # leaving it unclaimed by any column - matches gui.py's own
         # shares_list.column("path", stretch=True). Still scrolls
@@ -2028,7 +2555,8 @@ class MainWindow(QMainWindow):
         # AND horizontal) unconditionally rather than Qt's default
         # auto-hide-when-not-needed policy.
         self.shares_tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.shares_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.shares_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        _AutoHideScrollBars(self.shares_tree)
         # Without this, the selection highlight's own "all columns" look
         # (set via ::item:selected above) only reliably paints the FIRST
         # column - confirmed live: the Path column stayed unshaded while
@@ -2049,6 +2577,11 @@ class MainWindow(QMainWindow):
         # parent share was collapsed and clicked open again. Re-asserts
         # it on every expand rather than trying to chase why Qt drops it.
         self.shares_tree.itemExpanded.connect(self._on_share_item_expanded)
+        # Mid-tour, a collapsed share would pull its user rows out from
+        # under the step's highlight - keep them open.
+        self.shares_tree.itemCollapsed.connect(
+            lambda item: item.setExpanded(True) if self._tour_active() else None
+        )
         # See _SHARES_TOUR_FREE_PICK_EVENTS's own comment for why those
         # two wait_events stay unlocked while every other active tour
         # step locks selection to whatever row is already selected.
@@ -2080,6 +2613,10 @@ class MainWindow(QMainWindow):
         # static row - see _RowActionBar's own docstring. No separate
         # New User/Attach/Delete/etc. buttons live anywhere else now.
         self._share_action_bar = _RowActionBar(self.shares_tree, self._build_share_row_actions)
+        self._share_hover_bar = _RowActionBar(
+            self.shares_tree, self._build_share_row_actions,
+            hover_ok_fn=lambda: self._attaching_item is None and not self._tour_active(), hover_only=True,
+        )
 
         return page
 
@@ -2097,6 +2634,14 @@ class MainWindow(QMainWindow):
         return self.user_mgmt_panel, self.users_btn, self.side_panel_host, False
 
     def _toggle_panel(self, kind):
+        # Mid-tour, only the step that asks for it may open/close the
+        # Users panel - and the Log panel is never part of the tour.
+        opening_now = not self._panel_state[kind]
+        allowed = () if kind == "log" else (("user_mgmt_opened",) if opening_now else ("user_mgmt_closed",))
+        if not self._tour_gate(*allowed):
+            # The (checkable) button already flipped itself on click.
+            self._panel_info(kind)[1].setChecked(self._panel_state[kind])
+            return
         if self._animation is not None:
             # A glide is already in flight (either side) - queue this
             # request instead of starting a second QPropertyAnimation
@@ -2174,6 +2719,18 @@ class MainWindow(QMainWindow):
         self._workers.append(worker)
         worker.finished.connect(lambda: self._workers.remove(worker) if worker in self._workers else None)
 
+    def _busy_start(self):
+        self._busy_count += 1
+        if self._busy_count == 1:
+            # Brief delay so near-instant actions don't flash the overlay.
+            self._busy_delay.start()
+
+    def _busy_stop(self):
+        self._busy_count = max(0, self._busy_count - 1)
+        if self._busy_count == 0:
+            self._busy_delay.stop()
+            self._busy_overlay.stop()
+
     def _toast(self, message):
         # Phase 2 stand-in for gui.py's own transient _Toast widget -
         # functional (log-panel visibility + a message box would be too
@@ -2210,6 +2767,29 @@ class MainWindow(QMainWindow):
         # just opened - see GuiTourQt.on_event().
         if self._tour is not None:
             self._tour.on_event(event, window=window)
+
+    def _tour_active(self):
+        tour = self._tour
+        return bool(tour and tour._callout is not None and tour._wait_event is not None)
+
+    def _tour_gate(self, *allowed_events):
+        """False (and a hint) if a tour step is showing that doesn't ask
+        for one of `allowed_events`. The tour's mouse/keyboard guard
+        already stops most stray input; this is the second line of
+        defence inside each action, so nothing can run out of step no
+        matter how it was triggered. Always passes when no tour runs."""
+        if not self._tour_active():
+            return True
+        if self._tour._wait_event in allowed_events:
+            # Even the allowed action must be aimed at the tour's own
+            # share, never one that already existed.
+            selected, _ = self._selected_share_and_user()
+            if selected and self._tour_created_share not in (None, selected):
+                self._toast("The tour only works with the share it created.")
+                return False
+            return True
+        self._toast("Follow the tour step first - or use Skip Tour.")
+        return False
 
     def _tour_waiting_on(self, event):
         # True only while the tour is actually showing a step whose
@@ -2275,6 +2855,46 @@ class MainWindow(QMainWindow):
         if self._tour is not None:
             self._tour.show_name_error(message)
 
+    def _maybe_offer_adoption(self, then):
+        """One-time, on launch: shares (and, through them, users) made by
+        an earlier NASsie version keep working after an update. Their
+        accounts are already recognised; the shares just need today's
+        marker, which takes admin rights once."""
+        worker = _Worker(self.wizard.find_unadopted_shares)
+        worker.done.connect(lambda found, log: self._offer_adoption(found, then))
+        self._keep_alive(worker)
+        worker.start()
+
+    def _offer_adoption(self, found, then):
+        if not found:
+            then()
+            return
+        names = "\n".join(f"  \u2022 {s['name']}" for s in found)
+        if QMessageBox.question(
+            self, "Keep your existing shares?",
+            f"NASsie found {len(found)} share(s) created by an earlier version:\n\n{names}\n\n"
+            "Keep managing them here? Nothing about them changes - they just stay in NASsie "
+            "after this update. This needs administrator permission once.",
+        ) != QMessageBox.StandardButton.Yes:
+            then()
+            return
+        worker = _Worker(self.wizard.adopt_existing)
+        worker.done.connect(lambda ok, log: self._on_adopted(ok, log, then))
+        self._keep_alive(worker)
+        self._busy_start()
+        worker.start()
+
+    def _on_adopted(self, ok, log_output, then):
+        self._busy_stop()
+        if log_output.strip():
+            self.log_panel.append(log_output)
+        if ok:
+            self._toast("Existing shares are now managed by NASsie.")
+        else:
+            QMessageBox.warning(self, "Existing shares", f"Could not adopt the existing shares.\n\n{log_output.strip()}")
+        self.refresh_all()
+        then()
+
     def _maybe_start_tour(self):
         state = tour_state()
         if state == "new":
@@ -2302,6 +2922,16 @@ class MainWindow(QMainWindow):
     def _start_tour(self):
         # Rebuilt each time rather than cached - matches gui.py's own
         # _start_tour() (see its own comment for why).
+        open_kinds = [k for k, v in self._panel_state.items() if v]
+        if open_kinds or self._animation is not None:
+            # Every step assumes both panels start closed - close them
+            # (the queue keeps the latest request) and try again.
+            for kind in open_kinds:
+                self._toggle_panel(kind)
+            QTimer.singleShot(_GLIDE_MS * 2 + 150, self._start_tour)
+            return
+        self._tour_created_user = None
+        self._tour_created_share = None
         self._tour = GuiTourQt(self)
         self._tour.start()
 
@@ -2309,9 +2939,18 @@ class MainWindow(QMainWindow):
 
     def refresh_all(self):
         worker = _Worker(self._fetch_all)
-        worker.done.connect(self._apply_all)
+        worker.done.connect(
+            lambda data, log: (self._busy_stop(), self._apply_all(data, log), self._flush_pending_tour_event())
+        )
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
+
+    def _flush_pending_tour_event(self):
+        event = self._pending_tour_event
+        self._pending_tour_event = None
+        if event:
+            QTimer.singleShot(0, lambda: self._notify_tour(event))
 
     def _fetch_all(self):
         shares = self.wizard.list_shares()
@@ -2346,7 +2985,7 @@ class MainWindow(QMainWindow):
             # the tour's first highlight box tracing the whole tree
             # instead of just the add-row.
             self._did_first_refresh = True
-            self._maybe_start_tour()
+            self._maybe_offer_adoption(then=self._maybe_start_tour)
 
     def _populate_shares(self, shares):
         # Remember whatever was actually selected before rebuilding, so
@@ -2395,6 +3034,8 @@ class MainWindow(QMainWindow):
             name = share.get("name", "?")
             path = share.get("path") or "Unknown"
             share_item = QTreeWidgetItem(self.shares_tree, [name, path])
+            # Whether NASsie itself set this share up - gates Edit Share.
+            share_item.setData(0, Qt.ItemDataRole.UserRole, self.wizard.is_managed_share(share))
             if name == selected_share_name and selected_username is None:
                 new_selection = share_item
             for u in share.get("users", []):
@@ -2448,6 +3089,10 @@ class MainWindow(QMainWindow):
         # a no-op unless the tour is actually waiting on this exact
         # event right now.
         share, _ = self._selected_share_and_user()
+        if share and self._tour_active() and self._tour_created_share not in (None, share):
+            # Mid-tour, selecting some OTHER (pre-existing) share doesn't
+            # count as the step's "select your share".
+            return
         if share:
             # Deferred - this method is connected to shares_tree's own
             # itemSelectionChanged BEFORE self._share_action_bar even
@@ -2473,7 +3118,7 @@ class MainWindow(QMainWindow):
     def _on_shares_item_clicked(self, item, column):
         if item is self._add_share_row:
             self.shares_tree.clearSelection()
-            self._on_new_share()
+            _GATE.run(self._on_new_share)
 
     def _build_share_row_actions(self, container: QHBoxLayout, item) -> bool:
         # The add-row is a real Treeview row too, so _RowActionBar's own
@@ -2500,6 +3145,8 @@ class MainWindow(QMainWindow):
         else:
             container.addWidget(_row_action_button("icon_new_user", "New User", self._on_grant_new_user))
             container.addWidget(_row_action_button("icon_attach", "Attach User", self._on_attach_user))
+            if item.data(0, Qt.ItemDataRole.UserRole):
+                container.addWidget(_row_action_button("icon_edit", "Edit Share", self._on_edit_share))
             container.addWidget(_row_action_button("icon_delete", "Delete Share", self._on_delete_share))
         return True
 
@@ -2509,7 +3156,13 @@ class MainWindow(QMainWindow):
         # _build_inline_attach()/_commit_inline_attach().
         combo = QComboBox()
         label_to_user = {}
-        for u in self._attaching_candidates:
+        candidates = self._attaching_candidates
+        if self._tour_waiting_on("user_attached") and self._tour_created_user:
+            # The tour asks for the user it just had you create - offer
+            # only that one, not every account on the machine.
+            only = [u for u in candidates if u["username"] == self._tour_created_user]
+            candidates = only or candidates
+        for u in candidates:
             label = self._attaching_labels.get(u["username"], u["username"])
             combo.addItem(label)
             label_to_user[label] = u
@@ -2524,7 +3177,9 @@ class MainWindow(QMainWindow):
         # own on-row width at all.
         fm = combo.fontMetrics()
         longest = max((fm.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())), default=0)
-        combo.view().setMinimumWidth(longest + 40)
+        # Popup width follows the combo itself (never wider than the
+        # field) - so the combo is sized to fit its longest label.
+        combo.setMinimumWidth(min(longest + 40, 320))
 
         def on_activated(index):
             user = label_to_user.get(combo.itemText(index))
@@ -2542,6 +3197,8 @@ class MainWindow(QMainWindow):
         return True
 
     def _cancel_inline_attach(self):
+        if not self._tour_gate():
+            return
         self._attaching_item = None
         self._attaching_share = None
         self._attaching_candidates = []
@@ -2551,12 +3208,21 @@ class MainWindow(QMainWindow):
     # -- share/user actions ----------------------------------------------
 
     def _on_new_share(self):
+        if not self._tour_gate("share_dialog_opened"):
+            return
         dialog = CreateShareDialog(self, self.wizard, self._on_share_created)
         dialog.exec()
 
     def _on_share_created(self, share_name, log_output):
         if share_name:
-            self._notify_tour("share_created")
+            if self._tour_active():
+                self._tour_created_share = share_name
+                # The next step highlights the new share's row, which
+                # doesn't exist in the tree until the refresh below has
+                # landed - so advance the tour only then.
+                self._pending_tour_event = "share_created"
+            else:
+                self._notify_tour("share_created")
         if log_output.strip():
             self.log_panel.append(log_output)
         if share_name:
@@ -2566,6 +3232,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_delete_share(self):
+        if not self._tour_gate("share_delete_dialog_opened"):
+            return
         share, _ = self._selected_share_and_user()
         if not share:
             return
@@ -2584,14 +3252,61 @@ class MainWindow(QMainWindow):
             )
             self._notify_tour("share_delete_dialog_cancelled")
             return
-        if QMessageBox.question(self, "Delete Share", f"Delete share '{share}'?") != QMessageBox.StandardButton.Yes:
+        if not _confirm(self, "Delete Share", f"Delete share '{share}'?", "Delete"):
             return
         worker = _Worker(self.wizard.remove_share, share, False)
         worker.done.connect(lambda result, log: self._on_share_deleted(share, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
+    def _on_edit_share(self):
+        if not self._tour_gate():
+            return
+        share_name, user = self._selected_share_and_user()
+        if not share_name or user:
+            return
+        item = self.shares_tree.selectedItems()[0]
+        path = item.text(1)
+        if path == "Unknown":
+            path = ""
+        dialog = EditShareDialog(self, self.wizard, share_name, path)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result_data:
+            return
+        new_name, new_path = dialog.result_data["name"], dialog.result_data["path"]
+
+        def apply():
+            ok, message = self.wizard.check_share_edit(share_name, new_name, new_path)
+            if not ok:
+                print(message)
+                return False
+            self.wizard.update_share(share_name, new_name, new_path)
+            # Same reasoning as the create flow: elevated output can't be
+            # streamed back reliably, so re-read whether it took effect.
+            target = os.path.normcase(os.path.abspath(new_path))
+            return any(
+                s["name"] == new_name and os.path.normcase(os.path.abspath(s.get("path") or "")) == target
+                for s in self.wizard.list_shares()
+            )
+
+        worker = _Worker(apply)
+        worker.done.connect(lambda result, log: self._on_share_edited(share_name, new_name, result, log))
+        self._keep_alive(worker)
+        self._busy_start()
+        worker.start()
+
+    def _on_share_edited(self, old_name, new_name, ok, log_output):
+        self._busy_stop()
+        if log_output.strip():
+            self.log_panel.append(log_output)
+        if ok:
+            self._toast(f"Updated share '{new_name}'.")
+        else:
+            QMessageBox.critical(self, "Failed", f"Could not update share '{old_name}'.\n\n{log_output.strip()}")
+        self.refresh_all()
+
     def _on_share_deleted(self, share, removed, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if removed:
@@ -2601,12 +3316,17 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_grant_new_user(self):
+        if not self._tour_gate("user_dialog_opened"):
+            return
         share, _ = self._selected_share_and_user()
         if not share:
             return
         worker = _Worker(self.wizard.list_users)
-        worker.done.connect(lambda users, log, s=share: self._show_grant_new_user_dialog(s, users, log))
+        worker.done.connect(
+            lambda users, log, s=share: (self._busy_stop(), self._show_grant_new_user_dialog(s, users, log))
+        )
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _show_grant_new_user_dialog(self, share, users, log_output=""):
@@ -2633,9 +3353,11 @@ class MainWindow(QMainWindow):
         )
         worker.done.connect(lambda result, log: self._on_access_granted(share, data["username"], result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _on_access_granted(self, share, username, added, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if added:
@@ -2646,6 +3368,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_attach_user(self):
+        if not self._tour_gate("attach_dropdown_opened"):
+            return
         share, _ = self._selected_share_and_user()
         if not share:
             return
@@ -2692,6 +3416,8 @@ class MainWindow(QMainWindow):
         self._notify_tour("attach_dropdown_opened")
 
     def _commit_inline_attach(self, user):
+        if not self._tour_gate("user_attached"):
+            return
         share = self._attaching_share
         username = user["username"]
         self._attaching_item = None
@@ -2736,6 +3462,7 @@ class MainWindow(QMainWindow):
         worker = _Worker(self.wizard.grant_share_access, share, username, password, False)
         worker.done.connect(lambda result, log: self._on_access_granted(share, username, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _existing_account_grant_message(self, username):
@@ -2759,6 +3486,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_detach_user(self):
+        if not self._tour_gate("user_detach_dialog_opened"):
+            return
         share, user = self._selected_share_and_user()
         if not share or not user:
             return
@@ -2778,9 +3507,11 @@ class MainWindow(QMainWindow):
         worker = _Worker(self.wizard.revoke_share_access, share, user)
         worker.done.connect(lambda result, log: self._on_access_revoked(share, user, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _on_access_revoked(self, share, user, revoked, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if revoked:
@@ -2790,6 +3521,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_toggle_access(self):
+        if not self._tour_gate("access_level_changed"):
+            return
         share, user = self._selected_share_and_user()
         if not share or not user:
             return
@@ -2800,9 +3533,11 @@ class MainWindow(QMainWindow):
         worker = _Worker(self.wizard.change_share_access, share, user, not currently_read_only)
         worker.done.connect(lambda result, log: self._on_access_changed(share, user, result, log))
         self._keep_alive(worker)
+        self._busy_start()
         worker.start()
 
     def _on_access_changed(self, share, user, changed, log_output):
+        self._busy_stop()
         if log_output.strip():
             self.log_panel.append(log_output)
         if changed:
@@ -2822,6 +3557,8 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def _on_show_qr(self):
+        if not self._tour_gate("qr_dialog_opened"):
+            return
         share, user = self._selected_share_and_user()
         if not share or not user:
             return
@@ -2907,7 +3644,14 @@ def run():
         # native Wayland path on purpose) isn't silently overridden.
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     app = QApplication(sys.argv)
-    app.setFont(QFont(_DEFAULT_FONT_FAMILY, _DEFAULT_FONT_SIZE))
+    # Without these, the window manager only sees the interpreter's own
+    # name (python3 / gui_qt.py) as the app identity, so the dock/taskbar
+    # can't match this window to nassie.desktop (StartupWMClass=NASsie)
+    # and shows the wrong name and icon.
+    app.setApplicationName("NASsie")
+    app.setDesktopFileName("nassie")
+    app.setWindowIcon(QIcon(os.path.join(_asset_base_dir(), "nassie_icon.png")))
+    app.setFont(QFont(_DEFAULT_FONT_FAMILY, _DEFAULT_FONT_SIZE, QFont.Weight.Bold))
     _apply_base_palette(app)
     app.setStyleSheet(_build_stylesheet())
     win = MainWindow()

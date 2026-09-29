@@ -8,7 +8,11 @@ set -e
 # this needs to import) still exist at this point - by postrm they'd
 # already be gone.
 if { [ "$1" = "remove" ] || [ "$1" = "purge" ]; } && [ -z "$NASSIE_REINSTALLING" ]; then
-    if command -v python3 >/dev/null 2>&1 && [ -f /usr/lib/nassie/core.py ] && ( : < /dev/tty ) 2>/dev/null; then
+    # Uninstalling NASsie removes its shares, accounts and groups - with or
+    # without a terminal (a GUI package manager has none). Only the
+    # folders' DATA is ever optional, and it's only deleted on an explicit
+    # "yes" at a terminal, never automatically.
+    if command -v python3 >/dev/null 2>&1 && [ -f /usr/lib/nassie/core.py ]; then
         # The script has to come from somewhere other than fd 0: input()
         # below needs stdin free to redirect to /dev/tty for the actual
         # interactive prompt. A heredoc directly on the python3 command
@@ -28,6 +32,10 @@ from core import SMBWizard
 from tour_state import _first_run_marker_path
 
 w = SMBWizard()
+# Uninstall must also remove shares made by builds that predate the marker.
+w._allow_unmanaged_changes = True
+# No terminal to ask questions on (e.g. removal from a GUI package manager).
+interactive = os.environ.get('NASSIE_NONINTERACTIVE') != '1'
 
 
 def _group_exists(name):
@@ -48,11 +56,14 @@ def _group_exists(name):
 # entirely - no prompt, nothing removed - even though it's unambiguously
 # still a NASsie share sitting in smb.conf.
 shares = []
-for s in w.list_shares():
+# include_unmanaged: shares made by builds before the explicit marker existed
+# are still NASsie's (they have its ownership group, checked just below) and
+# must still be offered for removal.
+for s in w.list_shares(include_unmanaged=True):
     if not s.get('path'):
         continue
     expected_group = w._share_group_name(s['name'])
-    if _group_exists(expected_group):
+    if s.get('nassie_managed') or _group_exists(expected_group):
         shares.append(dict(s, group=expected_group))
 
 # Every share's own ownership group - list_groups() never surfaces
@@ -71,38 +82,31 @@ remove_shares = True
 
 if shares:
     print()
-    print("=== NASsie shares still configured ===")
+    print("=== Removing NASsie shares ===")
     for s in shares:
         print(f"  {s['name']} -> {s['path']}")
     print()
-    # Two separate questions, not one combined prompt - matches the
-    # in-app "Delete Share" action's own two-step confirm (gui.py's
-    # _delete_selected_share(): "Remove share?" then, only if yes,
-    # "Delete folder too?"). A single "delete these folders too?" prompt
-    # read as asking about the folders alone while silently also removing
-    # the [share] block from smb.conf either way - saying "N" there still
-    # deleted the share, just left the data behind, which isn't what "N"
-    # reads as.
-    remove_answer = input("Remove these shares from Samba? [y/N] ").strip().lower()
-    remove_shares = remove_answer in ('y', 'yes')
-    if remove_shares:
+    # The shares themselves always go (uninstalling NASsie removes what it
+    # set up); only whether their FOLDERS' data is deleted too is asked,
+    # and defaults to keeping it. Without a terminal, data is always kept.
+    delete_folders = False
+    if interactive:
         delete_answer = input(
             "Also permanently delete their folders and everything in them? This cannot be undone. [y/N] "
         ).strip().lower()
         delete_folders = delete_answer in ('y', 'yes')
-        # delete_share() removes the [share] block from smb.conf and
-        # restarts Samba, not just the on-disk folder - apt itself has no
-        # idea these entries exist (they live in Samba's own config, not
-        # any package file), so nothing else would ever remove them. Same
-        # tested code path the in-app "Delete Share" action uses, rather
-        # than duplicating smb.conf-editing/rmtree logic here.
-        for s in shares:
-            ok = w.delete_share(s['name'], delete_folder=delete_folders)
-            if ok:
-                ownership_groups.add(s['group'])
-                print(f"Removed share '{s['name']}' from Samba" + (" and deleted its folder." if delete_folders else "."))
-            else:
-                print(f"Failed to remove share '{s['name']}' from Samba.")
+    # delete_share() removes the [share] block from smb.conf and
+    # restarts Samba, not just the on-disk folder - apt itself has no
+    # idea these entries exist (they live in Samba's own config, not
+    # any package file), so nothing else would ever remove them. Same
+    # tested code path the in-app "Delete Share" action uses.
+    for s in shares:
+        ok = w.delete_share(s['name'], delete_folder=delete_folders)
+        if ok:
+            ownership_groups.add(s['group'])
+            print(f"Removed share '{s['name']}' from Samba" + (" and deleted its folder." if delete_folders else "."))
+        else:
+            print(f"Failed to remove share '{s['name']}' from Samba.")
 
 # Groups/accounts live outside the package entirely too (local group/
 # passwd database, not any package file) - nothing else would ever clean
@@ -172,7 +176,11 @@ for marker in markers:
 if removed_any:
     print("Reset the first-run tour for the next install.")
 PYEOF
-        python3 "$nassie_prerm_script" < /dev/tty > /dev/tty 2> /dev/tty || true
+        if ( : < /dev/tty ) 2>/dev/null; then
+            python3 "$nassie_prerm_script" < /dev/tty > /dev/tty 2> /dev/tty || true
+        else
+            NASSIE_NONINTERACTIVE=1 python3 "$nassie_prerm_script" < /dev/null || true
+        fi
         rm -f "$nassie_prerm_script"
     fi
 fi
