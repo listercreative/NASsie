@@ -59,13 +59,20 @@ tarball or `install.sh` itself.
 curl -fsSL https://raw.githubusercontent.com/listercreative/NASsie/main/smb-share-wizard/packaging/deb/bootstrap.sh | sh
 ```
 
-`bootstrap.sh` clones the repo, builds the `.deb` from current source, and
-runs `install.sh` - same preview/confirmation step as above, this only
-automates *fetching* the files. It explicitly redirects `install.sh` to
-`/dev/tty` rather than inherited stdin/stdout, since a `curl | sh`
-invocation's own stdin is the piped script source, not the terminal - the
-same reason `postinst` does the same redirect for NASsie's first-run
-launch after install.
+`bootstrap.sh` downloads the **latest GitHub release's** installer bundle
+(`nassie-linux-installer.tar.gz`), verifies its SHA-256 checksum, and runs the
+bundled `install.sh` - same preview/confirmation step as above, this only
+automates *fetching* the files. Nothing is cloned or built on the user's
+machine, and unreleased commits on `main` are never installed. It explicitly
+redirects `install.sh` to `/dev/tty` rather than inherited stdin/stdout,
+since a `curl | sh` invocation's own stdin is the piped script source, not
+the terminal - the same reason `postinst` does the same redirect for NASsie's
+first-run launch after install.
+
+**Updating:** run the same one-liner again. `install.sh` sees NASsie is
+already installed, removes it with `NASSIE_REINSTALLING=1` (so shares, users
+and groups are kept) and installs the newest release. `apt upgrade` does not
+update NASsie - it isn't in an apt repository.
 
 ## Double-click alternative (no terminal)
 
@@ -114,6 +121,6 @@ other. The repo root's `push.sh` does all of this for you in one step.
 | `build.sh` | Rebuilds the `.deb` from `../../src/*.py` |
 | `dist.sh` | Runs `build.sh`, then bundles the distributable tarball and its `.sha256` checksum |
 | `install.sh` | What end users run — preview, confirm, `apt install` |
-| `bootstrap.sh` | `curl \| sh` one-liner: clones the repo, builds, runs `install.sh` |
+| `bootstrap.sh` | `curl \| sh` one-liner: downloads the latest release bundle, verifies its checksum, runs `install.sh` |
 | `preview.py` | The pre-install curses preview screen (self-contained, no imports from `src/`, so the tarball needs only these files) |
 | `nassie/` | The `.deb`'s staged file tree (`DEBIAN/control`, `postinst`, etc.) |
