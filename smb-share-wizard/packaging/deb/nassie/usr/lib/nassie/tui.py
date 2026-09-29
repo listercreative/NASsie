@@ -113,6 +113,9 @@ class TUIWizard:
 
     def run(self):
         os.environ.setdefault("ESCDELAY", "25")
+        # Before curses takes over the terminal - see
+        # SMBWizard.offer_adoption_plain().
+        self.wizard.offer_adoption_plain()
         # _main returns after every menu action, since applying/deleting/etc.
         # may need an elevation prompt that can't happen while curses owns
         # the terminal. It returns an empty result only when the user chose

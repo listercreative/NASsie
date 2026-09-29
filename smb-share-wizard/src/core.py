@@ -416,6 +416,36 @@ class SMBWizard:
             return self.adopt_existing_shares()
         return self._elevated_relaunch("--adopt-shares", {})
 
+    def offer_adoption_plain(self):
+        """Terminal version of the desktop UI's "Keep your existing
+        shares?" prompt, for the TUI/CLI: run once on launch, BEFORE any
+        curses screen takes over (adopting may need a sudo/pkexec prompt,
+        which needs the real terminal). Declining just asks again next
+        launch."""
+        try:
+            found = self.find_unadopted_shares()
+        except Exception:
+            return
+        if not found:
+            return
+        print()
+        print(f"NASsie found {len(found)} share(s) created by an earlier version:")
+        for share in found:
+            print(f"  - {share['name']}")
+        print("Keep managing them here? Nothing about them changes - they just stay in NASsie")
+        print("after this update. This needs administrator permission once.")
+        try:
+            answer = input("Keep them? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if answer not in ("", "y", "yes"):
+            print("Skipped - you'll be asked again next time NASsie starts.")
+            return
+        if self.adopt_existing():
+            print("Existing shares are now managed by NASsie.")
+        else:
+            print("Could not adopt the existing shares (or elevation was cancelled).")
+
     @staticmethod
     def adopt_shares_from_file(path):
         try:

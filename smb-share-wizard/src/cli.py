@@ -299,6 +299,7 @@ class CLIWizard(SMBWizard):
                     print("Failed to delete user (or elevation was cancelled).")
 
     def start(self):
+        self.offer_adoption_plain()
         while True:
             options = ["Create New Share", "Manage Existing Shares", "Manage Users"]
             if self.gui_available():
